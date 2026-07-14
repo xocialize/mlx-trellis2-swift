@@ -59,8 +59,13 @@ public final class Trellis2Pipeline {
     /// `shapeMean/Std`, `texMean/Std` = the pipeline's per-channel SLat normalization [32].
     /// The sampler emits a NORMALIZED latent (std≈1); the decoder needs it DENORMALIZED
     /// (× std + mean). The tex concat_cond, by contrast, wants the raw normalized shape_slat.
+    /// `texture` false → geometry-only fast path (skip the tex flow + decoder; flat-gray mesh,
+    /// ~2× faster). `targetFaces` → decimation target for MeshBake. `yUp` → emit Y-up
+    /// (x,y,z)→(x,z,−y), the glTF/VRM convention required BEFORE rigging (a post-rig
+    /// reorientation mis-composes with clip playback).
     public func generate(cond: MLXArray, negCond: MLXArray, ssNoise: MLXArray, ssPhases: MLXArray,
                          shapeMean: MLXArray, shapeStd: MLXArray, texMean: MLXArray, texStd: MLXArray,
+                         texture: Bool = true, targetFaces: Int = 120_000, yUp: Bool = false,
                          seed: UInt64 = 0, log: (String) -> Void = { print($0) }) throws -> BakedMesh {
         // High-guidance CFG (SS r0.7, shape r0.5) is fp-sensitive — the g·vPos−(g−1)·vNeg
         // near-cancellation amplifies per-forward noise, so bf16-SDPA noise there shows up
@@ -93,25 +98,40 @@ public final class Trellis2Pipeline {
         MLX.eval(shapeOut.feats, shapeOut.coords)
         log("  [3] shape decoded: \(shapeOut.count) voxels (\(String(format: "%.1f", -t.timeIntervalSinceNow))s)")
 
-        // 4) tex SLat sampler (concat_cond = shape_slat, no CFG)
-        t = Date(); MLXRandom.seed(seed &+ 1)
-        let texSlat = FlowEulerSampler.sampleSLat(
-            model: texDit, noiseFeats: MLXRandom.normal([coords.dim(0), 32]), coords: coords, cond: cond, negCond: negCond,
-            concatCond: shapeSlat, guidanceStrength: 1.0, guidanceRescale: 0.0, guidanceInterval: (0.6, 0.9), rescaleT: 3.0)
-        MLX.eval(texSlat)
-        log("  [4] tex SLat sampled (\(String(format: "%.1f", -t.timeIntervalSinceNow))s)")
+        // 4-5) texture: tex SLat sampler (concat_cond=shape_slat, no CFG) → tex decode → base
+        //      color. `texture=false` skips both stages for a flat-gray geometry-only mesh.
+        let baseColor: MLXArray
+        if texture {
+            t = Date(); MLXRandom.seed(seed &+ 1)
+            let texSlat = FlowEulerSampler.sampleSLat(
+                model: texDit, noiseFeats: MLXRandom.normal([coords.dim(0), 32]), coords: coords, cond: cond, negCond: negCond,
+                concatCond: shapeSlat, guidanceStrength: 1.0, guidanceRescale: 0.0, guidanceInterval: (0.6, 0.9), rescaleT: 3.0)
+            MLX.eval(texSlat)
+            log("  [4] tex SLat sampled (\(String(format: "%.1f", -t.timeIntervalSinceNow))s)")
+            t = Date()
+            let texSlatDenorm = texSlat * texStd + texMean
+            let texOut = texDec(SparseTensor(feats: texSlatDenorm, coords: coords), guidedMasks: subs)
+            baseColor = MLX.clip(texOut.feats[0..., 0..<3] * 0.5 + 0.5, min: 0, max: 1)
+            MLX.eval(baseColor)
+            log("  [5] tex decoded: \(texOut.count) voxels (\(String(format: "%.1f", -t.timeIntervalSinceNow))s)")
+        } else {
+            baseColor = MLXArray.zeros([shapeOut.count, 3]) + 0.5   // flat gray, geometry-only
+            log("  [4-5] texture off — geometry-only (flat gray)")
+        }
 
-        // 5) tex decode (guided by the shape's subdivisions → same coords) → base color.
-        //    Denormalize the tex latent before decoding.
-        t = Date()
-        let texSlatDenorm = texSlat * texStd + texMean
-        let texOut = texDec(SparseTensor(feats: texSlatDenorm, coords: coords), guidedMasks: subs)
-        let baseColor = MLX.clip(texOut.feats[0..., 0..<3] * 0.5 + 0.5, min: 0, max: 1)
-        MLX.eval(baseColor)
-        log("  [5] tex decoded: \(texOut.count) voxels (\(String(format: "%.1f", -t.timeIntervalSinceNow))s)")
+        // 6) mesh + texture bake → clean mesh
+        var baked = try MeshBake.run(shapeFeats: shapeOut.feats, coords: shapeOut.coords, texBaseColor: baseColor,
+                                     fineRes: 1024, remeshRes: 256, targetFaces: targetFaces, atlasSize: 1024, log: log)
 
-        // 6) mesh + texture bake → clean textured mesh
-        return try MeshBake.run(shapeFeats: shapeOut.feats, coords: shapeOut.coords, texBaseColor: baseColor,
-                                fineRes: 1024, remeshRes: 256, targetFaces: 120_000, atlasSize: 1024, log: log)
+        // 7) optional Y-up reorientation (x,y,z)→(x,z,−y): a proper rotation, winding preserved.
+        if yUp {
+            func toYUp(_ a: MLXArray) -> MLXArray {
+                MLX.stacked([a[0..., 0], a[0..., 2], -a[0..., 1]], axis: 1)
+            }
+            baked = BakedMesh(vertices: toYUp(baked.vertices), faces: baked.faces, normals: toYUp(baked.normals),
+                              uvs: baked.uvs, texRGBA: baked.texRGBA, atlasSize: baked.atlasSize, coverage: baked.coverage)
+            log("  [7] reoriented Y-up")
+        }
+        return baked
     }
 }

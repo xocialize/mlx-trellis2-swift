@@ -29,18 +29,38 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
     /// Base RNG seed. SS noise + the shape/tex SLat noise draws derive from it deterministically.
     public var seed: UInt64
 
+    /// Run the texture path (tex SLat flow + tex decoder → base-color UV texture). Default on;
+    /// false = geometry-only flat-gray mesh (skips a 2nd flow + 2nd decode, ~2× faster).
+    public var texture: Bool
+
+    /// Decimate the extracted mesh to this face target before GLB encode (matches the HF `to_glb`
+    /// tail). nil = MeshBake's default (~120k).
+    public var decimateFaces: Int?
+
+    /// Emit the GLB Y-up (glTF/VRM convention) instead of TRELLIS's native Z-up: bakes the
+    /// (x,y,z)→(x,z,−y) rotation into the vertices/normals before encode. REQUIRED for the
+    /// rig→USDZ→RealityKit path (a post-rig reorientation mis-composes with clip playback).
+    /// Default false (Z-up) — existing Z-up consumers apply their own reorientation.
+    public var yUpOutput: Bool
+
     public init(quant: Quant = .bf16,
                 defaultMode: Mode = ImageTo3DContract.res512,
                 modelsRootDirectory: URL? = nil,
                 weightsRootOverride: URL? = nil,
                 steps: Int = 12,
-                seed: UInt64 = 0) {
+                seed: UInt64 = 0,
+                texture: Bool = true,
+                decimateFaces: Int? = 300_000,
+                yUpOutput: Bool = false) {
         self.quant = quant
         self.defaultMode = defaultMode
         self.modelsRootDirectory = modelsRootDirectory
         self.weightsRootOverride = weightsRootOverride
         self.steps = steps
         self.seed = seed
+        self.texture = texture
+        self.decimateFaces = decimateFaces
+        self.yUpOutput = yUpOutput
     }
 }
 
@@ -49,8 +69,9 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
 extension Trellis2Configuration: WeightSourcing {
     /// The consolidated, remap-free weights repo (one download): every component in the Swift
     /// module-key layout (incl. DINOv3, redistributed under the DINOv3 License §1.b) +
-    /// `normalization.json` + the license files. The repo is GATED (auto-approval, DINOv3 terms):
-    /// first-run materialization env-detects `HF_TOKEN` (an account that accepted the terms).
+    /// `normalization.json` + the license files. The repo is UNGATED (token-less first-run
+    /// materialization) — anti-mirror is by card/license framing (pipeline artifact, not a DINOv3
+    /// mirror; standalone-DINOv3 → Meta's gated repo; "Built with DINOv3").
     public static let consolidatedRepo = "xocialize/trellis2-mlx"
 
     /// Every weight/normalization file of the published snapshot the probe requires. A
@@ -248,7 +269,8 @@ public final class Trellis2Package: ModelPackage {
             cond: cond, negCond: negCond, ssNoise: ssNoise, ssPhases: ssPhases,
             shapeMean: MLXArray(shapeMean), shapeStd: MLXArray(shapeStd),
             texMean: MLXArray(texMean), texStd: MLXArray(texStd),
-            seed: configuration.seed, log: { _ in })
+            texture: configuration.texture, targetFaces: configuration.decimateFaces ?? 120_000,
+            yUp: configuration.yUpOutput, seed: configuration.seed, log: { _ in })
         try Task.checkCancellation()
 
         let glb = try GLTFExport.glbData(

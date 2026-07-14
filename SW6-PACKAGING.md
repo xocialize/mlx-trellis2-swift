@@ -27,8 +27,9 @@ weight sourcing/auto-materialization, `load()`/`run()`, born-clean gates).
   most-restrictive component and governs (TRELLIS.2 itself is MIT).
 - **Provenance:** `microsoft/TRELLIS.2-4B`, tier 3 (multi-component pipeline).
 - **Requirements:** `.metalGPU`; macOS floor 26.0; chip floor `.pro`.
-- **Footprint (split, contract 1.14):** `residentBytes ≈ 21 GB`, `peakActivationBytes ≈ 8 GB`.
-  **DOCUMENTED ESTIMATE — needs an in-app phys_footprint re-baseline** (see below).
+- **Footprint (split, contract 1.14):** `residentBytes = 21 GB`, `peakActivationBytes = 11 GB`.
+  Grounded in a **measured engine e2e run** (below); still needs an in-app phys_footprint
+  re-baseline before the registry Eff flips to ✅.
 - **Specialty:** `3d-generation` (strength 1.0).
 - **Surfaces:** `ImageTo3DContract` `res512` / `res1024` / `res1536` (res512 is the validated tier).
 
@@ -48,9 +49,28 @@ All pass:
 The gate is a **CLI lane** (`swift run`), not XCTest, per the skill — nothing runs under
 `swift test` (metallib unreliable there). It evaluates no Metal kernels and touches no weights.
 
-## Footprint — the estimate and the re-baseline
+## Engine e2e validation (`trellis2-run-engine`, MLXServeEngine, GPU)
 
-The number is an **estimate**, flagged for re-measure. Basis:
+The full coordinator path was run end-to-end against the locally-consolidated snapshot:
+
+```
+register (license C7/C8 admitted) → prewarm paged 8 files / 11 GB in 1.1s
+prepare (load) OK in 1.1s | governor charged 21.00 GB resident
+run OK in 123s | MLX-pool peak 31.17 GB
+mesh: verts=94502 faces=118248 vertexColors=false bytes=5,952,036
+evict → resident 0.00 GB   (unload() + clearCache; phys falls)
+```
+
+The output GLB validates as glTF 2.0 with POSITION/NORMAL/TEXCOORD_0 + an embedded base-color
+texture (OPAQUE) — the UV-textured output (the improvement over the old port's vertex colors).
+This exercises load() (consolidated-dir resolution + normalization.json), run() (preprocess →
+DINOv3 → in-package SS grid/noise → samplers → decoders → MeshBake → GLB), the license gate,
+governor charging, and clean eviction.
+
+## Footprint — measured basis and the re-baseline
+
+Grounded in the engine run above (resident 21.00 GB charged; MLX-pool peak 31.17 GB ⇒ activation
+~10.2 GB → declared 11 GB). Still flagged for re-measure. Basis:
 
 - `residentBytes ≈ 21 GB`: the pipeline holds **all 7 components resident at once (no per-stage
   eviction)** and every model constructor casts weights to **fp32** (the parity dtype). On-disk

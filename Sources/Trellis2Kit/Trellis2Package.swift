@@ -138,23 +138,22 @@ public final class Trellis2Package: ModelPackage {
                 portCodeLicense: .mit),    // C8 — our Swift port
             provenance: Provenance(sourceRepo: "microsoft/TRELLIS.2-4B", revision: "main", tier: 3),
             requirements: RequirementsManifest(
-                // Split footprint (contract 1.14), res512 default tier. DOCUMENTED ESTIMATE — a full
-                // measured run is ~10 min on the GPU; these need an in-app phys_footprint re-baseline
-                // (MLXEngineTestKit) before the registry Eff flips to ✅. Basis:
-                //   residentBytes ≈ 21 GB — the pipeline holds all 7 components resident at once with
+                // Split footprint (contract 1.14), res512 default tier. Grounded in a MEASURED engine
+                // e2e run (res512, MLXServeEngine, GPU): governor charged 21.00 GB resident; MLX-pool
+                // peak 31.17 GB in a 123 s run ⇒ pool activation ~10.2 GB. Still flagged for an in-app
+                // phys_footprint re-baseline (the CLI GPU.peakMemory under-reads true phys ~2.7×, and
+                // phys is the admission basis) before the registry Eff flips to ✅.
+                //   residentBytes = 21 GB — the pipeline holds all 7 components resident at once with
                 //     NO per-stage eviction, and every constructor casts weights to fp32 (the parity
-                //     dtype). On-disk bf16/fp16 sums ~11 GB → ~21 GB fp32-resident (3×1.3B DiTs 7.8→15.5,
-                //     2 sparse decoders 1.9→3.8, ss_dec 0.15→0.3, DINOv3 1.2 already-fp32). Declaring
-                //     `.bf16` quant but an fp32-resident floor is deliberate — the manifest reports the
-                //     memory this build actually occupies. P0 efficiency follow-up (bf16-resident
-                //     weights + per-stage load→use→evict) would roughly halve this.
-                //   peakActivationBytes ≈ 8 GB — transient scratch on top: sparse full-attention over
-                //     ~19.5k SLat tokens (O(T²)) + the ~7.85M-voxel shape/tex decodes. Estimate anchored
-                //     to the old port's MEASURED res512 total ~14 GB (which held bf16 weights); flagged
-                //     as the least-certain number pending the in-app probe.
+                //     dtype). On-disk bf16/fp16 ~11 GB → ~21 GB fp32-resident (matches the governor
+                //     charge above). Declaring `.bf16` quant with an fp32-resident floor is deliberate
+                //     — the manifest reports the memory this build actually occupies. P0 efficiency
+                //     follow-up (bf16-resident weights + per-stage load→use→evict) would ~halve it.
+                //   peakActivationBytes = 11 GB — measured MLX-pool activation ~10.2 GB (sparse
+                //     full-attention over ~19.5k SLat tokens O(T²) + the shape/tex decodes) + margin.
                 footprints: [QuantFootprint(quant: .bf16,
                                             residentBytes: 21_000_000_000,
-                                            peakActivationBytes: 8_000_000_000)],
+                                            peakActivationBytes: 11_000_000_000)],
                 requiredBackends: [.metalGPU],
                 os: OSRequirement(minMacOS: SemanticVersion(major: 26, minor: 0, patch: 0)),
                 chipFloor: .pro),

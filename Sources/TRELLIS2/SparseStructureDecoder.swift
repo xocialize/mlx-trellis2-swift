@@ -75,17 +75,18 @@ public final class SparseStructureDecoder {
     }
 
     /// occupancy = logits>0 -> coords[[b,d0,d1,d2]] (int32), matching torch.argwhere order.
+    /// Host-compacted (mlx-swift has no boolean-mask gather); ascending linear index
+    /// preserves argwhere's row-major order.
     public func coords(_ logits: MLXArray) -> MLXArray {
-        let occ = logits.squeezed(axis: 1)                // [1,64,64,64]
-        let flat = (occ .> 0).reshaped([-1])
-        let idx = MLXArray(0 ..< flat.shape[0])[flat]     // linear indices of occupied
-        let d0 = 64, d1 = 64, d2 = 64
-        let b = idx / (d0 * d1 * d2)
-        let r0 = idx % (d0 * d1 * d2)
-        let c0 = r0 / (d1 * d2)
-        let r1 = r0 % (d1 * d2)
-        let c1 = r1 / d2
-        let c2 = r1 % d2
-        return MLX.stacked([b, c0, c1, c2], axis: 1).asType(.int32)
+        let occ = logits.squeezed(axis: 1)                // [1,D0,D1,D2]
+        let D0 = occ.dim(1), D1 = occ.dim(2), D2 = occ.dim(3)
+        let flat = (occ .> 0).reshaped([-1]).asType(.int32).asArray(Int32.self)
+        let plane = D1 * D2, vol = D0 * plane
+        var out = [Int32](); out.reserveCapacity(flat.count / 8)
+        for i in 0..<flat.count where flat[i] != 0 {
+            let b = i / vol, r = i % vol
+            out.append(Int32(b)); out.append(Int32(r / plane)); out.append(Int32((r % plane) / D2)); out.append(Int32(r % D2))
+        }
+        return MLXArray(out).reshaped([out.count / 4, 4])
     }
 }

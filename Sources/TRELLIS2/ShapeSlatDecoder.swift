@@ -127,8 +127,9 @@ public final class ShapeSlatDecoder {
     /// C2S ResBlock: predicts subdivision, upsamples h and x, convs on the finer grid.
     /// `guidedMask` (Int32 [N,8], active != 0) overrides the learned subdivision when provided.
     private func upBlock(_ x: SparseTensor, _ p: String, ch: Int, out: Int, mapCur: NeighborMap27, guidedMask: MLXArray? = nil)
-        -> (SparseTensor, NeighborMap27) {
+        -> (SparseTensor, NeighborMap27, MLXArray) {
         let subdiv = guidedMask ?? SparseOps.linear(x.feats, w["\(p).to_subdiv.weight"]!, w["\(p).to_subdiv.bias"]!)
+        let mask = (subdiv .> 0).asType(.int32)     // subdivision decisions used (for tex-decoder guidance)
         var h = SparseOps.silu(layerNorm32(x.feats, weight: w["\(p).norm1.weight"], bias: w["\(p).norm1.bias"]))
         h = SparseOps.conv(h, w["\(p).conv1.weight"]!, w["\(p).conv1.bias"]!, mapCur)   // [N, out*8]
         let topo = C2STopology(coords: x.coords, subdivLogits: subdiv)
@@ -138,7 +139,7 @@ public final class ShapeSlatDecoder {
         var h2 = SparseOps.silu(layerNorm32(hC))   // norm2 non-affine
         h2 = SparseOps.conv(h2, w["\(p).conv2.weight"]!, w["\(p).conv2.bias"]!, mapNew)
         let skip = SparseOps.repeatInterleave(xC, out / (ch / 8))
-        return (SparseTensor(feats: h2 + skip, coords: topo.newCoords), mapNew)
+        return (SparseTensor(feats: h2 + skip, coords: topo.newCoords), mapNew, mask)
     }
 
     /// Diagnostic: level-0 stages (coords unchanged) for parity localization.
@@ -163,12 +164,33 @@ public final class ShapeSlatDecoder {
                 MLX.eval(h.feats)
             }
             if let out = lvl.up {
-                (h, map) = upBlock(h, "blocks.\(i).\(lvl.n)", ch: lvl.ch, out: out, mapCur: map, guidedMask: guidedMasks?[i])
+                (h, map, _) = upBlock(h, "blocks.\(i).\(lvl.n)", ch: lvl.ch, out: out, mapCur: map, guidedMask: guidedMasks?[i])
                 MLX.eval(h.feats, h.coords)
             }
         }
         var o = layerNorm32(h.feats, eps: 1e-5)                             // final non-affine LN (F.layer_norm default eps)
         o = SparseOps.linear(o, w["output_layer.weight"]!, w["output_layer.bias"]!)
         return h.replace(o)
+    }
+
+    /// Free-run decode that also returns the per-level subdivision masks it chose —
+    /// feed these as the tex decoder's `guidedMasks` so shape+tex share coords.
+    public func decodeCapturingSubs(_ x: SparseTensor) -> (out: SparseTensor, subs: [MLXArray]) {
+        var h = x.replace(SparseOps.linear(x.feats, w["from_latent.weight"]!, w["from_latent.bias"]!))
+        var map = NeighborMap27(h.coords)
+        var subs = [MLXArray]()
+        for (i, lvl) in levels.enumerated() {
+            for j in 0..<lvl.n {
+                h = convNeXt(h, "blocks.\(i).\(j)", map); MLX.eval(h.feats)
+            }
+            if let out = lvl.up {
+                let (hh, mm, mask) = upBlock(h, "blocks.\(i).\(lvl.n)", ch: lvl.ch, out: out, mapCur: map)
+                h = hh; map = mm; subs.append(mask)
+                MLX.eval(h.feats, h.coords, mask)
+            }
+        }
+        var o = layerNorm32(h.feats, eps: 1e-5)
+        o = SparseOps.linear(o, w["output_layer.weight"]!, w["output_layer.bias"]!)
+        return (h.replace(o), subs)
     }
 }

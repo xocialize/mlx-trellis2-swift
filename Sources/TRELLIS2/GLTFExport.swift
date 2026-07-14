@@ -22,6 +22,21 @@ public enum GLTFExport {
         uvs: MLXArray? = nil,
         baseColorRGBA: (pixels: [UInt8], width: Int, height: Int)? = nil
     ) throws {
+        let glb = try glbData(positions: positions, indices: indices, normals: normals,
+                              uvs: uvs, baseColorRGBA: baseColorRGBA)
+        try glb.write(to: url)
+    }
+
+    /// Serialize a single-primitive textured mesh as in-memory binary glTF (.glb) `Data` — the
+    /// same bytes `writeGLB` writes to disk. Used by the engine `ModelPackage` path, whose
+    /// canonical `Mesh` output is GLB bytes (no file needed).
+    public static func glbData(
+        positions: MLXArray,
+        indices: MLXArray,
+        normals: MLXArray? = nil,
+        uvs: MLXArray? = nil,
+        baseColorRGBA: (pixels: [UInt8], width: Int, height: Int)? = nil
+    ) throws -> Data {
         let V = positions.dim(0)
         let pos = positions.asType(.float32).asArray(Float.self)   // [V*3]
         let idx = indices.asType(.int32).asArray(Int32.self)       // [F*3]
@@ -143,7 +158,7 @@ public enum GLTFExport {
         putU32LE(0x004E_4942, &glb)          // "BIN\0"
         glb.append(binChunk)
 
-        try glb.write(to: url)
+        return glb
     }
 
     // MARK: - helpers

@@ -29,6 +29,24 @@ public final class Trellis2Pipeline {
         dino = DINOv3(weights: try loadArrays(url: URL(fileURLWithPath: dinoPath)))
     }
 
+    /// Load from a single consolidated snapshot directory whose files carry the module-key names
+    /// (`struct_flow`/`struct_dec`/`shape_flow_512`/`shape_dec`/`tex_flow_512`/`tex_dec`/`dino`
+    /// `.safetensors`) — the layout the `xocialize/trellis2-mlx` repo publishes and the
+    /// `trellis2-consolidate` tool assembles. No key remap: the published keys ARE the Swift module
+    /// keys (each component self-verifies via its parity gate).
+    public init(consolidatedDir dir: String) throws {
+        func load(_ f: String) throws -> [String: MLXArray] {
+            try loadArrays(url: URL(fileURLWithPath: "\(dir)/\(f).safetensors"))
+        }
+        ssDit = SparseStructureFlowModel(weights: try load("struct_flow"))
+        ssDec = SparseStructureDecoder(weights: try load("struct_dec"))
+        shapeDit = SLatFlowModel(weights: try load("shape_flow_512"))
+        shapeDec = ShapeSlatDecoder(weights: try load("shape_dec"))
+        texDit = SLatFlowModel(weights: try load("tex_flow_512"))
+        texDec = ShapeSlatDecoder(weights: try load("tex_dec"))
+        dino = DINOv3(weights: try load("dino"))
+    }
+
     /// Image conditioning: preprocessed pixels [1,3,512,512] → DINOv3 tokens.
     /// neg_cond is zeros (matches get_cond's `torch.zeros_like`).
     public func encodeImage(_ pixels: MLXArray) -> (cond: MLXArray, negCond: MLXArray) {

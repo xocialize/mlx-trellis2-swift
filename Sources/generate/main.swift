@@ -7,6 +7,7 @@ import TRELLIS2
 let goldens = "/Volumes/Satechi/TrellisRedux/trellis2-port/goldens"
 let ckpts = "/Volumes/Satechi/TrellisRedux/models/models--microsoft--TRELLIS.2-4B/snapshots/af44b45f2e35a493886929c6d786e563ec68364d/ckpts"
 let ssDecPath = "/Volumes/Satechi/TrellisRedux/models/models--microsoft--TRELLIS-image-large/snapshots/25e0d31ffbebe4b5a97464dd851910efc3002d96/ckpts/ss_dec_conv3d_16l8_fp16.safetensors"
+let dinoPath = "/Volumes/Satechi/TrellisRedux/models/models--facebook--dinov3-vitl16-pretrain-lvd1689m/snapshots/ea8dc2863c51be0a264bab82070e3e8836b02d51/model.safetensors"
 func golden(_ n: String) throws -> MLXArray { try loadArray(url: URL(fileURLWithPath: "\(goldens)/\(n).npy")) }
 func log(_ s: String) { FileHandle.standardError.write((s + "\n").data(using: .utf8)!) }
 
@@ -14,11 +15,17 @@ TRELLIS2Config.fastAttention = true   // bf16 SDPA for inference speed
 
 let t0 = Date()
 log("[generate] loading models…")
-let pipe = try Trellis2Pipeline(ckptDir: ckpts, ssDecPath: ssDecPath)
-log("[generate] loaded (\(String(format: "%.1f", -t0.timeIntervalSinceNow))s). Generating…")
+let pipe = try Trellis2Pipeline(ckptDir: ckpts, ssDecPath: ssDecPath, dinoPath: dinoPath)
+log("[generate] loaded (\(String(format: "%.1f", -t0.timeIntervalSinceNow))s). Encoding image + generating…")
+
+// cond computed NATIVELY via the ported DINOv3 from the preprocessed image pixels
+// (dino_in_pixels = the bg-removed/cropped/normalized T.png). Last injected fixture removed.
+let (cond, negCond) = pipe.encodeImage(try golden("dino_in_pixels"))
+MLX.eval(cond, negCond)
+log("[generate] DINOv3 cond \(cond.shape) computed natively")
 
 let baked = try pipe.generate(
-    cond: try golden("cond_512"), negCond: try golden("neg_cond_512"),
+    cond: cond, negCond: negCond,
     ssNoise: try golden("ss_noise"), ssPhases: try golden("rope_phases_cossin"),
     shapeMean: try golden("shape_slat_mean"), shapeStd: try golden("shape_slat_std"),
     texMean: try golden("tex_slat_mean"), texStd: try golden("tex_slat_std"),

@@ -12,9 +12,11 @@ public final class Trellis2Pipeline {
     let shapeDec: ShapeSlatDecoder
     let texDit: SLatFlowModel
     let texDec: ShapeSlatDecoder     // FlexiDualGrid decoder w/ 6-ch (PBR) output weights
+    let dino: DINOv3                 // image conditioning (ViT-L/16)
 
-    /// `ckptDir` = the TRELLIS.2-4B ckpts dir; `ssDecPath` = the TRELLIS-image-large SS decoder.
-    public init(ckptDir: String, ssDecPath: String) throws {
+    /// `ckptDir` = the TRELLIS.2-4B ckpts dir; `ssDecPath` = the TRELLIS-image-large SS
+    /// decoder; `dinoPath` = the facebook DINOv3 ViT-L/16 model.safetensors.
+    public init(ckptDir: String, ssDecPath: String, dinoPath: String) throws {
         func load(_ f: String) throws -> [String: MLXArray] {
             try loadArrays(url: URL(fileURLWithPath: "\(ckptDir)/\(f).safetensors"))
         }
@@ -24,6 +26,14 @@ public final class Trellis2Pipeline {
         shapeDec = ShapeSlatDecoder(weights: try load("shape_dec_next_dc_f16c32_fp16"))
         texDit = SLatFlowModel(weights: try load("slat_flow_imgshape2tex_dit_1_3B_512_bf16"))
         texDec = ShapeSlatDecoder(weights: try load("tex_dec_next_dc_f16c32_fp16"))
+        dino = DINOv3(weights: try loadArrays(url: URL(fileURLWithPath: dinoPath)))
+    }
+
+    /// Image conditioning: preprocessed pixels [1,3,512,512] → DINOv3 tokens.
+    /// neg_cond is zeros (matches get_cond's `torch.zeros_like`).
+    public func encodeImage(_ pixels: MLXArray) -> (cond: MLXArray, negCond: MLXArray) {
+        let cond = dino(pixels)
+        return (cond, MLXArray.zeros(cond.shape, dtype: cond.dtype))
     }
 
     /// cond/negCond = DINOv3 tokens [1,N,D]; ssNoise = [1,8,16,16,16]; ssPhases = SS-DiT

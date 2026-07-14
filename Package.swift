@@ -53,6 +53,7 @@ let package = Package(
             dependencies: [
                 "TRELLIS2",
                 .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift"),
             ],
             swiftSettings: [.interoperabilityMode(.Cxx)]
         ),

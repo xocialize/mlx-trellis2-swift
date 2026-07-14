@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXRandom
 import TRELLIS2
 
 // Full-scale stress + parity: run the shape SLat decoder on the FULL 19548-voxel
@@ -41,4 +42,23 @@ let cos = ((af * bf).sum() / (MLX.sqrt((af*af).sum()) * MLX.sqrt((bf*bf).sum()))
 let symFrac = Double((Ns - inter) + (Ng - inter)) / Double(Ng)
 err("[scaletest] swift=\(Ns) gold=\(Ng) shared=\(inter) symDiff=\(String(format: "%.3f", symFrac*100))%  feats cosine(shared)=\(cos)")
 err((symFrac < 0.02 && cos >= 0.99) ? "SCALETEST PASS (full 7.85M decode verified)" : "SCALETEST CHECK — review numbers")
-print("SCALETEST DONE \(out.count) voxels \(String(format: "%.1f", dt))s")
+
+// --- DiT/sampler scaling: shape SLat sampler at full production scale (19548 tokens) ---
+// Only unproven-at-scale piece left (DiTs were gated on small fixtures). Times a full
+// 12-step CFG sparse sampling loop over ~19548 voxels — the sparse-attention envelope.
+let slatPath = "/Volumes/Satechi/TrellisRedux/models/models--microsoft--TRELLIS.2-4B/snapshots/af44b45f2e35a493886929c6d786e563ec68364d/ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.safetensors"
+let slat = SLatFlowModel(weights: try loadArrays(url: URL(fileURLWithPath: slatPath)))
+let ssCoords = (try golden("ssdec_coords")).asType(.int32)   // ~19548 SS-decoded voxels
+let cond = try golden("cond_512"), neg = try golden("neg_cond_512")
+MLXRandom.seed(0)
+let noise = MLXRandom.normal([ssCoords.dim(0), 32])
+err("[scaletest] shape SLat sampler: \(ssCoords.dim(0)) tokens, 12-step CFG (24 DiT forwards)…")
+let t1 = Date()
+let shapeSlat = FlowEulerSampler.sampleSLat(
+    model: slat, noiseFeats: noise, coords: ssCoords, cond: cond, negCond: neg,
+    guidanceStrength: 7.5, guidanceRescale: 0.5, guidanceInterval: (0.6, 1.0), rescaleT: 3.0)
+MLX.eval(shapeSlat)
+let dt1 = -t1.timeIntervalSinceNow
+err("[scaletest] shape SLat sampled \(shapeSlat.dim(0))×\(shapeSlat.dim(1)) in \(String(format: "%.1f", dt1))s  (\(String(format: "%.1f", dt1/12)) s/step)")
+err("SLAT-SCALE DONE — DiT sparse attention runs at production scale")
+print("SCALETEST DONE decode \(String(format: "%.1f", dt))s  slat-sampler \(String(format: "%.1f", dt1))s")

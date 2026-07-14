@@ -21,7 +21,7 @@ let package = Package(
         // mlx-engine-swift declares `mlx-swift from: 0.31.5`, but a `path` dependency overrides the
         // version constraint (SPM uses the on-disk package for that identity), so the graph resolves
         // on 0.31.3. See the SW6 report for the exact conflict + resolution.
-        .package(path: "../mlx-swift"),
+        .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.31.5"),  // 0.31.6 de-risk-verified (M5 NAX/TF32 within cosine gates; no workaround needed)
         .package(path: "../mlx-swift-mesh"),
         // MLXEngine contract + coordinator + conformance harness (URL-consumed like the sibling
         // -swift wrappers). imageTo3D stable since 1.12.0; 0.30.0 carries the split QuantFootprint,

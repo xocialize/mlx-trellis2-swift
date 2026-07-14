@@ -48,5 +48,13 @@ let package = Package(
             ],
             swiftSettings: [.interoperabilityMode(.Cxx)]
         ),
+        .executableTarget(
+            name: "scaletest",
+            dependencies: [
+                "TRELLIS2",
+                .product(name: "MLX", package: "mlx-swift"),
+            ],
+            swiftSettings: [.interoperabilityMode(.Cxx)]
+        ),
     ]
 )

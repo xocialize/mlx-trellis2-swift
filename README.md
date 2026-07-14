@@ -8,6 +8,17 @@ The build target is on-device garment/accessory generation (the mesh half of a V
 `.xwear` closet); it emits standard glTF (positions / normals / uv1 / indices + base-color
 texture, `alphaMode=OPAQUE`).
 
+Successor to the archived `mlx-trellis2-swift-old` (which hit a geometry-holes wall);
+this is a from-scratch verified re-port built against a PyTorch-on-Apple-Silicon oracle.
+
+## Runs at production scale
+
+The decode → mesh → texture → GLB half runs end-to-end in Swift on the full object:
+the shape decoder handles **7.85M voxels in 19 s** (`swift run -c release scaletest`,
+cosine 0.999 vs golden), and the full mesh+texture bake produces a **watertight textured
+GLB in 30 s** (`swift run -c release meshbake`) — DC-remesh (0 boundary edges) → simplify
+→ UV unwrap → BVH-remap bake (hitFrac 1.0).
+
 ## Status — the whole pipeline is ported and parity-gated
 
 | Stage | File | Parity vs PyTorch oracle |

@@ -20,6 +20,8 @@ log("[generate] loaded (\(String(format: "%.1f", -t0.timeIntervalSinceNow))s). G
 let baked = try pipe.generate(
     cond: try golden("cond_512"), negCond: try golden("neg_cond_512"),
     ssNoise: try golden("ss_noise"), ssPhases: try golden("rope_phases_cossin"),
+    shapeMean: try golden("shape_slat_mean"), shapeStd: try golden("shape_slat_std"),
+    texMean: try golden("tex_slat_mean"), texStd: try golden("tex_slat_std"),
     seed: 0, log: log)
 
 log("[generate] baked: \(baked.vertices.dim(0)) verts, \(baked.faces.dim(0)) faces, atlas \(baked.atlasSize), coverage \(String(format: "%.1f", baked.coverage*100))%")

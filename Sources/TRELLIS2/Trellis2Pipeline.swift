@@ -28,27 +28,40 @@ public final class Trellis2Pipeline {
 
     /// cond/negCond = DINOv3 tokens [1,N,D]; ssNoise = [1,8,16,16,16]; ssPhases = SS-DiT
     /// rope phases for the 16³ grid. Returns a clean textured mesh.
+    /// `shapeMean/Std`, `texMean/Std` = the pipeline's per-channel SLat normalization [32].
+    /// The sampler emits a NORMALIZED latent (std≈1); the decoder needs it DENORMALIZED
+    /// (× std + mean). The tex concat_cond, by contrast, wants the raw normalized shape_slat.
     public func generate(cond: MLXArray, negCond: MLXArray, ssNoise: MLXArray, ssPhases: MLXArray,
+                         shapeMean: MLXArray, shapeStd: MLXArray, texMean: MLXArray, texStd: MLXArray,
                          seed: UInt64 = 0, log: (String) -> Void = { print($0) }) throws -> BakedMesh {
+        // High-guidance CFG (SS r0.7, shape r0.5) is fp-sensitive — the g·vPos−(g−1)·vNeg
+        // near-cancellation amplifies per-forward noise, so bf16-SDPA noise there shows up
+        // as surface speckle. Run the CFG samplers in fp32; keep bf16 for the CFG-free tex.
+        let fastRequested = TRELLIS2Config.fastAttention
+
         // 1) sparse structure: SS sampler → z_s → decode → occupancy coords
         var t = Date()
+        TRELLIS2Config.fastAttention = false
         let zs = FlowEulerSampler.sampleSS(model: ssDit, noise: ssNoise, cond: cond, negCond: negCond, phases: ssPhases,
                                            steps: 12, guidanceStrength: 7.5, guidanceRescale: 0.7,
                                            guidanceInterval: (0.6, 1.0), rescaleT: 5.0)
         let coords = ssDec.coords(ssDec(zs)); MLX.eval(coords)
         log("  [1] sparse structure: \(coords.dim(0)) voxels (\(String(format: "%.1f", -t.timeIntervalSinceNow))s)")
 
-        // 2) shape SLat sampler on those coords
+        // 2) shape SLat sampler on those coords (fp32 SDPA — CFG quality)
         t = Date(); MLXRandom.seed(seed)
         let shapeSlat = FlowEulerSampler.sampleSLat(
             model: shapeDit, noiseFeats: MLXRandom.normal([coords.dim(0), 32]), coords: coords, cond: cond, negCond: negCond,
             guidanceStrength: 7.5, guidanceRescale: 0.5, guidanceInterval: (0.6, 1.0), rescaleT: 3.0)
         MLX.eval(shapeSlat)
+        TRELLIS2Config.fastAttention = fastRequested
         log("  [2] shape SLat sampled (\(String(format: "%.1f", -t.timeIntervalSinceNow))s)")
 
-        // 3) shape decode → 7-ch dual-grid + the subdivision masks (for tex guidance)
+        // 3) shape decode → 7-ch dual-grid + subdivision masks. Denormalize the latent
+        //    (sampler emits normalized; decoder expects std·x+mean).
         t = Date()
-        let (shapeOut, subs) = shapeDec.decodeCapturingSubs(SparseTensor(feats: shapeSlat, coords: coords))
+        let shapeSlatDenorm = shapeSlat * shapeStd + shapeMean
+        let (shapeOut, subs) = shapeDec.decodeCapturingSubs(SparseTensor(feats: shapeSlatDenorm, coords: coords))
         MLX.eval(shapeOut.feats, shapeOut.coords)
         log("  [3] shape decoded: \(shapeOut.count) voxels (\(String(format: "%.1f", -t.timeIntervalSinceNow))s)")
 
@@ -60,9 +73,11 @@ public final class Trellis2Pipeline {
         MLX.eval(texSlat)
         log("  [4] tex SLat sampled (\(String(format: "%.1f", -t.timeIntervalSinceNow))s)")
 
-        // 5) tex decode (guided by the shape's subdivisions → same coords) → base color
+        // 5) tex decode (guided by the shape's subdivisions → same coords) → base color.
+        //    Denormalize the tex latent before decoding.
         t = Date()
-        let texOut = texDec(SparseTensor(feats: texSlat, coords: coords), guidedMasks: subs)
+        let texSlatDenorm = texSlat * texStd + texMean
+        let texOut = texDec(SparseTensor(feats: texSlatDenorm, coords: coords), guidedMasks: subs)
         let baseColor = MLX.clip(texOut.feats[0..., 0..<3] * 0.5 + 0.5, min: 0, max: 1)
         MLX.eval(baseColor)
         log("  [5] tex decoded: \(texOut.count) voxels (\(String(format: "%.1f", -t.timeIntervalSinceNow))s)")

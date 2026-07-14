@@ -50,15 +50,29 @@ let slatPath = "/Volumes/Satechi/TrellisRedux/models/models--microsoft--TRELLIS.
 let slat = SLatFlowModel(weights: try loadArrays(url: URL(fileURLWithPath: slatPath)))
 let ssCoords = (try golden("ssdec_coords")).asType(.int32)   // ~19548 SS-decoded voxels
 let cond = try golden("cond_512"), neg = try golden("neg_cond_512")
+
+// bf16-SDPA accuracy check: single forward vs the fp32 slat golden (expect ≈0.99+).
+TRELLIS2Config.fastAttention = true
+let bfIn = SparseTensor(feats: try golden("slat_in_feats"), coords: (try golden("slat_in_coords")).asType(.int32))
+let bfOut = slat(bfIn, t: try golden("ssdit_in_t"), cond: cond).feats
+let bg = try golden("slat_out_feats")
+let ba = bfOut.reshaped([-1]).asType(.float32), bb = bg.reshaped([-1]).asType(.float32)
+let bfCos = ((ba*bb).sum() / (MLX.sqrt((ba*ba).sum()) * MLX.sqrt((bb*bb).sum()))).item(Float.self)
+err("[scaletest] bf16-SDPA forward cosine vs fp32 golden = \(bfCos)  (expect ≈0.99+)")
+
+// bf16-SDPA shape SLat sampler timing (production inference path).
 MLXRandom.seed(0)
 let noise = MLXRandom.normal([ssCoords.dim(0), 32])
-err("[scaletest] shape SLat sampler: \(ssCoords.dim(0)) tokens, 12-step CFG (24 DiT forwards)…")
+err("[scaletest] shape SLat sampler (bf16 SDPA): \(ssCoords.dim(0)) tokens, 12-step CFG (24 forwards)…")
 let t1 = Date()
 let shapeSlat = FlowEulerSampler.sampleSLat(
     model: slat, noiseFeats: noise, coords: ssCoords, cond: cond, negCond: neg,
     guidanceStrength: 7.5, guidanceRescale: 0.5, guidanceInterval: (0.6, 1.0), rescaleT: 3.0)
 MLX.eval(shapeSlat)
 let dt1 = -t1.timeIntervalSinceNow
-err("[scaletest] shape SLat sampled \(shapeSlat.dim(0))×\(shapeSlat.dim(1)) in \(String(format: "%.1f", dt1))s  (\(String(format: "%.1f", dt1/12)) s/step)")
-err("SLAT-SCALE DONE — DiT sparse attention runs at production scale")
-print("SCALETEST DONE decode \(String(format: "%.1f", dt))s  slat-sampler \(String(format: "%.1f", dt1))s")
+let fin = shapeSlat.reshaped([-1])
+let allFinite = MLX.all(fin .== fin).item(Bool.self)   // NaN check
+let fmean = fin.mean(); let fstd = MLX.sqrt(((fin - fmean) * (fin - fmean)).mean()).item(Float.self)
+err("[scaletest] shape SLat sampled \(shapeSlat.dim(0))×\(shapeSlat.dim(1)) in \(String(format: "%.1f", dt1))s (\(String(format: "%.1f", dt1/12)) s/step)  finite=\(allFinite) std=\(fstd)")
+err("SLAT-SCALE DONE — bf16-SDPA DiT at production scale")
+print("SCALETEST DONE decode \(String(format: "%.1f", dt))s  slat-sampler(bf16) \(String(format: "%.1f", dt1))s  fwdCos \(bfCos)")

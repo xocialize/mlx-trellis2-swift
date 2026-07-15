@@ -84,10 +84,19 @@ extension Trellis2Configuration: WeightSourcing {
         "struct_flow.safetensors",
         "struct_dec.safetensors",
         "shape_flow_512.safetensors",
+        "shape_flow_1024.safetensors",
         "shape_dec.safetensors",
         "tex_flow_512.safetensors",
+        "tex_flow_1024.safetensors",
         "tex_dec.safetensors",
     ]
+
+    /// A canonical ORIGINAL-upstream tensor key. The snapshot must carry it; the OLD broken port
+    /// shipped renamed keys (`adaLN.weight`/`b0.`) under the SAME filenames, which a filename-only
+    /// probe served as "present" → the 2026-07-14 nil-unwrap crash. `snapshotPresent` reads the
+    /// struct_flow safetensors header and re-reports the snapshot missing (→ re-materialize) if this
+    /// key is absent, so a content swap under a stable filename can't silently degrade.
+    public static let canonicalKey = "adaLN_modulation.1.weight"
 
     /// ONE consolidated snapshot source. The upstream 3-repo chain stays a load()-time fallback for
     /// pre-staged dev machines and is deliberately NOT declared (a fresh machine materializes the
@@ -115,7 +124,21 @@ extension Trellis2Configuration: WeightSourcing {
 
     static func snapshotPresent(at dir: URL) -> Bool {
         let fm = FileManager.default
-        return probeFiles.allSatisfy { fm.fileExists(atPath: dir.appending(path: $0).path) }
+        guard probeFiles.allSatisfy({ fm.fileExists(atPath: dir.appending(path: $0).path) }) else { return false }
+        // Content guard (not filename-only): the struct_flow snapshot must carry the ORIGINAL keys.
+        return safetensorsHeaderContains(dir.appending(path: "struct_flow.safetensors"), key: canonicalKey)
+    }
+
+    /// Cheap content probe: a safetensors file starts with an 8-byte little-endian header length, then
+    /// that many bytes of JSON whose keys are the tensor names. Read only the header (≪ the multi-GB
+    /// file) and substring-match `key`. Returns false on any read error (⇒ treat as missing/re-fetch).
+    static func safetensorsHeaderContains(_ url: URL, key: String) -> Bool {
+        guard let fh = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? fh.close() }
+        guard let lenBytes = try? fh.read(upToCount: 8), lenBytes.count == 8 else { return false }
+        let n = lenBytes.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }.littleEndian
+        guard n > 0, n < 100_000_000, let header = try? fh.read(upToCount: Int(n)) else { return false }
+        return header.range(of: Data(key.utf8)) != nil
     }
 }
 
@@ -159,22 +182,25 @@ public final class Trellis2Package: ModelPackage {
                 portCodeLicense: .mit),    // C8 — our Swift port
             provenance: Provenance(sourceRepo: "microsoft/TRELLIS.2-4B", revision: "main", tier: 3),
             requirements: RequirementsManifest(
-                // Split footprint (contract 1.14), res512 default tier. Grounded in a MEASURED engine
-                // e2e run (res512, MLXServeEngine, GPU): governor charged 21.00 GB resident; MLX-pool
-                // peak 31.17 GB in a 123 s run ⇒ pool activation ~10.2 GB. Still flagged for an in-app
-                // phys_footprint re-baseline (the CLI GPU.peakMemory under-reads true phys ~2.7×, and
-                // phys is the admission basis) before the registry Eff flips to ✅.
-                //   residentBytes = 21 GB — the pipeline holds all 7 components resident at once with
-                //     NO per-stage eviction, and every constructor casts weights to fp32 (the parity
-                //     dtype). On-disk bf16/fp16 ~11 GB → ~21 GB fp32-resident (matches the governor
-                //     charge above). Declaring `.bf16` quant with an fp32-resident floor is deliberate
-                //     — the manifest reports the memory this build actually occupies. P0 efficiency
-                //     follow-up (bf16-resident weights + per-stage load→use→evict) would ~halve it.
-                //   peakActivationBytes = 11 GB — measured MLX-pool activation ~10.2 GB (sparse
-                //     full-attention over ~19.5k SLat tokens O(T²) + the shape/tex decodes) + margin.
+                // Split footprint (contract 1.14). The pipeline now runs the '1024' tier (SS decoder
+                // emits 64³ occupancy; shape/tex use the resolution-matched 1024 flow models with
+                // dual-res DINOv3 — cond_512 for SS, cond_1024 for shape/tex, concatenated per view).
+                //   residentBytes = 21 GB — UNCHANGED: the 512→1024 flow models are a SWAP (same 7
+                //     components, same ~2.58 GB each), not an add; still all-resident, fp32-cast (parity
+                //     dtype), no per-stage eviction. Matches the MEASURED governor charge (21.00 GB) from
+                //     the res512 e2e run; on-disk bf16/fp16 ~11 GB → ~21 GB fp32-resident.
+                //   peakActivationBytes = 16 GB — ESTIMATE, raised from the 11 GB res512/single-view
+                //     baseline (MLX-pool peak 31.17 GB ⇒ ~10.2 GB activation). The dominant O(T²)
+                //     self-attention over ~19.5k SLat tokens is unchanged, but the shape/tex cross-
+                //     attention cond grew 1029→4101 tokens per view (×4) and multi-view CONCATENATES
+                //     across views (3 views ⇒ ~12.3k cond tokens), plus a second DINOv3 forward per view
+                //     at 1024² (4096 patches). +~45% margin over the 512 baseline; conservative to keep
+                //     admission safe. STILL flagged for an in-app phys_footprint re-baseline on the 1024
+                //     multi-view path (the CLI GPU.peakMemory under-reads true phys ~2.7×, and phys is
+                //     the admission basis) before the registry Eff flips to ✅.
                 footprints: [QuantFootprint(quant: .bf16,
                                             residentBytes: 21_000_000_000,
-                                            peakActivationBytes: 11_000_000_000)],
+                                            peakActivationBytes: 16_000_000_000)],
                 requiredBackends: [.metalGPU],
                 os: OSRequirement(minMacOS: SemanticVersion(major: 26, minor: 0, patch: 0)),
                 chipFloor: .pro),
@@ -253,10 +279,19 @@ public final class Trellis2Package: ModelPackage {
 
         // Preprocess the (assumed pre-masked / plain) input to DINOv3's NCHW [1,3,512,512]. Background
         // removal (BiRefNet matting) is a SEPARATE package composed at the app layer — a follow-up.
-        let pixels = try ImagePreprocess.dinoPixels(from: req.image)
+        // Multi-view: the front image plus any `additionalViews` (front/side/back turnaround of the SAME
+        // subject) are each preprocessed and conditioned together — DINOv3 per view, tokens concatenated
+        // (see encodeImages), matching the oracle's multi-image get_cond.
+        // Dual-resolution conditioning (oracle '1024' tier): SS uses cond_512, shape+tex use cond_1024.
+        // DINOv3 is resolution-agnostic (patch grid derived from input dims), so 512² and 1024² inputs
+        // both work; each view is preprocessed at both sizes and its tokens concatenated per size.
+        let views = [req.image] + (req.additionalViews ?? [])
+        let px512 = try views.map { try ImagePreprocess.dinoPixels(from: $0, size: 512) }
+        let px1024 = try views.map { try ImagePreprocess.dinoPixels(from: $0, size: 1024) }
         try Task.checkCancellation()
 
-        let (cond, negCond) = pipeline.encodeImage(pixels)
+        let (cond, negCond) = pipeline.encodeImages(px512)
+        let (cond1024, negCond1024) = pipeline.encodeImages(px1024)
         try Task.checkCancellation()
 
         // In-package SS constants (no goldens dir): the deterministic 16³ RoPE grid + seeded noise.
@@ -266,7 +301,8 @@ public final class Trellis2Package: ModelPackage {
         // The pipeline's samplers/decoders honor cooperative cancellation at their step/layer seams
         // (they read the ambient Task); generate() is the long-running body.
         let baked = try pipeline.generate(
-            cond: cond, negCond: negCond, ssNoise: ssNoise, ssPhases: ssPhases,
+            cond: cond, negCond: negCond, cond1024: cond1024, negCond1024: negCond1024,
+            ssNoise: ssNoise, ssPhases: ssPhases,
             shapeMean: MLXArray(shapeMean), shapeStd: MLXArray(shapeStd),
             texMean: MLXArray(texMean), texStd: MLXArray(texStd),
             texture: configuration.texture, targetFaces: configuration.decimateFaces ?? 120_000,

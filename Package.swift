@@ -26,7 +26,7 @@ let package = Package(
         // MLXEngine contract + coordinator + conformance harness (URL-consumed like the sibling
         // -swift wrappers). imageTo3D stable since 1.12.0; 0.30.0 carries the split QuantFootprint,
         // MAT gate (MaterializationConformance) and CAN gate (CancellationConformance).
-        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.30.0"),
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.31.0"),
         // First-run auto-materialization (MAT): HubClient snapshot download into the ModelStore layout.
         .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
     ],

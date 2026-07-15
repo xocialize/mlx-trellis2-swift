@@ -40,17 +40,33 @@ public final class Trellis2Pipeline {
         }
         ssDit = SparseStructureFlowModel(weights: try load("struct_flow"))
         ssDec = SparseStructureDecoder(weights: try load("struct_dec"))
-        shapeDit = SLatFlowModel(weights: try load("shape_flow_512"))
+        // The SS decoder emits 64³ occupancy, so shape/tex SLat run on a 64³ coord grid (= the
+        // oracle '1024' tier); load the resolution-matched 1024 flow models, NOT the 512 ones
+        // (running shape_flow_512/tex_flow_512 on 64³ coords was off-distribution). Conditioned on
+        // cond_1024 (DINOv3 at image_size 1024) in generate(); SS still uses cond_512.
+        shapeDit = SLatFlowModel(weights: try load("shape_flow_1024"))
         shapeDec = ShapeSlatDecoder(weights: try load("shape_dec"))
-        texDit = SLatFlowModel(weights: try load("tex_flow_512"))
+        texDit = SLatFlowModel(weights: try load("tex_flow_1024"))
         texDec = ShapeSlatDecoder(weights: try load("tex_dec"))
         dino = DINOv3(weights: try load("dino"))
     }
 
-    /// Image conditioning: preprocessed pixels [1,3,512,512] → DINOv3 tokens.
-    /// neg_cond is zeros (matches get_cond's `torch.zeros_like`).
+    /// Single-view image conditioning: preprocessed pixels [1,3,512,512] → DINOv3 tokens.
     public func encodeImage(_ pixels: MLXArray) -> (cond: MLXArray, negCond: MLXArray) {
-        let cond = dino(pixels)
+        encodeImages([pixels])
+    }
+
+    /// Multi-view image conditioning. Each element is one view's preprocessed pixels [1,3,512,512]
+    /// (front + additional views of the SAME subject). DINOv3 runs per view (its patch-embed assumes
+    /// batch 1, so we don't batch), then the per-view token sets are CONCATENATED along the sequence
+    /// into a single [1, K·N, D] context — matching the oracle's `get_cond`
+    /// (`cond = image_cond_model(images); cond.reshape(1, -1, D)`). K=1 is the single-view identity.
+    /// neg_cond is zeros (matches get_cond's `torch.zeros_like`).
+    public func encodeImages(_ pixelsPerView: [MLXArray]) -> (cond: MLXArray, negCond: MLXArray) {
+        precondition(!pixelsPerView.isEmpty, "encodeImages requires at least one view")
+        let perView = pixelsPerView.map { dino($0) }                 // each [1, N, D]
+        let cond = perView.count == 1 ? perView[0]
+                                      : MLX.concatenated(perView, axis: 1)   // [1, K·N, D]
         return (cond, MLXArray.zeros(cond.shape, dtype: cond.dtype))
     }
 
@@ -63,7 +79,11 @@ public final class Trellis2Pipeline {
     /// ~2× faster). `targetFaces` → decimation target for MeshBake. `yUp` → emit Y-up
     /// (x,y,z)→(x,z,−y), the glTF/VRM convention required BEFORE rigging (a post-rig
     /// reorientation mis-composes with clip playback).
-    public func generate(cond: MLXArray, negCond: MLXArray, ssNoise: MLXArray, ssPhases: MLXArray,
+    /// `cond`/`negCond` = SS conditioning (DINOv3 at image_size 512, the oracle's cond_512 — SS
+    /// always uses the 512 tokens). `cond1024`/`negCond1024` = shape+tex conditioning (DINOv3 at
+    /// image_size 1024). Pass the same array for both to run single-resolution.
+    public func generate(cond: MLXArray, negCond: MLXArray,
+                         cond1024: MLXArray, negCond1024: MLXArray, ssNoise: MLXArray, ssPhases: MLXArray,
                          shapeMean: MLXArray, shapeStd: MLXArray, texMean: MLXArray, texStd: MLXArray,
                          texture: Bool = true, targetFaces: Int = 120_000, yUp: Bool = false,
                          seed: UInt64 = 0, log: (String) -> Void = { print($0) }) throws -> BakedMesh {
@@ -84,7 +104,7 @@ public final class Trellis2Pipeline {
         // 2) shape SLat sampler on those coords (fp32 SDPA — CFG quality)
         t = Date(); MLXRandom.seed(seed)
         let shapeSlat = FlowEulerSampler.sampleSLat(
-            model: shapeDit, noiseFeats: MLXRandom.normal([coords.dim(0), 32]), coords: coords, cond: cond, negCond: negCond,
+            model: shapeDit, noiseFeats: MLXRandom.normal([coords.dim(0), 32]), coords: coords, cond: cond1024, negCond: negCond1024,
             guidanceStrength: 7.5, guidanceRescale: 0.5, guidanceInterval: (0.6, 1.0), rescaleT: 3.0)
         MLX.eval(shapeSlat)
         TRELLIS2Config.fastAttention = fastRequested
@@ -104,7 +124,7 @@ public final class Trellis2Pipeline {
         if texture {
             t = Date(); MLXRandom.seed(seed &+ 1)
             let texSlat = FlowEulerSampler.sampleSLat(
-                model: texDit, noiseFeats: MLXRandom.normal([coords.dim(0), 32]), coords: coords, cond: cond, negCond: negCond,
+                model: texDit, noiseFeats: MLXRandom.normal([coords.dim(0), 32]), coords: coords, cond: cond1024, negCond: negCond1024,
                 concatCond: shapeSlat, guidanceStrength: 1.0, guidanceRescale: 0.0, guidanceInterval: (0.6, 0.9), rescaleT: 3.0)
             MLX.eval(texSlat)
             log("  [4] tex SLat sampled (\(String(format: "%.1f", -t.timeIntervalSinceNow))s)")

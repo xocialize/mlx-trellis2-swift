@@ -83,11 +83,27 @@ check("C13 registration (IoC)", registration.manifest.capabilities == [.imageTo3
 // ---------------------------------------------------------------------------------------------
 section("MAT-1..5 (MaterializationConformance, offline)")
 
+/// A minimal VALID safetensors byte stream (8-byte LE header length + JSON header) carrying the
+/// canonical original key — so `snapshotPresent`'s content guard (which reads struct_flow's header)
+/// treats the staged snapshot as genuine, not a renamed-key stale one. Other files stay stubs (the
+/// guard only inspects struct_flow).
+func safetensorsStub(withKey key: String) -> Data {
+    let headerJSON = Data("{\"\(key)\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]},\"__metadata__\":{}}".utf8)
+    var out = Data()
+    withUnsafeBytes(of: UInt64(headerJSON.count).littleEndian) { out.append(contentsOf: $0) }
+    out.append(headerJSON)
+    out.append(Data(count: 4))   // the one f32 tensor's bytes
+    return out
+}
+
 func stagedSnapshotDir() throws -> URL {
     let dir = FileManager.default.temporaryDirectory.appending(path: "trellis2-mat-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     for f in Trellis2Configuration.probeFiles {
-        FileManager.default.createFile(atPath: dir.appending(path: f).path, contents: Data("probe".utf8))
+        let contents = f == "struct_flow.safetensors"
+            ? safetensorsStub(withKey: Trellis2Configuration.canonicalKey)
+            : Data("probe".utf8)
+        FileManager.default.createFile(atPath: dir.appending(path: f).path, contents: contents)
     }
     return dir
 }

@@ -24,8 +24,10 @@ let (cond, negCond) = pipe.encodeImage(try golden("dino_in_pixels"))
 MLX.eval(cond, negCond)
 log("[generate] DINOv3 cond \(cond.shape) computed natively")
 
+// Smoke harness: only the 512 golden pixels exist, so reuse cond for both tiers (the app builds a
+// real cond_1024 from 1024² preprocess). Exercises the pipeline end-to-end, not a strict 1024 golden.
 let baked = try pipe.generate(
-    cond: cond, negCond: negCond,
+    cond: cond, negCond: negCond, cond1024: cond, negCond1024: negCond,
     ssNoise: try golden("ss_noise"), ssPhases: try golden("rope_phases_cossin"),
     shapeMean: try golden("shape_slat_mean"), shapeStd: try golden("shape_slat_std"),
     texMean: try golden("tex_slat_mean"), texStd: try golden("tex_slat_std"),

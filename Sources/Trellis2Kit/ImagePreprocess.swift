@@ -22,7 +22,7 @@ enum ImagePreprocess {
 
     /// Decode the canonical `Image`, apply the rembg-aware crop/composite, and return the normalized
     /// NCHW `[1,3,512,512]` pixel array DINOv3 expects.
-    static func dinoPixels(from image: Image) throws -> MLXArray {
+    static func dinoPixels(from image: Image, size: Int = Self.size) throws -> MLXArray {
         let (cg, hasAlpha) = try decodeCGImage(image)
         let side0 = max(cg.width, cg.height)
         let scale = side0 > maxSide ? Double(maxSide) / Double(side0) : 1.0

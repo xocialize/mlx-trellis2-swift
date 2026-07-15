@@ -22,7 +22,8 @@ let package = Package(
         // version constraint (SPM uses the on-disk package for that identity), so the graph resolves
         // on 0.31.3. See the SW6 report for the exact conflict + resolution.
         .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.31.5"),  // 0.31.6 de-risk-verified (M5 NAX/TF32 within cosine gates; no workaround needed)
-        .package(path: "../mlx-swift-mesh"),
+        // (mlx-swift-mesh + SwiftXatlas are now VENDORED in-tree as the MLXMesh/Xatlas/Cxatlas targets
+        //  below — self-contained, no external path deps; see THIRD_PARTY_LICENSES.md.)
         // MLXEngine contract + coordinator + conformance harness (URL-consumed like the sibling
         // -swift wrappers). imageTo3D stable since 1.12.0; 0.30.0 carries the split QuantFootprint,
         // MAT gate (MaterializationConformance) and CAN gate (CancellationConformance).
@@ -39,9 +40,9 @@ let package = Package(
                 .product(name: "MLXFast", package: "mlx-swift"),
                 .product(name: "MLXLinalg", package: "mlx-swift"),
                 .product(name: "MLXRandom", package: "mlx-swift"),
-                .product(name: "MLXMesh", package: "mlx-swift-mesh"),
+                "MLXMesh",   // vendored (was the mlx-swift-mesh package product)
             ],
-            swiftSettings: [.interoperabilityMode(.Cxx)]  // MLXMesh consumes SwiftXatlas C++ interop
+            swiftSettings: [.interoperabilityMode(.Cxx)]  // MLXMesh consumes the vendored xatlas C++ interop
         ),
         // The MLXToolKit ModelPackage conformer (capability imageTo3D). Offline-buildable against
         // MLXToolKit alone; HuggingFace is only touched at load()-time materialization.
@@ -97,5 +98,38 @@ let package = Package(
             .product(name: "MLXToolKit", package: "mlx-engine-swift"),
             .product(name: "MLX", package: "mlx-swift"),
         ], swiftSettings: [.interoperabilityMode(.Cxx)]),
-    ]
+        // --- VENDORED mesh + xatlas (were ../mlx-swift-mesh + ../SwiftXatlas path deps; folded
+        //     in-tree so the package is self-contained and we own maintenance). ---
+        // xatlas C++ (jpcy/xatlas, MIT — see THIRD_PARTY_LICENSES.md): the atlas UV parameterizer,
+        // built from the vendored xatlas.cpp + a thin C shim (symlinks dereferenced into real files).
+        .target(
+            name: "Cxatlas",
+            path: "Sources/Cxatlas",
+            publicHeadersPath: "include",
+            cxxSettings: [
+                .headerSearchPath("include"),
+                .define("NDEBUG"),   // silence xatlas internal XA_DEBUG_ASSERTs on consumer error paths
+            ]
+        ),
+        // Swift C++-interop wrapper over Cxatlas.
+        .target(
+            name: "Xatlas",
+            dependencies: ["Cxatlas"],
+            path: "Sources/Xatlas",
+            swiftSettings: [.interoperabilityMode(.Cxx)]
+        ),
+        // MLX mesh ops (BVH, DC-remesh, simplify, UV unwrap) — consumes Xatlas.
+        .target(
+            name: "MLXMesh",
+            dependencies: [
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXFast", package: "mlx-swift"),
+                .product(name: "MLXLinalg", package: "mlx-swift"),
+                "Xatlas",
+            ],
+            path: "Sources/MLXMesh",
+            swiftSettings: [.interoperabilityMode(.Cxx)]
+        ),
+    ],
+    cxxLanguageStandard: .cxx14
 )

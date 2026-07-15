@@ -1,0 +1,6 @@
+module Cxatlas {
+    header "xatlas.h"
+    header "xatlas_shim.h"
+    requires cplusplus
+    export *
+}

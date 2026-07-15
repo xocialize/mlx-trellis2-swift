@@ -55,7 +55,8 @@ public enum MeshBake {
             log("  simplified: \(mesh.vertexCount) verts, \(mesh.faceCount) faces")
         }
 
-        // 3) UV unwrap
+        // 3) UV unwrap (xatlas, via MLXMesh). MUST come AFTER the remesh+simplify above: xatlas on the
+        //    raw dual-grid mesh is pathologically slow (~2.2h); on the cleaned mesh it's fast.
         let uv = try mesh.uvUnwrap()
         let finalMesh = uv.mesh
         MLX.eval(finalMesh.vertices, finalMesh.faces, uv.uvs)

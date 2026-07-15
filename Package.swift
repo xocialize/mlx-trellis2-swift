@@ -102,6 +102,11 @@ let package = Package(
         //     in-tree so the package is self-contained and we own maintenance). ---
         // xatlas C++ (jpcy/xatlas, MIT — see THIRD_PARTY_LICENSES.md): the atlas UV parameterizer,
         // built from the vendored xatlas.cpp + a thin C shim (symlinks dereferenced into real files).
+        // LIVE DEPENDENCY — do NOT strip as dead weight: it's the UV-unwrap backend the texture bake
+        // actually calls (MeshBake.run → mesh.uvUnwrap() → MLXMesh/UVUnwrap.swift → Xatlas.Atlas()).
+        // It's fast ONLY because MeshBake unwraps the DC-remeshed + simplified mesh; RAW xatlas on the
+        // unconditioned dual-grid mesh is pathologically slow (~2.2h) — the reason it was first
+        // abandoned. Conditioned-unwrap is the reference-fidelity path (mirrors cumesh.uv_unwrap).
         .target(
             name: "Cxatlas",
             path: "Sources/Cxatlas",

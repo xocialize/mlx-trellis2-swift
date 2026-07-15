@@ -189,18 +189,17 @@ public final class Trellis2Package: ModelPackage {
                 //     components, same ~2.58 GB each), not an add; still all-resident, fp32-cast (parity
                 //     dtype), no per-stage eviction. Matches the MEASURED governor charge (21.00 GB) from
                 //     the res512 e2e run; on-disk bf16/fp16 ~11 GB → ~21 GB fp32-resident.
-                //   peakActivationBytes = 16 GB — ESTIMATE, raised from the 11 GB res512/single-view
-                //     baseline (MLX-pool peak 31.17 GB ⇒ ~10.2 GB activation). The dominant O(T²)
-                //     self-attention over ~19.5k SLat tokens is unchanged, but the shape/tex cross-
-                //     attention cond grew 1029→4101 tokens per view (×4) and multi-view CONCATENATES
-                //     across views (3 views ⇒ ~12.3k cond tokens), plus a second DINOv3 forward per view
-                //     at 1024² (4096 patches). +~45% margin over the 512 baseline; conservative to keep
-                //     admission safe. STILL flagged for an in-app phys_footprint re-baseline on the 1024
-                //     multi-view path (the CLI GPU.peakMemory under-reads true phys ~2.7×, and phys is
-                //     the admission basis) before the registry Eff flips to ✅.
+                //   peakActivationBytes = 18 GB — MEASURED (2026-07-14, in-app phys_footprint on the
+                //     1024 multi-view front door, 3 views): real process peak 42.05 GB. Subtract the
+                //     governor-measured 21 GB resident and the app/engine baseline (klein/BiRefNet are
+                //     evicted before the trellis run, so a few GB) ⇒ trellis transient ~15-18 GB; declare
+                //     18 for margin. This is the honest phys re-baseline (phys is the admission basis;
+                //     the earlier CLI GPU.peakMemory under-read it ~2.7×). The transient is dominated by
+                //     the shape/tex cross-attention over ~12.3k concatenated cond tokens (3 views × 4101)
+                //     + the O(T²) self-attention over ~19.5k SLat tokens. Registry Eff now ✅.
                 footprints: [QuantFootprint(quant: .bf16,
                                             residentBytes: 21_000_000_000,
-                                            peakActivationBytes: 16_000_000_000)],
+                                            peakActivationBytes: 18_000_000_000)],
                 requiredBackends: [.metalGPU],
                 os: OSRequirement(minMacOS: SemanticVersion(major: 26, minor: 0, patch: 0)),
                 chipFloor: .pro),

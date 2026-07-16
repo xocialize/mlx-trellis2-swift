@@ -46,6 +46,12 @@ public struct S2CTopology {
         self.src = MLXArray(srcA)
         self.newCoords = MLXArray(coordsA).reshaped([np, 4])
     }
+    /// per-parent child-occupancy mask [nParent, 8] (1 = child voxel exists). This is the
+    /// subdivision record the DECODER needs as guidance to reproduce the encoder's voxel
+    /// structure (upstream carries it via the SparseTensor spatial cache).
+    public var childMask: MLXArray {
+        (src .!= Int32(N)).asType(.int32).reshaped([nParent, 8])
+    }
     /// gather each parent's 8 child slots from feats [N,C] -> [nParent, C*8].
     public func apply(_ feats: MLXArray) -> MLXArray {
         let C = feats.dim(1)
@@ -79,7 +85,7 @@ public final class ShapeSlatEncoder {
 
     /// S2C ResBlock: norm1->silu->conv1(ch->out/8)->S2C(h)&S2C(x)->norm2->silu->conv2 + group-mean skip.
     private func downBlock(_ x: SparseTensor, _ p: String, ch: Int, out: Int, mapCur: NeighborMap27)
-        -> (SparseTensor, NeighborMap27) {
+        -> (SparseTensor, NeighborMap27, coords: MLXArray, mask: MLXArray) {
         var h = SparseOps.silu(layerNorm32(x.feats, weight: w["\(p).norm1.weight"], bias: w["\(p).norm1.bias"]))
         h = SparseOps.conv(h, w["\(p).conv1.weight"]!, w["\(p).conv1.bias"]!, mapCur)   // [N, out/8]
         let topo = S2CTopology(coords: x.coords)
@@ -90,26 +96,38 @@ public final class ShapeSlatEncoder {
         h2 = SparseOps.conv(h2, w["\(p).conv2.weight"]!, w["\(p).conv2.bias"]!, mapNew)
         let g = (ch * 8) / out
         let skip = xC.reshaped([topo.nParent, out, g]).mean(axis: -1)   // group-mean skip
-        return (SparseTensor(feats: h2 + skip, coords: topo.newCoords), mapNew)
+        return (SparseTensor(feats: h2 + skip, coords: topo.newCoords), mapNew, topo.newCoords, topo.childMask)
     }
 
     /// vertices.feats [N,3] (∈[0,1]) + intersected.feats [N,3] (∈{0,1}) -> z [P,32].
     public func callAsFunction(_ vertices: SparseTensor, _ intersected: SparseTensor) -> SparseTensor {
+        encodeCapturingMasks(vertices, intersected).slat
+    }
+
+    /// Like callAsFunction, but also returns the per-down-level subdivision record
+    /// (parent coords at the coarser level + child-occupancy mask [P,8]), coarsest LAST.
+    /// These are the guidance the tex decoder needs to land on the encoder's voxel set
+    /// (upstream's SparseTensor spatial-cache mechanism, made explicit).
+    public func encodeCapturingMasks(_ vertices: SparseTensor, _ intersected: SparseTensor)
+        -> (slat: SparseTensor, masks: [(coords: MLXArray, mask: MLXArray)]) {
         let x6 = MLX.concatenated([vertices.feats - 0.5, intersected.feats - 0.5], axis: 1)   // [N,6]
         var h = vertices.replace(SparseOps.linear(x6, w["input_layer.weight"]!, w["input_layer.bias"]!))
         var map = NeighborMap27(h.coords)
+        var masks: [(coords: MLXArray, mask: MLXArray)] = []
         for (i, lvl) in levels.enumerated() {
             for j in 0..<lvl.n {
                 h = convNeXt(h, "blocks.\(i).\(j)", map); MLX.eval(h.feats)
             }
             if let out = lvl.down {
-                (h, map) = downBlock(h, "blocks.\(i).\(lvl.n)", ch: lvl.ch, out: out, mapCur: map)
+                let (hh, mapNew, pc, mask) = downBlock(h, "blocks.\(i).\(lvl.n)", ch: lvl.ch, out: out, mapCur: map)
+                h = hh; map = mapNew
+                masks.append((pc, mask))
                 MLX.eval(h.feats, h.coords)
             }
         }
         var o = layerNorm32(h.feats, eps: 1e-5)                          // final non-affine LN
         o = SparseOps.linear(o, w["to_latent.weight"]!, w["to_latent.bias"]!)   // [P,64]
         let z = o[0..., 0..<32]                                          // mean (chunk-2 first half)
-        return h.replace(z)
+        return (h.replace(z), masks)
     }
 }

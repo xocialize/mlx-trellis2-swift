@@ -112,6 +112,57 @@ public enum MeshBake {
     }
 
     /// Fill unfilled texels from filled 4-neighbours (seam/gap inpaint, push-out).
+    /// UV-preserving bake for TEXTURING an existing mesh: rasterize the mesh's OWN UVs and
+    /// sample the PBR voxel field at each texel's surface position. No remesh/unwrap/BVH —
+    /// the voxels were generated from this exact geometry, so texel positions lie on the
+    /// shell already (mirrors trellis2_texturing.postprocess_mesh's keep-existing-UVs branch).
+    ///
+    /// `uvs` are glTF-convention [V,2] (v down); the atlas is written so that a glTF sampler
+    /// reading these UVs sees the right texel (row = (1-v)·S). `texFeats` [N,C>=3] in [0,1]
+    /// (decoder output already mapped via ·0.5+0.5); channel 0..3 baked as RGB.
+    public static func bakeWithUVs(
+        vertices: MLXArray, faces: MLXArray, uvs: MLXArray,
+        texFeats: MLXArray, texCoords: MLXArray, fineRes: Float, atlasSize: Int,
+        log: (String) -> Void = { print($0) }
+    ) -> (rgba: [UInt8], filled: [Bool], coverage: Float) {
+        let uvPix = MLX.concatenated([uvs[0..., 0..<1], 1 - uvs[0..., 1..<2]], axis: 1) * Float(atlasSize)
+        let (pix, fid, bary) = UVRasterize.rasterize(uvsPix: uvPix, faces: faces, textureSize: atlasSize)
+        MLX.eval(pix, fid, bary)
+        let K = fid.dim(0)
+
+        let faceVerts = faces.take(fid, axis: 0)
+        let v0 = vertices.take(faceVerts[0..., 0], axis: 0)
+        let v1 = vertices.take(faceVerts[0..., 1], axis: 0)
+        let v2 = vertices.take(faceVerts[0..., 2], axis: 0)
+        let pos = bary[0..., 0..<1] * v0 + bary[0..., 1..<2] * v1 + bary[0..., 2..<3] * v2
+        let query = ((pos + 0.5) * fineRes).reshaped([1, K, 3])
+        let sampled = GridSample3d.sample(feats: texFeats[0..., 0..<3], coords: texCoords, grid: query, mode: "trilinear")[0]
+        MLX.eval(sampled)
+
+        let px = pix.asType(.int32).asArray(Int32.self)
+        let col = MLX.clip(sampled, min: 0, max: 1).asArray(Float.self)
+        var rgb = [Float](repeating: 0, count: atlasSize * atlasSize * 3)
+        var filled = [Bool](repeating: false, count: atlasSize * atlasSize)
+        for k in 0..<K {
+            let x = Int(px[k*2]), y = Int(px[k*2+1])
+            let p = y * atlasSize + x
+            rgb[p*3] = col[k*3]; rgb[p*3+1] = col[k*3+1]; rgb[p*3+2] = col[k*3+2]
+            filled[p] = true
+        }
+        let coverage = Float(filled.lazy.filter { $0 }.count) / Float(atlasSize * atlasSize)
+        let filledBefore = filled
+        dilateInpaint(&rgb, &filled, atlasSize, iterations: 12)
+        var rgba = [UInt8](repeating: 0, count: atlasSize * atlasSize * 4)
+        for p in 0..<(atlasSize * atlasSize) {
+            rgba[p*4] = UInt8(max(0, min(255, Int(rgb[p*3] * 255 + 0.5))))
+            rgba[p*4+1] = UInt8(max(0, min(255, Int(rgb[p*3+1] * 255 + 0.5))))
+            rgba[p*4+2] = UInt8(max(0, min(255, Int(rgb[p*3+2] * 255 + 0.5))))
+            rgba[p*4+3] = 255
+        }
+        log("  bakeWithUVs: \(K) texels, coverage \(String(format: "%.3f", coverage))")
+        return (rgba, filledBefore, coverage)
+    }
+
     static func dilateInpaint(_ rgb: inout [Float], _ filled: inout [Bool], _ S: Int, iterations: Int) {
         for _ in 0..<iterations {
             var newlyFilled = [(Int, Float, Float, Float)]()

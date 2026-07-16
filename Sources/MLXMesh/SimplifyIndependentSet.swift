@@ -26,7 +26,11 @@ private let lubyRoundKernel: MLXFastKernel = MLXFast.metalKernel(
 
         // Stable priority. Lower cost ⇒ higher priority; jitter via xorshift
         // hash of (edge_id, seed) for tie-breaking. Both endpoints' edges see
-        // the same jitter, so comparisons are well-defined.
+        // the same jitter, so comparisons are well-defined. Equal-cost edges
+        // can still collide on the 24-bit jitter, so ties fall through to the
+        // edge id — (priority, id) is a strict total order, which the
+        // independent-set property requires (a residual tie would let two
+        // adjacent edges both win a round).
         uint h = (uint)e ^ ((uint)seed[0] * 2654435761u);
         h ^= h << 13; h ^= h >> 17; h ^= h << 5;
         float jitter = (float)(h & 0xffffff) * (1.0f / 16777216.0f) * 1e-6f;
@@ -47,7 +51,7 @@ private let lubyRoundKernel: MLXFastKernel = MLXFast.metalKernel(
             hf ^= hf << 13; hf ^= hf >> 17; hf ^= hf << 5;
             float jf = (float)(hf & 0xffffff) * (1.0f / 16777216.0f) * 1e-6f;
             float r_f = -cost[f] + jf;
-            if (r_f > r_e) win = false;
+            if (r_f > r_e || (r_f == r_e && (uint)f < e)) win = false;
         }
         // Scan endpoint B's edges if still winning.
         if (win) {
@@ -60,7 +64,7 @@ private let lubyRoundKernel: MLXFastKernel = MLXFast.metalKernel(
                 hf ^= hf << 13; hf ^= hf >> 17; hf ^= hf << 5;
                 float jf = (float)(hf & 0xffffff) * (1.0f / 16777216.0f) * 1e-6f;
                 float r_f = -cost[f] + jf;
-                if (r_f > r_e) win = false;
+                if (r_f > r_e || (r_f == r_e && (uint)f < e)) win = false;
             }
         }
 

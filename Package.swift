@@ -105,6 +105,12 @@ let package = Package(
         .executableTarget(name: "bvhstress", dependencies: [
             "MLXMesh", .product(name: "MLX", package: "mlx-swift"),
         ], swiftSettings: [.interoperabilityMode(.Cxx)]),
+        // Luby IS correctness stress (tie-break total order in SimplifyIndependentSet.swift):
+        // engineered jitter-collision seeds on a coplanar grid must still yield a true
+        // independent set; aggressive coplanar simplify must stay manifold. GPU stream.
+        .executableTarget(name: "simplifystress", dependencies: [
+            "MLXMesh", .product(name: "MLX", package: "mlx-swift"),
+        ], swiftSettings: [.interoperabilityMode(.Cxx)]),
         // Engine-driven GPU e2e CLI (Stage-2 step 7): drives the package THROUGH MLXServeEngine
         // (register → prepare → run → decode Mesh → GLB) on a real image. Real weights, GPU stream.
         .executableTarget(name: "trellis2-run-engine", dependencies: [

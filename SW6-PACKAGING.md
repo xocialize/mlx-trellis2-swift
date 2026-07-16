@@ -153,9 +153,21 @@ IMG=<png> WEIGHTS_DIR=<consolidated-dir> swift run -c release trellis2-run-engin
 3. **Model-registry row** — update `mlx-engine-swift/docs/model-registry.md`'s `mlx-trellis2-swift`
    row to point at this successor (it still describes the OLD vertex-color port). Set Avail per
    publish, Val per the engine e2e run, Eff ⬜ pending the footprint re-baseline.
-4. **BiRefNet preprocess** — compose the `xocialize/mlx-birefnet-swift` `matting` package ahead of
-   this one for RAW (unmasked) image input; `run()` currently assumes a pre-masked / plain-bg input
-   and falls back to full-frame resize otherwise.
+4. **BiRefNet preprocess** — ✅ DONE 2026-07-15 (T0.4). `Trellis2Configuration.matting` is an
+   optional app-injected hook (`Trellis2Matting = @Sendable (Image) async throws -> Matte` —
+   canonical MLXToolKit artifacts only, so no cross-package ModelPackage dependency (C13) and the
+   offline build is untouched; excluded from the config's Codable surface). `run()` routes every
+   view WITHOUT a usable alpha (opaque RGB/JPEG, or RGBA whose alpha is uniformly 255 — upstream
+   `preprocess_image`'s `has_alpha` test) through `ImagePreprocess.mattedIfNeeded`: cap ≤1024²
+   (upstream resizes before rembg), matte, graft the matte in as the alpha channel → the existing
+   threshold-bbox crop / RGB×alpha-on-black path. The app composes the shipped BiRefNet `matting`
+   package here (e.g. `{ try await engine.run(MattingRequest(image: $0), package: birefnetID) }` —
+   nested `engine.run` is safe: the admission gate is released before a run executes). Verified
+   e2e through MLXServeEngine: RAW 3024² phone-photo-style JPEG (cluttered background) →
+   BiRefNet fast@1024 matte (4.6 s, clean silhouette) → res512 generation 84 s → 152k-vert
+   textured GLB (`TrellisDev/out_mesh_engine_t04_matted.glb`); skip-path verified (pre-masked
+   RGBA input: hook not invoked, alpha honored as before). With no hook injected, a raw input
+   still falls back to the full-frame resize (unchanged prior behavior).
 5. **Footprint re-baseline** — measure `residentBytes`/`peakActivationBytes` with the in-app
    phys_footprint probe (replaces the documented estimate above).
 6. **Cascade tiers** — wire res1024/res1536 (add `shape_flow_1024`/`tex_flow_1024` to the snapshot +

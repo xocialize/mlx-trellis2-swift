@@ -43,6 +43,23 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
     /// Default false (Z-up) — existing Z-up consumers apply their own reorientation.
     public var yUpOutput: Bool
 
+    /// Optional app-injected foreground matting for RAW (unmasked) inputs — T0.4. When set, `run()`
+    /// mattes every view that lacks a usable alpha (opaque RGB/JPEG, or an RGBA whose alpha is all
+    /// 255 — upstream `preprocess_image`'s `has_alpha` test) BEFORE DINOv3 conditioning, so a raw
+    /// phone photo gets background-removed instead of the full-frame-resize fallback. Typed on the
+    /// canonical MLXToolKit artifacts only (`Image` → `Matte`), so Trellis2Kit carries no
+    /// cross-package dependency (C13); the app composes the shipped BiRefNet `.matting` capability
+    /// here, e.g. `{ try await engine.run(MattingRequest(image: $0), package: birefnetID) … }`.
+    /// nil (default) = prior behavior: honor an existing alpha, else full-frame resize.
+    /// NOT part of the Codable surface (in-process wiring, not persisted configuration).
+    public var matting: Trellis2Matting? = nil
+
+    /// Explicit Codable surface: everything except the `matting` closure (which decodes to nil).
+    enum CodingKeys: String, CodingKey {
+        case quant, defaultMode, modelsRootDirectory, weightsRootOverride
+        case steps, seed, texture, decimateFaces, yUpOutput
+    }
+
     public init(quant: Quant = .bf16,
                 defaultMode: Mode = ImageTo3DContract.res512,
                 modelsRootDirectory: URL? = nil,
@@ -51,7 +68,8 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
                 seed: UInt64 = 0,
                 texture: Bool = true,
                 decimateFaces: Int? = 300_000,
-                yUpOutput: Bool = false) {
+                yUpOutput: Bool = false,
+                matting: Trellis2Matting? = nil) {
         self.quant = quant
         self.defaultMode = defaultMode
         self.modelsRootDirectory = modelsRootDirectory
@@ -61,8 +79,15 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
         self.texture = texture
         self.decimateFaces = decimateFaces
         self.yUpOutput = yUpOutput
+        self.matting = matting
     }
 }
+
+/// The injected foreground-matting hook: canonical `Image` in, canonical `Matte` out (soft alpha at
+/// the input image's dimensions, per `MattingContract`). Async so the app can route it through
+/// `MLXServeEngine.run(.matting)`; throws propagate out of `Trellis2Package.run()` (a broken matter
+/// is a failed generation, not a silent full-frame fallback).
+public typealias Trellis2Matting = @Sendable (Image) async throws -> Matte
 
 // MARK: - Per-tier footprint hints (contract 1.13/1.14 FootprintConfigured)
 
@@ -184,6 +209,7 @@ extension Trellis2Configuration: WeightPrewarming {
 /// Errors specific to the TRELLIS.2 runtime.
 public enum Trellis2Error: Error, Sendable {
     case imageDecodeFailed
+    case matteDecodeFailed
     case weightsNotFound(String)
     case normalizationMissing
 }
@@ -310,8 +336,11 @@ public final class Trellis2Package: ModelPackage {
         default: .res512
         }
 
-        // Preprocess the (assumed pre-masked / plain) input to DINOv3's NCHW [1,3,512,512]. Background
-        // removal (BiRefNet matting) is a SEPARATE package composed at the app layer — a follow-up.
+        // Preprocess each input to DINOv3's NCHW [1,3,512,512]. RAW (no-usable-alpha) views are
+        // matted first through the app-injected `configuration.matting` hook (T0.4 — e.g. the shipped
+        // BiRefNet `.matting` package composed via the engine); each view is matted ONCE, then
+        // conditioned at every needed resolution. Without the hook, a raw view falls back to the
+        // full-frame resize (background leaks into the mesh).
         // Multi-view: the front image plus any `additionalViews` (front/side/back turnaround of the SAME
         // subject) are each preprocessed and conditioned together — DINOv3 per view, tokens concatenated
         // (see encodeImages), matching the oracle's multi-image get_cond.
@@ -320,7 +349,13 @@ public final class Trellis2Package: ModelPackage {
         // from input dims), so 512² and 1024² inputs both work; each view is preprocessed at both
         // sizes and its tokens concatenated per size. res512 skips the 1024² pass entirely
         // (upstream cond_1024=None for the '512' pipeline type).
-        let views = [req.image] + (req.additionalViews ?? [])
+        var views = [req.image] + (req.additionalViews ?? [])
+        if let matting = configuration.matting {
+            for i in views.indices {
+                views[i] = try await ImagePreprocess.mattedIfNeeded(views[i], using: matting)
+                try Task.checkCancellation()   // the matter may itself be a model run
+            }
+        }
         let px512 = try views.map { try ImagePreprocess.dinoPixels(from: $0, size: 512) }
         try Task.checkCancellation()
 

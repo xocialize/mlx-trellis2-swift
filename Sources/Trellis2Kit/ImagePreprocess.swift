@@ -3,16 +3,19 @@ import MLX
 import MLXToolKit
 import CoreGraphics
 import ImageIO
+import UniformTypeIdentifiers
 
 /// Host-side image preprocessing for the DINOv3 conditioner. Reproduces TRELLIS.2's
 /// `preprocess_image`: honor a foreground alpha (a pre-masked RGBA input), crop to a square bbox
 /// around the subject, composite `RGB×alpha` on black, resize to 512×512, ImageNet-normalize, and
 /// emit **NCHW `[1,3,512,512]`** — the input layout of `Trellis2Pipeline.encodeImage`.
 ///
-/// Background removal for a plain (opaque) RGB input is the consumer's job via the shipped BiRefNet
-/// `.matting` capability (composed at the app layer) — kept out of this package so it carries no
-/// cross-package ModelPackage dependency (C13). With no usable alpha we fall back to a full-frame
-/// resize (the background then leaks into the mesh).
+/// Background removal for a plain (opaque) RGB input rides the app-injected
+/// `Trellis2Configuration.matting` hook (T0.4): `mattedIfNeeded` reproduces upstream's rembg branch
+/// (matte the ≤1024-capped frame, graft the matte in as alpha) using only the canonical MLXToolKit
+/// artifacts, so the package still carries no cross-package ModelPackage dependency (C13). With no
+/// hook and no usable alpha we fall back to a full-frame resize (the background then leaks into the
+/// mesh).
 enum ImagePreprocess {
     static let size = 512
     static let maxSide = 1024
@@ -46,6 +49,77 @@ enum ImagePreprocess {
             chw[2*n + i] = (rgb[3*i + 2] - mean[2]) / std[2]
         }
         return MLXArray(chw, [1, 3, size, size])
+    }
+
+    // MARK: matting (T0.4)
+
+    /// Upstream `preprocess_image`'s rembg branch. Returns `image` untouched when it already carries
+    /// a USABLE alpha (an alpha channel with any pixel < 255 — upstream's `not np.all(alpha == 255)`
+    /// test, so a fully-opaque RGBA counts as raw). Otherwise: cap the frame at `maxSide` (upstream
+    /// resizes before rembg), hand the opaque frame to the injected matter, and graft the returned
+    /// matte in as the alpha channel. The RGBA result then flows through `dinoPixels`' alpha path
+    /// (threshold-bbox crop → RGB×alpha composite on black), matching upstream end-to-end.
+    static func mattedIfNeeded(_ image: Image, using matter: Trellis2Matting) async throws -> Image {
+        let (cg, hasAlpha) = try decodeCGImage(image)
+        let side0 = max(cg.width, cg.height)
+        let scale = side0 > maxSide ? Double(maxSide) / Double(side0) : 1.0
+        let W = max(1, Int((Double(cg.width) * scale).rounded()))
+        let H = max(1, Int((Double(cg.height) * scale).rounded()))
+        var pm = drawRGBA8(cg, width: W, height: H)
+        if hasAlpha, stride(from: 3, to: pm.count, by: 4).contains(where: { pm[$0] < 255 }) {
+            return image   // pre-masked input — honor its alpha, skip matting (upstream has_alpha)
+        }
+
+        // Opaque frame (alpha uniformly 255, so premultiplied == straight): matte it at the capped
+        // resolution. The matte comes back at the input's dimensions (MattingContract), soft alpha.
+        let framePNG = try encodePNG(pm, width: W, height: H, alphaInfo: .premultipliedLast)
+        let matte = try await matter(Image(format: .png, data: framePNG, width: W, height: H))
+        let alpha = try decodeMatte(matte, width: W, height: H)
+        for i in 0..<(W * H) { pm[4*i + 3] = alpha[i] }
+        // Straight (non-premultiplied) alpha: the RGB planes still hold the full-color frame.
+        let rgbaPNG = try encodePNG(pm, width: W, height: H, alphaInfo: .last)
+        return Image(format: .png, data: rgbaPNG, width: W, height: H)
+    }
+
+    /// Rasterize a `Matte` (grayscale PNG) to a `width×height` alpha plane; a matter that returns
+    /// off-size (against the contract) is rescaled rather than rejected.
+    private static func decodeMatte(_ matte: Matte, width: Int, height: Int) throws -> [UInt8] {
+        guard let src = CGImageSourceCreateWithData(matte.data as CFData, nil),
+              let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+            throw Trellis2Error.matteDecodeFailed
+        }
+        var px = [UInt8](repeating: 0, count: width * height)
+        try px.withUnsafeMutableBytes { buf in
+            guard let ctx = CGContext(data: buf.baseAddress, width: width, height: height,
+                                      bitsPerComponent: 8, bytesPerRow: width,
+                                      space: CGColorSpaceCreateDeviceGray(),
+                                      bitmapInfo: CGImageAlphaInfo.none.rawValue) else {
+                throw Trellis2Error.matteDecodeFailed
+            }
+            ctx.interpolationQuality = .high
+            ctx.draw(cg, in: CGRect(x: 0, y: 0, width: width, height: height))
+        }
+        return px
+    }
+
+    private static func encodePNG(_ rgba: [UInt8], width: Int, height: Int,
+                                  alphaInfo: CGImageAlphaInfo) throws -> Data {
+        let cs = CGColorSpaceCreateDeviceRGB()
+        guard let provider = CGDataProvider(data: Data(rgba) as CFData),
+              let cg = CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
+                               bytesPerRow: width * 4, space: cs,
+                               bitmapInfo: CGBitmapInfo(rawValue: alphaInfo.rawValue),
+                               provider: provider, decode: nil, shouldInterpolate: true,
+                               intent: .defaultIntent) else {
+            throw Trellis2Error.imageDecodeFailed
+        }
+        let out = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(out, UTType.png.identifier as CFString, 1, nil) else {
+            throw Trellis2Error.imageDecodeFailed
+        }
+        CGImageDestinationAddImage(dest, cg, nil)
+        guard CGImageDestinationFinalize(dest) else { throw Trellis2Error.imageDecodeFailed }
+        return out as Data
     }
 
     // MARK: decode

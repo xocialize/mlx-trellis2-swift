@@ -183,6 +183,23 @@ for it in 0..<8 {
     }
 }
 
+// ---- Part 2: aggressive coplanar simplify stays manifold ------------------
+
+let g = coplanarGrid(n: 256)
+let startFaces = g.faceCount
+let simplified = g.simplify(targetNumFaces: startFaces / 20)
+let t2 = simplified.edgeTable()
+let nonManifold = t2.edgeFaceCount.asArray(Int32.self).filter { $0 > 2 }.count
+print("simplify 256x256: \(startFaces) -> \(simplified.faceCount) faces, \(nonManifold) non-manifold edges")
+if simplified.faceCount == 0 || simplified.faceCount > startFaces / 10 {
+    failures += 1
+    err("FAIL [simplify]: insufficient reduction (\(startFaces) -> \(simplified.faceCount), wanted <= \(startFaces / 10))")
+}
+if nonManifold > 0 {
+    failures += 1
+    err("FAIL [simplify]: \(nonManifold) non-manifold edges after aggressive coplanar collapse")
+}
+
 if failures > 0 {
     err("simplifystress: \(failures) failure(s)")
     exit(1)

@@ -23,6 +23,23 @@ import Trellis2Kit
 setvbuf(stdout, nil, _IONBF, 0)
 func gb(_ bytes: UInt64) -> String { String(format: "%.2f GB", Double(bytes) / 1e9) }
 
+// phys_footprint peak sampler — the admission-basis measurement (manifest re-baseline).
+func physFootprintGB() -> Double {
+    var info = task_vm_info_data_t()
+    var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+    let kr = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+        }
+    }
+    return kr == KERN_SUCCESS ? Double(info.phys_footprint) / 1e9 : 0
+}
+nonisolated(unsafe) var peakPhys = 0.0
+let physTimer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "phys"))
+physTimer.schedule(deadline: .now(), repeating: .milliseconds(200))
+physTimer.setEventHandler { peakPhys = max(peakPhys, physFootprintGB()) }
+physTimer.resume()
+
 let env = ProcessInfo.processInfo.environment
 let here = FileManager.default.currentDirectoryPath
 guard let imgPath = env["IMG"], let pngData = FileManager.default.contents(atPath: imgPath) else {
@@ -63,7 +80,8 @@ do {
     guard let resp = response as? ImageTo3DResponse else { fatalError("unexpected response \(type(of: response))") }
     try resp.mesh.data.write(to: URL(fileURLWithPath: outGLB))
 
-    print(String(format: "[engine] run OK in %.0fs | peak %.2f GB", -tRun.timeIntervalSinceNow, Double(GPU.peakMemory)/1e9))
+    print(String(format: "[engine] run OK in %.0fs | GPU peak %.2f GB | peak phys %.2f GB",
+                 -tRun.timeIntervalSinceNow, Double(GPU.peakMemory)/1e9, peakPhys))
     print("[engine] mesh: verts=\(resp.mesh.vertexCount ?? -1) faces=\(resp.mesh.faceCount ?? -1) "
         + "vertexColors=\(resp.mesh.hasVertexColors) bytes=\(resp.mesh.data.count)")
     print("[engine] engine-charged footprint(imageTo3D)=\(gb((await engine.memory).residents[.imageTo3D] ?? 0))")

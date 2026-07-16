@@ -69,6 +69,9 @@ let package = Package(
         .executableTarget(name: "texturize", dependencies: [
             "TRELLIS2", .product(name: "MLX", package: "mlx-swift"),
         ], swiftSettings: [.interoperabilityMode(.Cxx)]),
+        .executableTarget(name: "cascadeparity", dependencies: [
+            "TRELLIS2", .product(name: "MLX", package: "mlx-swift"),
+        ], swiftSettings: [.interoperabilityMode(.Cxx)]),
         .executableTarget(name: "meshbake", dependencies: [
             "TRELLIS2", .product(name: "MLX", package: "mlx-swift"),
         ], swiftSettings: [.interoperabilityMode(.Cxx)]),

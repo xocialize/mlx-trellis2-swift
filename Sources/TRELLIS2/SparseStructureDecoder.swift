@@ -77,10 +77,21 @@ public final class SparseStructureDecoder {
     /// occupancy = logits>0 -> coords[[b,d0,d1,d2]] (int32), matching torch.argwhere order.
     /// Host-compacted (mlx-swift has no boolean-mask gather); ascending linear index
     /// preserves argwhere's row-major order.
-    public func coords(_ logits: MLXArray) -> MLXArray {
-        let occ = logits.squeezed(axis: 1)                // [1,D0,D1,D2]
+    ///
+    /// `resolution` < the decoded grid (64) max-pools the occupancy down first
+    /// (upstream sample_sparse_structure's `max_pool3d(ratio) > 0.5`, i.e. logical OR
+    /// over each ratio³ block) — the 512/cascade tiers run shape SLat on a 32³ grid.
+    public func coords(_ logits: MLXArray, resolution: Int? = nil) -> MLXArray {
+        var occ = (logits.squeezed(axis: 1) .> 0)         // [1,D0,D1,D2]
+        let D = occ.dim(1)
+        if let res = resolution, res != D {
+            let r = D / res
+            occ = occ.asType(.float32)
+                .reshaped([1, res, r, res, r, res, r])
+                .max(axes: [2, 4, 6]) .> 0.5              // OR over each r³ block
+        }
         let D0 = occ.dim(1), D1 = occ.dim(2), D2 = occ.dim(3)
-        let flat = (occ .> 0).reshaped([-1]).asType(.int32).asArray(Int32.self)
+        let flat = occ.reshaped([-1]).asType(.int32).asArray(Int32.self)
         let plane = D1 * D2, vol = D0 * plane
         var out = [Int32](); out.reserveCapacity(flat.count / 8)
         for i in 0..<flat.count where flat[i] != 0 {

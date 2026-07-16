@@ -64,6 +64,34 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
     }
 }
 
+// MARK: - Per-tier footprint hints (contract 1.13/1.14 FootprintConfigured)
+
+extension Trellis2Configuration: FootprintConfigured {
+    /// Per-tier charging (same quant, very different working sets — the BiRefNet pattern).
+    /// Keyed on the CONFIGURED defaultMode: an app that pins a tier is charged that tier.
+    /// A per-request mode override above the configured tier is not re-charged (same gap as
+    /// BiRefNet); apps that roam tiers should configure the highest one they use.
+    ///   res512  — resident 18 GB (SS + shape_512 + tex_512 fp32 + DINOv3 + decoders ≈ 17.3),
+    ///             activation 18 GB (conservative carry-over of the pre-T0.3 measured transient;
+    ///             true res512 decodes at 512, well under it).
+    ///   res1024 — resident 23 GB (cascade set), activation 26 GB (measured peak phys 46.76 GB).
+    ///   res1536 — nil ⇒ falls through to the manifest QuantFootprint (23 + 56, measured 76.97).
+    public var residentBytesHint: UInt64? {
+        switch defaultMode {
+        case ImageTo3DContract.res512: 18_000_000_000
+        case ImageTo3DContract.res1024: 23_000_000_000
+        default: nil
+        }
+    }
+    public var peakActivationBytesHint: UInt64? {
+        switch defaultMode {
+        case ImageTo3DContract.res512: 18_000_000_000
+        case ImageTo3DContract.res1024: 26_000_000_000
+        default: nil
+        }
+    }
+}
+
 // MARK: - Weight sources (auto-materialization, engine ≥0.19.0 MAT gate)
 
 extension Trellis2Configuration: WeightSourcing {
@@ -182,24 +210,24 @@ public final class Trellis2Package: ModelPackage {
                 portCodeLicense: .mit),    // C8 — our Swift port
             provenance: Provenance(sourceRepo: "microsoft/TRELLIS.2-4B", revision: "main", tier: 3),
             requirements: RequirementsManifest(
-                // Split footprint (contract 1.14). The pipeline now runs the '1024' tier (SS decoder
-                // emits 64³ occupancy; shape/tex use the resolution-matched 1024 flow models with
-                // dual-res DINOv3 — cond_512 for SS, cond_1024 for shape/tex, concatenated per view).
-                //   residentBytes = 21 GB — UNCHANGED: the 512→1024 flow models are a SWAP (same 7
-                //     components, same ~2.58 GB each), not an add; still all-resident, fp32-cast (parity
-                //     dtype), no per-stage eviction. Matches the MEASURED governor charge (21.00 GB) from
-                //     the res512 e2e run; on-disk bf16/fp16 ~11 GB → ~21 GB fp32-resident.
-                //   peakActivationBytes = 18 GB — MEASURED (2026-07-14, in-app phys_footprint on the
-                //     1024 multi-view front door, 3 views): real process peak 42.05 GB. Subtract the
-                //     governor-measured 21 GB resident and the app/engine baseline (klein/BiRefNet are
-                //     evicted before the trellis run, so a few GB) ⇒ trellis transient ~15-18 GB; declare
-                //     18 for margin. This is the honest phys re-baseline (phys is the admission basis;
-                //     the earlier CLI GPU.peakMemory under-read it ~2.7×). The transient is dominated by
-                //     the shape/tex cross-attention over ~12.3k concatenated cond tokens (3 views × 4101)
-                //     + the O(T²) self-attention over ~19.5k SLat tokens. Registry Eff now ✅.
+                // Split footprint (contract 1.14), T0.3 per-tier re-baseline (2026-07-15, engine-governed
+                // trellis2-run-engine phys_footprint peaks, single view). The QuantFootprint is the
+                // WORST-mode (res1536) declaration — per-tier charging comes from the FootprintConfigured
+                // hints below (keyed on the configured defaultMode), the BiRefNet same-quant pattern.
+                //   residentBytes = 23 GB — the cascade working set, all fp32-cast (parity dtype), no
+                //     per-stage eviction: SS DiT + shape_512(LR) + shape_1024 + tex_1024 (4×~5.2 GB) +
+                //     DINOv3 (~1.2) + decoders (~0.5) ≈ 22.5; generate() prunes cached flows to the
+                //     tier's set, so res512-only sessions never hold the 1024 pair (see hints).
+                //   peakActivationBytes = 56 GB — res1536 MEASURED peak phys 76.97 GB (1850 s run,
+                //     token back-off active) − ~22.5 resident ⇒ ~54.5 transient; declare 56. res1024
+                //     cascade measured 46.76 GB peak phys ⇒ ~24 transient (hint declares 26). The
+                //     transient is dominated by the HR shape/tex decode (7.8M voxels @1024, ~2.2× @1536)
+                //     + the LR full-decode upsample (1.7M voxels) + O(T²) SLat self-attention (≤49,152
+                //     HR tokens). Bare-CLI (ungoverned buffer pool) ratchets to ~112 GB — the engine's
+                //     bounded pool is the admission-basis environment.
                 footprints: [QuantFootprint(quant: .bf16,
-                                            residentBytes: 21_000_000_000,
-                                            peakActivationBytes: 18_000_000_000)],
+                                            residentBytes: 23_000_000_000,
+                                            peakActivationBytes: 56_000_000_000)],
                 requiredBackends: [.metalGPU],
                 os: OSRequirement(minMacOS: SemanticVersion(major: 26, minor: 0, patch: 0)),
                 chipFloor: .pro),
@@ -272,25 +300,38 @@ public final class Trellis2Package: ModelPackage {
         }
         guard let pipeline else { throw PackageError.notLoaded }
 
-        // Resolution tier (voxel grid). res512 is the validated tier; res1024/res1536 map onto the
-        // cascade in the core (currently the res512 pipeline; higher tiers documented as follow-up).
-        _ = req.mode ?? configuration.defaultMode
+        // Resolution tier (voxel grid): res512 = direct 512 flows; res1024/res1536 = the T0.3
+        // cascade (LR 512 pass → decoder-upsample re-quantization → HR 1024 flows, token
+        // back-off floor 1024).
+        let mode = req.mode ?? configuration.defaultMode
+        let tier: Trellis2Tier = switch mode {
+        case ImageTo3DContract.res1536: .res1536
+        case ImageTo3DContract.res1024: .res1024
+        default: .res512
+        }
 
         // Preprocess the (assumed pre-masked / plain) input to DINOv3's NCHW [1,3,512,512]. Background
         // removal (BiRefNet matting) is a SEPARATE package composed at the app layer — a follow-up.
         // Multi-view: the front image plus any `additionalViews` (front/side/back turnaround of the SAME
         // subject) are each preprocessed and conditioned together — DINOv3 per view, tokens concatenated
         // (see encodeImages), matching the oracle's multi-image get_cond.
-        // Dual-resolution conditioning (oracle '1024' tier): SS uses cond_512, shape+tex use cond_1024.
-        // DINOv3 is resolution-agnostic (patch grid derived from input dims), so 512² and 1024² inputs
-        // both work; each view is preprocessed at both sizes and its tokens concatenated per size.
+        // Dual-resolution conditioning (upstream cascade tiers): SS + the LR pass use cond_512;
+        // the HR shape + tex passes use cond_1024. DINOv3 is resolution-agnostic (patch grid derived
+        // from input dims), so 512² and 1024² inputs both work; each view is preprocessed at both
+        // sizes and its tokens concatenated per size. res512 skips the 1024² pass entirely
+        // (upstream cond_1024=None for the '512' pipeline type).
         let views = [req.image] + (req.additionalViews ?? [])
         let px512 = try views.map { try ImagePreprocess.dinoPixels(from: $0, size: 512) }
-        let px1024 = try views.map { try ImagePreprocess.dinoPixels(from: $0, size: 1024) }
         try Task.checkCancellation()
 
         let (cond, negCond) = pipeline.encodeImages(px512)
-        let (cond1024, negCond1024) = pipeline.encodeImages(px1024)
+        let (cond1024, negCond1024): (MLXArray, MLXArray)
+        if tier.isCascade {
+            let px1024 = try views.map { try ImagePreprocess.dinoPixels(from: $0, size: 1024) }
+            (cond1024, negCond1024) = pipeline.encodeImages(px1024)
+        } else {
+            (cond1024, negCond1024) = (cond, negCond)
+        }
         try Task.checkCancellation()
 
         // In-package SS constants (no goldens dir): the deterministic 16³ RoPE grid + seeded noise.
@@ -299,7 +340,8 @@ public final class Trellis2Package: ModelPackage {
 
         // The pipeline's samplers/decoders honor cooperative cancellation at their step/layer seams
         // (they read the ambient Task); generate() is the long-running body.
-        let baked = try pipeline.generate(
+        let (baked, _) = try pipeline.generate(
+            tier: tier,
             cond: cond, negCond: negCond, cond1024: cond1024, negCond1024: negCond1024,
             ssNoise: ssNoise, ssPhases: ssPhases,
             shapeMean: MLXArray(shapeMean), shapeStd: MLXArray(shapeStd),

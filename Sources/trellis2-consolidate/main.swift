@@ -38,9 +38,13 @@ let jobs: [(String, String, String)] = [
     ("struct_flow",    T2,                                          "ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors"),
     ("struct_dec",     "microsoft/TRELLIS-image-large",             "ckpts/ss_dec_conv3d_16l8_fp16.safetensors"),
     ("shape_flow_512", T2,                                          "ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.safetensors"),
+    ("shape_flow_1024", T2,                                         "ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors"),
     ("shape_dec",      T2,                                          "ckpts/shape_dec_next_dc_f16c32_fp16.safetensors"),
+    ("shape_enc",      T2,                                          "ckpts/shape_enc_next_dc_f16c32_fp16.safetensors"),
     ("tex_flow_512",   T2,                                          "ckpts/slat_flow_imgshape2tex_dit_1_3B_512_bf16.safetensors"),
+    ("tex_flow_1024",  T2,                                          "ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.safetensors"),
     ("tex_dec",        T2,                                          "ckpts/tex_dec_next_dc_f16c32_fp16.safetensors"),
+    ("tex_enc",        T2,                                          "ckpts/tex_enc_next_dc_f16c32_fp16.safetensors"),
 ]
 
 var copied = 0

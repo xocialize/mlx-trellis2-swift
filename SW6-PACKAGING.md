@@ -87,7 +87,7 @@ read the floor **post-load** and the peak during one res512 run, then flip the r
 A P0 efficiency follow-up (bf16-resident weights + per-stage load→use→evict) would roughly halve
 `residentBytes`.
 
-## Consolidated weights — `xocialize/trellis2-mlx` (to be published by the user)
+## Consolidated weights — `xocialize/trellis2-mlx` (PUBLISHED 2026-07-16, gated auto-approval)
 
 USER DECISION: republish as a VERIFIED consolidated snapshot in the **ORIGINAL microsoft/facebook
 key layout** (NOT the old port's renamed-key conversion). So consolidation is a pure per-file
@@ -100,7 +100,7 @@ Produce locally with:
 MODELS=/Volumes/Satechi/TrellisRedux/models OUT=<dir> swift run -c release trellis2-consolidate
 ```
 
-**Exact file list for the repo (validated — 10 GB total):**
+**Exact file list for the repo (published — 17.6 GB total):**
 
 | Repo file | Bytes | Assembled from |
 |---|---|---|
@@ -108,19 +108,28 @@ MODELS=/Volumes/Satechi/TrellisRedux/models OUT=<dir> swift run -c release trell
 | `struct_flow.safetensors` | 2584.4 MB | `microsoft/TRELLIS.2-4B/ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors` |
 | `struct_dec.safetensors` | 147.6 MB | `microsoft/TRELLIS-image-large/ckpts/ss_dec_conv3d_16l8_fp16.safetensors` |
 | `shape_flow_512.safetensors` | 2584.6 MB | `microsoft/TRELLIS.2-4B/ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.safetensors` |
+| `shape_flow_1024.safetensors` | 2584.6 MB | `microsoft/TRELLIS.2-4B/ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors` |
 | `shape_dec.safetensors` | 948.5 MB | `microsoft/TRELLIS.2-4B/ckpts/shape_dec_next_dc_f16c32_fp16.safetensors` |
+| `shape_enc.safetensors` | 708.8 MB | `microsoft/TRELLIS.2-4B/ckpts/shape_enc_next_dc_f16c32_fp16.safetensors` |
 | `tex_flow_512.safetensors` | 2584.7 MB | `microsoft/TRELLIS.2-4B/ckpts/slat_flow_imgshape2tex_dit_1_3B_512_bf16.safetensors` |
+| `tex_flow_1024.safetensors` | 2584.7 MB | `microsoft/TRELLIS.2-4B/ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.safetensors` |
 | `tex_dec.safetensors` | 948.5 MB | `microsoft/TRELLIS.2-4B/ckpts/tex_dec_next_dc_f16c32_fp16.safetensors` |
-| `normalization.json` | ~3 KB | `microsoft/TRELLIS.2-4B/pipeline.json` → `{shape,tex}_slat_normalization{mean,std}` |
+| `tex_enc.safetensors` | 708.8 MB | `microsoft/TRELLIS.2-4B/ckpts/tex_enc_next_dc_f16c32_fp16.safetensors` |
+| `normalization.json` | ~2 KB | `microsoft/TRELLIS.2-4B/pipeline.json` → `{shape,tex}_slat_normalization{mean,std}` |
 
-Plus, before publishing: `LICENSE` (MIT, for the TRELLIS.2 port code + weights), `NOTICE`, and
-`DINOv3_LICENSE.md` (the DINOv3 license text — redistribution under §1.b requires shipping it), and
-the "Built with DINOv3" attribution obligation carried through. The repo should be **gated
-(auto-approval)** matching the old port; first-run materialization env-detects `HF_TOKEN`.
+Plus `LICENSE` (MIT, packaging metadata), `NOTICE`, and `DINOv3_LICENSE.md` (the DINOv3 license
+text — redistribution under §1.b requires shipping it), with the "Built with DINOv3" attribution
+obligation carried through. The repo is **gated (auto-approval)** with the DINOv3 terms surfaced
+in the gate prompt (`extra_gated_prompt` + agreement checkboxes); first-run materialization
+env-detects `HF_TOKEN`.
 
-Cascade HR (res1024/res1536) DiTs (`shape_flow_1024` / `tex_flow_1024`) are intentionally **not**
-included yet — res512 is the validated tier; add those two files (+ probe entries) when the cascade
-tiers are wired.
+The cascade HR (res1024/res1536) DiTs (`shape_flow_1024` / `tex_flow_1024`) ship for the T0.3
+cascade tiers, and the `shape_enc` / `tex_enc` VAE encoders ship for `TexturingPipeline`
+(shape-conditioned re-texturing, SW8/T1.5; `shape_enc` is its hard requirement). res512 remains
+the validated image→3D tier. The published snapshot lives locally at
+`/Volumes/Satechi/TrellisRedux/_trellis2-mlx-weights` (the byte-copy, original-key consolidation
+used by the engine e2e runs). NOTE: the older `DEV/TrellisDev/trellis2-mlx-weights` copy is the
+STALE pre-decision remapped-key conversion — do not publish or load it with current code.
 
 ## Dependency conflict + resolution
 
@@ -145,8 +154,14 @@ IMG=<png> WEIGHTS_DIR=<consolidated-dir> swift run -c release trellis2-run-engin
 
 ## TODOs handed back (user + coordinator)
 
-1. **Publish weights** — upload the consolidated snapshot to `xocialize/trellis2-mlx` (needs the
-   user's HF auth; gated repo + DINOv3 license files + "Built with DINOv3"). Not done here.
+1. **Publish weights** — ✅ DONE 2026-07-16 (T0.1). `xocialize/trellis2-mlx` is live with the full
+   snapshot (11 safetensors incl. `shape_flow_1024`/`tex_flow_1024` cascade DiTs and the
+   `shape_enc`/`tex_enc` VAE encoders for `TexturingPipeline`, + `normalization.json`, LICENSE /
+   NOTICE / DINOv3_LICENSE.md; 17.6 GB; commit `bc4bc5b7`). Repo is **gated auto-approval** with
+   the DINOv3 terms in the gate prompt (agreement checkboxes; anonymous `resolve/` returns 401)
+   and "Built with DINOv3" carried through. Every safetensors byte-verified/size-verified against
+   its upstream source before upload. Source of truth locally:
+   `/Volumes/Satechi/TrellisRedux/_trellis2-mlx-weights`.
 2. **App cutover** — update the MLXEngine3D app's residual code refs to the new clean names
    (`Trellis2Kit` / `Trellis2Package` / `Trellis2Configuration`). Coordinated with the user; the
    package link was already removed on the app side.

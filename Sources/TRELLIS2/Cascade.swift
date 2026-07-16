@@ -46,7 +46,9 @@ public enum CascadeQuantize {
                 let z = Int64(Int32((Float(c[m * 4 + 3]) + 0.5) / lr * n))
                 keys.insert(b << 48 | x << 32 | y << 16 | z)   // components < 2^16 ⇒ key sort == lex row sort
             }
-            if keys.count < maxNumTokens || hr == floorResolution {
+            // `<=` (not `==`): a target not congruent to the floor mod 128 must
+            // still stop at the floor instead of stepping past it toward hr <= 0.
+            if keys.count < maxNumTokens || hr <= floorResolution {
                 let sorted = keys.sorted()
                 var out = [Int32](); out.reserveCapacity(sorted.count * 4)
                 for k in sorted {

@@ -9,8 +9,13 @@ import MLXFast
 /// At every parent it atomically increments a visit counter; the *first*
 /// thread to arrive at a parent stops (its sibling will handle the merge);
 /// the *second* thread reads both children's AABBs and writes their union
-/// into the parent. The `acq_rel` ordering on the counter is what makes the
-/// sibling's AABB visible to the merging thread.
+/// into the parent. MSL atomics only support `memory_order_relaxed`, which
+/// gives no happens-before between a child's AABB stores and its counter
+/// bump — the merging thread could pass the gate yet read stale (zero-init)
+/// child boxes. Device-scope `atomic_thread_fence` (MSL 3.2+) supplies the
+/// missing release/acquire edges: fence before the bump publishes this
+/// thread's subtree stores; fence after winning the gate makes the sibling's
+/// stores visible before the child loads.
 
 private let bvhAABBKernel: MLXFastKernel = MLXFast.metalKernel(
     name: "bvh_aabb_bottom_up",
@@ -48,8 +53,17 @@ private let bvhAABBKernel: MLXFastKernel = MLXFast.metalKernel(
         while (true) {
             int p = nodeParent[cur];
             if (p < 0) break;  // hit root from below
+            // Release: publish this subtree's AABB stores before the counter
+            // bump can be observed (relaxed atomics alone order nothing).
+            atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst,
+                                thread_scope::thread_scope_device);
             int v = atomic_fetch_add_explicit(&visitCount[p], 1, memory_order_relaxed);
             if (v == 0) return;  // first arrival; let sibling do the merge
+
+            // Acquire: we observed the sibling's bump, so after this fence its
+            // pre-bump AABB stores are visible to our child loads below.
+            atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst,
+                                thread_scope::thread_scope_device);
 
             // Second arrival: union our children's AABBs.
             int lc = nodeLeft[p];

@@ -100,6 +100,11 @@ let package = Package(
         .executableTarget(name: "trellis2-consolidate", dependencies: [
             "TRELLIS2", .product(name: "MLX", package: "mlx-swift"),
         ], swiftSettings: [.interoperabilityMode(.Cxx)]),
+        // BVH AABB correctness stress (fence-gated visit-counter handoff in BVHAABB.swift):
+        // exact union-of-children validation on random soups, small→1M faces. GPU stream.
+        .executableTarget(name: "bvhstress", dependencies: [
+            "MLXMesh", .product(name: "MLX", package: "mlx-swift"),
+        ], swiftSettings: [.interoperabilityMode(.Cxx)]),
         // Engine-driven GPU e2e CLI (Stage-2 step 7): drives the package THROUGH MLXServeEngine
         // (register → prepare → run → decode Mesh → GLB) on a real image. Real weights, GPU stream.
         .executableTarget(name: "trellis2-run-engine", dependencies: [

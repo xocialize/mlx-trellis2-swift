@@ -41,6 +41,7 @@ let package = Package(
                 .product(name: "MLXLinalg", package: "mlx-swift"),
                 .product(name: "MLXRandom", package: "mlx-swift"),
                 "MLXMesh",   // vendored (was the mlx-swift-mesh package product)
+                "Cfdg",      // vendored o-voxel mesh->dual-grid converter (encode direction)
             ],
             swiftSettings: [.interoperabilityMode(.Cxx)]  // MLXMesh consumes the vendored xatlas C++ interop
         ),
@@ -60,6 +61,9 @@ let package = Package(
             "TRELLIS2", .product(name: "MLX", package: "mlx-swift"),
         ], swiftSettings: [.interoperabilityMode(.Cxx)]),
         .executableTarget(name: "dinoparity", dependencies: [
+            "TRELLIS2", .product(name: "MLX", package: "mlx-swift"),
+        ], swiftSettings: [.interoperabilityMode(.Cxx)]),
+        .executableTarget(name: "fdgparity", dependencies: [
             "TRELLIS2", .product(name: "MLX", package: "mlx-swift"),
         ], swiftSettings: [.interoperabilityMode(.Cxx)]),
         .executableTarget(name: "meshbake", dependencies: [
@@ -116,6 +120,19 @@ let package = Package(
                 .define("NDEBUG"),   // silence xatlas internal XA_DEBUG_ASSERTs on consumer error paths
             ]
         ),
+        // Vendored TRELLIS.2 o-voxel mesh->flexible-dual-grid converter (CPU C++/Eigen, encode
+        // direction). Algorithm body verbatim upstream (MIT); torch entry replaced by a C ABI.
+        // Eigen headers vendored under include/Eigen at the upstream submodule pin 21e4582d (MPL2).
+        .target(
+            name: "Cfdg",
+            path: "Sources/Cfdg",
+            publicHeadersPath: "include",
+            cxxSettings: [
+                .headerSearchPath("include"),
+                .headerSearchPath("eigen"),   // private: keeps Eigen out of the module umbrella
+                .define("NDEBUG"),
+            ]
+        ),
         // Swift C++-interop wrapper over Cxatlas.
         .target(
             name: "Xatlas",
@@ -136,5 +153,5 @@ let package = Package(
             swiftSettings: [.interoperabilityMode(.Cxx)]
         ),
     ],
-    cxxLanguageStandard: .cxx14
+    cxxLanguageStandard: .cxx17   // Cfdg (vendored o-voxel converter) uses std::clamp; xatlas is 17-clean
 )

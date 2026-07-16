@@ -9,9 +9,18 @@ license, reproduced in full below.
 | `Sources/MLXMesh/` | mlx-swift-mesh | MIT | © 2026 Hiroaki Yamane |
 | `Sources/Cxatlas/xatlas.cpp`, `Sources/Cxatlas/include/xatlas.h` | [jpcy/xatlas](https://github.com/jpcy/xatlas) | MIT | © 2018–2020 Jonathan Young |
 | `Sources/Xatlas/`, `Sources/Cxatlas/xatlas_shim.{cpp,h}`, `module.modulemap` | SwiftXatlas (thin Swift/C++ wrapper over xatlas) | MIT (per xatlas) | wrapper code |
+| `Sources/Cfdg/fdg.cpp` | [microsoft/TRELLIS.2](https://github.com/microsoft/TRELLIS.2) `o-voxel/src/convert/flexible_dual_grid.cpp` | MIT | © 2025 Jianfeng XIANG / Microsoft |
+| `Sources/Cfdg/eigen/Eigen/` | [Eigen](https://gitlab.com/libeigen/eigen) @ `21e4582d` (upstream o-voxel submodule pin) | MPL-2.0 (`COPYING.MPL2` in-tree) | Eigen contributors |
 
 The vendored files are byte-for-byte copies (the two symlinked xatlas sources were dereferenced into
 real files); no functional modifications were made during vendoring.
+
+Cfdg deviations from upstream (documented, no algorithm changes): the torch tensor entry point is
+replaced by a plain-buffer C ABI (`fdg_shim.h`); two GNU `0.0d` float-suffix literals were changed
+to standard `0.0` (clang rejects the extension); the decode-direction mesh-extraction helpers
+(`quad_to_2tri`, `face_from_dual_vertices`) are omitted — the Swift port already has its own
+bit-exact dual-grid→mesh path (`DualGridMesh.swift`). Parity: `swift run fdgparity` — voxel set,
+intersection flags, and dual vertices bit-exact vs the Python oracle at 64³/256³.
 
 ---
 

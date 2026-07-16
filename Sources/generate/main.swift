@@ -31,10 +31,11 @@ let baked = try pipe.generate(
     ssNoise: try golden("ss_noise"), ssPhases: try golden("rope_phases_cossin"),
     shapeMean: try golden("shape_slat_mean"), shapeStd: try golden("shape_slat_std"),
     texMean: try golden("tex_slat_mean"), texStd: try golden("tex_slat_std"),
+    yUp: true,   // glTF convention — T0.2: HF/GLB parity is Y-up
     seed: 0, log: log)
 
 log("[generate] baked: \(baked.vertices.dim(0)) verts, \(baked.faces.dim(0)) faces, atlas \(baked.atlasSize), coverage \(String(format: "%.1f", baked.coverage*100))%")
-let outURL = URL(fileURLWithPath: "/private/tmp/claude-501/-Volumes-Satechi-TrellisRedux/7650dae1-8f9c-4462-a6f9-f2974ee27db5/scratchpad/trellis_native.glb")
+let outURL = URL(fileURLWithPath: "/Users/dustinnielson/Development/mlxengine-3d/DEV/TrellisDev/texturing/t02_native_yup.glb")
 try GLTFExport.writeGLB(to: outURL, positions: baked.vertices, indices: baked.faces,
                         normals: baked.normals, uvs: baked.uvs,
                         baseColorRGBA: (baked.texRGBA, baked.atlasSize, baked.atlasSize))

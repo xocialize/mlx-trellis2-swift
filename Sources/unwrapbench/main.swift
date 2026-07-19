@@ -18,6 +18,7 @@ struct Config {
     var doRemesh = true
     var doModelIO = false
     var doGolden = false
+    var doProvenance = false
     var paths: [String] = []
 }
 
@@ -30,6 +31,7 @@ while let a = it.next() {
     case "--no-remesh": cfg.doRemesh = false
     case "--modelio": cfg.doModelIO = true
     case "--golden": cfg.doGolden = true
+    case "--provenance": cfg.doProvenance = true
     default: cfg.paths.append(a)
     }
 }
@@ -103,6 +105,36 @@ for path in cfg.paths {
         record["utilization"] = atlas.utilization.first.map { Double($0) } ?? -1
         log("  xatlas: add \(String(format: "%.2f", tAdd))s | charts \(String(format: "%.2f", tCharts))s | pack \(String(format: "%.2f", tPack))s | \(atlas.chartCount) charts, \(atlas.width)x\(atlas.height), util \(atlas.utilization.first ?? -1)")
 
+        if cfg.doProvenance {
+            // Phase-2 E2E: tagged remesh -> provenance charts -> axis UVs ->
+            // seam split -> pack-only. Runs on the UNSIMPLIFIED remesh output
+            // (label-preserving simplify is the next sub-phase).
+            var t2 = now()
+            let raw = Mesh(
+                vertices: MLXArray(loaded.positions, [loaded.vertexCount, 3]),
+                faces: MLXArray(loaded.indices, [loaded.faceCount, 3])
+            )
+            let (tagged, faceAxis) = raw.remeshDualContouringTagged(resolution: cfg.remeshRes)
+            MLX.eval(tagged.vertices, tagged.faces)
+            let tTagRemesh = now() - t2
+            t2 = now()
+            let prov = try tagged.provenanceUnwrap(faceAxis: faceAxis)
+            let tProv = now() - t2
+            let u = prov.unwrap
+            record["prov_remesh_s"] = tTagRemesh
+            record["prov_unwrap_s"] = tProv
+            record["prov_faces"] = tagged.faceCount
+            record["prov_charts"] = prov.chartCount
+            record["prov_packed_charts"] = u.charts.count
+            record["prov_atlas_wh"] = [Int(u.atlasWidth), Int(u.atlasHeight)]
+            record["prov_out_verts"] = u.mesh.vertexCount
+            // UV validity on the packed result
+            let uvArr = u.uvs.asArray(Float.self)
+            var uvOK = true
+            for x in uvArr where !x.isFinite || x < -0.001 || x > 1.001 { uvOK = false; break }
+            record["prov_uvs_valid"] = uvOK
+            log("  provenance: remesh+tags \(String(format: "%.2f", tTagRemesh))s | charts+split+pack \(String(format: "%.2f", tProv))s | \(tagged.faceCount) faces -> \(prov.chartCount) charts (\(u.charts.count) packed), atlas \(u.atlasWidth)x\(u.atlasHeight), uvs valid: \(uvOK)")
+        }
         if cfg.doGolden {
             // Phase-1 golden round-trip: full unwrap, then feed its own output
             // through the pack-only seam; atlas metrics must reproduce.

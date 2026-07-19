@@ -59,6 +59,7 @@ public enum MeshBake {
         // 2+3) clean (DC remesh, watertight) then unwrap, per backend.
         let finalMesh: Mesh
         let finalUVs: MLXArray
+        let finalNormals: MLXArray
         let chartCount: Int
         switch backend {
         case .xatlas:
@@ -76,6 +77,7 @@ public enum MeshBake {
             let uv = try mesh.uvUnwrap()
             finalMesh = uv.mesh
             finalUVs = uv.uvs
+            finalNormals = finalMesh.vertexNormals()
             chartCount = uv.charts.count
         case .provenance:
             let (tagged, faceAxis) = mesh.remeshDualContouringTagged(resolution: remeshRes)
@@ -96,6 +98,16 @@ public enum MeshBake {
             finalMesh = prov.unwrap.mesh
             finalUVs = prov.unwrap.uvs
             chartCount = prov.unwrap.charts.count
+            // Normals from the PRE-split mesh, carried through the split maps.
+            // Computing them on the seam-split mesh gives every chart-border
+            // vertex one-sided normals; sliver/poke-through triangles then
+            // light up dark instead of shading like the surrounding surface
+            // (user-visible shards; xatlas's smoother normals camouflage the
+            // same geometry). Normals are geometric, not chart-dependent.
+            let preNormals = provMesh.vertexNormals()
+            let splitMapArr = MLXArray(prov.splitVertexMap, [prov.splitVertexMap.count])
+            let origIdx = splitMapArr.take(prov.unwrap.vertexMap, axis: 0)
+            finalNormals = preNormals.take(origIdx, axis: 0)
         }
         MLX.eval(finalMesh.vertices, finalMesh.faces, finalUVs)
         log("  unwrapped[\(backend.rawValue)]: \(finalMesh.vertexCount) verts, \(chartCount) charts")
@@ -150,7 +162,7 @@ public enum MeshBake {
             rgba[p*4+3] = 255
         }
         return BakedMesh(vertices: finalMesh.vertices, faces: finalMesh.faces,
-                         normals: finalMesh.vertexNormals(), uvs: finalUVs, texRGBA: rgba,
+                         normals: finalNormals, uvs: finalUVs, texRGBA: rgba,
                          atlasSize: atlasSize, coverage: coverage)
     }
 

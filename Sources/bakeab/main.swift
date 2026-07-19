@@ -39,9 +39,16 @@ let outDir = "/private/tmp/claude-501/-Users-dustinnielson-Development-vroid-xwe
 
 let full = !CommandLine.arguments.contains("octant")
 var sampleCount = 150_000
-if let i = CommandLine.arguments.firstIndex(of: "samples"), i + 1 < CommandLine.arguments.count {
-    sampleCount = Int(CommandLine.arguments[i + 1]) ?? sampleCount
+var targetFaces = 120_000
+var atlasSize = 1024
+func argValue(_ name: String) -> Int? {
+    guard let i = CommandLine.arguments.firstIndex(of: name),
+          i + 1 < CommandLine.arguments.count else { return nil }
+    return Int(CommandLine.arguments[i + 1])
 }
+sampleCount = argValue("samples") ?? sampleCount
+targetFaces = argValue("target") ?? targetFaces
+atlasSize = argValue("atlas") ?? atlasSize
 let (shN, texN) = full ? ("shapedec_out_feats", "texdec_full_feats")
                        : ("shapedec_sm_out_feats", "texdec_out_feats")
 let coordsN = full ? "shapedec_out_coords" : "shapedec_sm_out_coords"
@@ -80,7 +87,7 @@ func evaluate(_ backend: UnwrapBackend) throws -> EvalResult {
     let t0 = CFAbsoluteTimeGetCurrent()
     let baked = try MeshBake.run(
         shapeFeats: shapeFeats, coords: coords, texBaseColor: baseColor,
-        fineRes: fineRes, remeshRes: 256, targetFaces: 120_000, atlasSize: 1024,
+        fineRes: fineRes, remeshRes: 256, targetFaces: targetFaces, atlasSize: atlasSize,
         backend: backend)
     let bakeSeconds = CFAbsoluteTimeGetCurrent() - t0
 

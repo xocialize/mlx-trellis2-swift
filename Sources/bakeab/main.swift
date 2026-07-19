@@ -85,6 +85,9 @@ struct EvalResult {
     var badFrac: Double     // fraction of samples with L2 error > 0.1
     var coverage: Float
     var faces: Int
+    var baked: BakedMesh
+    var badPoints: [Float] = []     // up to 2000 bad-sample xyz
+    var badColors: [Float] = []     // this backend's baked color at those samples
 }
 
 func evaluate(_ backend: UnwrapBackend) throws -> EvalResult {
@@ -201,19 +204,41 @@ func evaluate(_ backend: UnwrapBackend) throws -> EvalResult {
         let bad = bucketAll[b] > 0 ? Double(bucketBad[b]) / Double(bucketAll[b]) * 100 : 0
         print(String(format: "    faceArea %@: %5.1f%% of samples, bad %5.1f%%", name as NSString, share, bad))
     }
+    var badPoints: [Float] = []
+    var badColors: [Float] = []
+    for i in 0..<sampleCount where errs[i] > 0.1 && badPoints.count < 6000 {
+        badPoints.append(pts[i*3]); badPoints.append(pts[i*3+1]); badPoints.append(pts[i*3+2])
+        badColors.append(bakedCol[i*3]); badColors.append(bakedCol[i*3+1]); badColors.append(bakedCol[i*3+2])
+    }
     errs.sort()
     let mean = errs.reduce(0, +) / Double(sampleCount)
     let p95 = errs[Int(Double(sampleCount) * 0.95)]
     let bad = Double(errs.lazy.filter { $0 > 0.1 }.count) / Double(sampleCount)
 
     writePNG(baked.texRGBA, S, S, to: "\(outDir)/bakeab_\(backend.rawValue)_atlas.png")
+    // Diagnostic GLB: gray = rasterized ok, RED = inpainted, BLUE = wall-flipped remap
+    var diag = [UInt8](repeating: 0, count: S * S * 4)
+    for p in 0..<(S * S) {
+        let (r, g, b): (UInt8, UInt8, UInt8) =
+            baked.wallFlipped[p] ? (40, 80, 255) :
+            (baked.filledBeforeInpaint[p] ? (170, 170, 170) : (255, 40, 40))
+        diag[p*4] = r; diag[p*4+1] = g; diag[p*4+2] = b; diag[p*4+3] = 255
+    }
+    let inpFrac = Double(baked.filledBeforeInpaint.lazy.filter { !$0 }.count) / Double(S * S)
+    let flipFrac = Double(baked.wallFlipped.lazy.filter { $0 }.count) / Double(S * S)
+    print(String(format: "    texel classes: inpainted %.1f%% of atlas, wall-flipped %.2f%%", inpFrac * 100, flipFrac * 100))
+    try GLTFExport.writeGLB(
+        to: URL(fileURLWithPath: "\(outDir)/bakeab_\(backend.rawValue)_diag.glb"),
+        positions: baked.vertices, indices: baked.faces,
+        normals: baked.normals, uvs: baked.uvs, baseColorRGBA: (diag, S, S))
     let glbURL = URL(fileURLWithPath: "\(outDir)/bakeab_\(backend.rawValue).glb")
     try GLTFExport.writeGLB(to: glbURL, positions: baked.vertices, indices: baked.faces,
                             normals: baked.normals, uvs: baked.uvs,
                             baseColorRGBA: (baked.texRGBA, S, S))
     print("  wrote \(glbURL.lastPathComponent)")
     return EvalResult(bakeSeconds: bakeSeconds, meanErr: mean, p95Err: p95,
-                      badFrac: bad, coverage: baked.coverage, faces: F)
+                      badFrac: bad, coverage: baked.coverage, faces: F,
+                      baked: baked, badPoints: badPoints, badColors: badColors)
 }
 
 let rx = onlyBackend == "provenance" ? nil : try evaluate(.xatlas)
@@ -225,4 +250,52 @@ func row(_ n: String, _ r: EvalResult) {
 print("--- RESULTS (color L2 vs voxel ground truth, \(sampleCount) surface samples)")
 if let rx { row("xatlas", rx) }
 if let rp { row("provenance", rp) }
+
+// Cross-backend probe: read the xatlas bake at provenance's bad-sample 3D
+// points. If xatlas is also dark there, the surface color is legitimately
+// dark; if bright, provenance's sampling diverges per-point.
+if let rx, let rp, !rp.badPoints.isEmpty {
+    let n = rp.badPoints.count / 3
+    let xm = Mesh(vertices: rx.baked.vertices, faces: rx.baked.faces)
+    let cp2 = xm.bvh().closestPoints(mesh: xm, queries: MLXArray(rp.badPoints, [n, 3]))
+    let cpP = cp2.points.asArray(Float.self)
+    let cpF = cp2.faceIndices.asArray(Int32.self)
+    let xv = rx.baked.vertices.asArray(Float.self)
+    let xf = rx.baked.faces.asArray(Int32.self)
+    let xuv = rx.baked.uvs.asArray(Float.self)
+    let XS = rx.baked.atlasSize
+    var agreeDark = 0, xBright = 0
+    var meanDelta = 0.0
+    for i in 0..<n {
+        let fi = Int(cpF[i])
+        let i0 = Int(xf[fi*3]), i1 = Int(xf[fi*3+1]), i2 = Int(xf[fi*3+2])
+        // barycentric of cp point in the triangle
+        let a = SIMD3<Float>(xv[i0*3], xv[i0*3+1], xv[i0*3+2])
+        let b = SIMD3<Float>(xv[i1*3], xv[i1*3+1], xv[i1*3+2])
+        let c = SIMD3<Float>(xv[i2*3], xv[i2*3+1], xv[i2*3+2])
+        let pnt = SIMD3<Float>(cpP[i*3], cpP[i*3+1], cpP[i*3+2])
+        let v0 = b - a, v1 = c - a, v2 = pnt - a
+        let d00 = simd_dot(v0, v0), d01 = simd_dot(v0, v1), d11 = simd_dot(v1, v1)
+        let d20 = simd_dot(v2, v0), d21 = simd_dot(v2, v1)
+        let den = d00 * d11 - d01 * d01
+        var bw: Float = 0, cw: Float = 0
+        if abs(den) > 1e-20 { bw = (d11 * d20 - d01 * d21) / den; cw = (d00 * d21 - d01 * d20) / den }
+        let aw = 1 - bw - cw
+        let u = aw * xuv[i0*2] + bw * xuv[i1*2] + cw * xuv[i2*2]
+        let w = aw * xuv[i0*2+1] + bw * xuv[i1*2+1] + cw * xuv[i2*2+1]
+        let x = max(0, min(XS - 1, Int(u * Float(XS))))
+        let y = max(0, min(XS - 1, Int(w * Float(XS))))
+        let p = (y * XS + x) * 4
+        let xr = Float(rx.baked.texRGBA[p]) / 255
+        let xg = Float(rx.baked.texRGBA[p+1]) / 255
+        let xb = Float(rx.baked.texRGBA[p+2]) / 255
+        let pr = rp.badColors[i*3], pg = rp.badColors[i*3+1], pb = rp.badColors[i*3+2]
+        let xMean = (xr + xg + xb) / 3, pMean = (pr + pg + pb) / 3
+        if pMean < 0.25 && xMean < 0.25 { agreeDark += 1 }
+        if pMean < 0.25 && xMean > 0.4 { xBright += 1 }
+        meanDelta += Double(abs(xr - pr) + abs(xg - pg) + abs(xb - pb)) / 3
+    }
+    print(String(format: "CROSS-PROBE: %d prov-bad points | xatlas-also-dark %.1f%% | xatlas-bright-while-prov-dark %.1f%% | mean |dCol| %.3f",
+                 n, Double(agreeDark) / Double(n) * 100, Double(xBright) / Double(n) * 100, meanDelta / Double(n)))
+}
 print("BAKEAB DONE")

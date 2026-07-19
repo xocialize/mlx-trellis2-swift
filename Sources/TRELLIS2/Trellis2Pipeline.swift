@@ -230,7 +230,8 @@ public final class Trellis2Pipeline {
                 MLX.stacked([a[0..., 0], a[0..., 2], -a[0..., 1]], axis: 1)
             }
             baked = BakedMesh(vertices: toYUp(baked.vertices), faces: baked.faces, normals: toYUp(baked.normals),
-                              uvs: baked.uvs, texRGBA: baked.texRGBA, atlasSize: baked.atlasSize, coverage: baked.coverage)
+                              uvs: baked.uvs, texRGBA: baked.texRGBA, atlasSize: baked.atlasSize, coverage: baked.coverage,
+                              filledBeforeInpaint: baked.filledBeforeInpaint, wallFlipped: baked.wallFlipped)
             log("  [7] reoriented Y-up")
         }
         return (baked, hrResolution)

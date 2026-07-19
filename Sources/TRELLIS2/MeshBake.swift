@@ -14,6 +14,10 @@ public struct BakedMesh {
     public let texRGBA: [UInt8]     // atlasSize*atlasSize*4
     public let atlasSize: Int
     public let coverage: Float      // fraction of texels covered before inpaint
+    /// Diagnostics (atlasSize² each): texel rasterized before inpaint; texel's
+    /// closest-point remap landed on an opposing-normal (wrong-wall) raw face.
+    public let filledBeforeInpaint: [Bool]
+    public let wallFlipped: [Bool]
 }
 
 /// Which unwrap produces the bake's UV atlas (UV-UNWRAP-METAL-PLAN.md).
@@ -107,6 +111,8 @@ public enum MeshBake {
                 provAxis = nil
                 log("  simplified: \(provMesh.vertexCount) verts, \(provMesh.faceCount) faces")
             }
+            // (padding gutters and stronger absorption were both measured NULL
+            // on the seam-crack artifact and cost texel density — keep defaults)
             let prov = try provMesh.provenanceUnwrap(faceAxis: provAxis)
             finalMesh = prov.unwrap.mesh
             finalUVs = prov.unwrap.uvs
@@ -125,12 +131,28 @@ public enum MeshBake {
         MLX.eval(finalMesh.vertices, finalMesh.faces, finalUVs)
         log("  unwrapped[\(backend.rawValue)]: \(finalMesh.vertexCount) verts, \(chartCount) charts")
 
-        // 4) rasterize + bake
+        // 4) rasterize + bake. Center-inside rasterization leaves sub-texel
+        // gaps along jagged chart seams (thin slivers never cover a texel
+        // center); those gaps then inpaint-fill with unrepresentative color —
+        // visible dark seam "cracks" (worst for provenance charts, whose
+        // boundaries are staircase-jagged). Approximate conservative
+        // rasterization with 4 half-texel-jittered passes appended after the
+        // main one; later duplicate writes lose (first-write-wins below), so
+        // jitter only fills otherwise-empty texels.
         let uvPix = finalUVs * Float(atlasSize)
-        let (pix, fid, bary) = UVRasterize.rasterize(uvsPix: uvPix, faces: finalMesh.faces, textureSize: atlasSize)
+        var pixParts: [MLXArray] = [], fidParts: [MLXArray] = [], baryParts: [MLXArray] = []
+        for (dx, dy): (Float, Float) in [(0, 0), (0.49, 0.49), (-0.49, 0.49), (0.49, -0.49), (-0.49, -0.49)] {
+            let jittered = dx == 0 && dy == 0 ? uvPix
+                : MLX.stacked([uvPix[0..., 0] + dx, uvPix[0..., 1] + dy], axis: 1)
+            let (p, f, b) = UVRasterize.rasterize(uvsPix: jittered, faces: finalMesh.faces, textureSize: atlasSize)
+            pixParts.append(p); fidParts.append(f); baryParts.append(b)
+        }
+        let pix = MLX.concatenated(pixParts, axis: 0)
+        let fid = MLX.concatenated(fidParts, axis: 0)
+        let bary = MLX.concatenated(baryParts, axis: 0)
         MLX.eval(pix, fid, bary)
         let K = fid.dim(0)
-        log("  rasterized: \(K) covered texels")
+        log("  rasterized: \(K) covered texel-writes (5-pass conservative)")
 
         // surface position per texel: Σ bary · verts[faces[fid]]
         let faceVerts = finalMesh.faces.take(fid, axis: 0)                 // [K,3] vertex ids
@@ -139,7 +161,20 @@ public enum MeshBake {
         let v2 = finalMesh.vertices.take(faceVerts[0..., 2], axis: 0)
         let posRaw = bary[0..., 0..<1] * v0 + bary[0..., 1..<2] * v1 + bary[0..., 2..<3] * v2   // [K,3]
         // remap each texel position onto the original on-shell surface, so trilinear hits the thin PBR shell
-        let pos = origBVH.closestPoints(mesh: origMesh, queries: posRaw).points                 // [K,3]
+        let cp = origBVH.closestPoints(mesh: origMesh, queries: posRaw)
+        let pos = cp.points                                                                     // [K,3]
+        // diagnostic: does the remap land on a raw face whose normal opposes
+        // the texel's final-mesh face normal? (wrong-wall snap)
+        let fe1 = v1 - v0, fe2 = v2 - v0
+        let fnl = MLX.stacked([
+            fe1[0..., 1] * fe2[0..., 2] - fe1[0..., 2] * fe2[0..., 1],
+            fe1[0..., 2] * fe2[0..., 0] - fe1[0..., 0] * fe2[0..., 2],
+            fe1[0..., 0] * fe2[0..., 1] - fe1[0..., 1] * fe2[0..., 0],
+        ], axis: 1)
+        let rawFN = origMesh.faceNormals().take(cp.faceIndices, axis: 0)
+        let flipDot = (fnl * rawFN).sum(axis: 1)
+        MLX.eval(flipDot)
+        let flipArr = flipDot.asArray(Float.self)
         MLX.eval(pos)
         let query = ((pos + 0.5) * fineRes).reshaped([1, K, 3])
         let sampled = GridSample3d.sample(feats: texBaseColor, coords: coords, grid: query, mode: "trilinear")[0]  // [K,3]
@@ -153,12 +188,17 @@ public enum MeshBake {
         let col = MLX.clip(sampled, min: 0, max: 1).asArray(Float.self)   // [K*3]
         var rgb = [Float](repeating: 0, count: atlasSize * atlasSize * 3)
         var filled = [Bool](repeating: false, count: atlasSize * atlasSize)
+        var wallFlipped = [Bool](repeating: false, count: atlasSize * atlasSize)
         for k in 0..<K {
             let x = Int(px[k*2]), y = Int(px[k*2+1])
+            if x < 0 || x >= atlasSize || y < 0 || y >= atlasSize { continue }  // jitter can push 1 texel out
             let p = y * atlasSize + x
+            if filled[p] { continue }   // first write wins: center pass beats jitter passes
             rgb[p*3] = col[k*3]; rgb[p*3+1] = col[k*3+1]; rgb[p*3+2] = col[k*3+2]
             filled[p] = true
+            if flipArr[k] < 0 { wallFlipped[p] = true }
         }
+        let filledBeforeInpaint = filled
         let coverage = Float(filled.lazy.filter { $0 }.count) / Float(atlasSize * atlasSize)
         // Inpaint to COMPLETION, not a fixed ring count: any unfilled texel is
         // black, and the renderer's mip chain averages small charts against it,
@@ -176,7 +216,8 @@ public enum MeshBake {
         }
         return BakedMesh(vertices: finalMesh.vertices, faces: finalMesh.faces,
                          normals: finalNormals, uvs: finalUVs, texRGBA: rgba,
-                         atlasSize: atlasSize, coverage: coverage)
+                         atlasSize: atlasSize, coverage: coverage,
+                         filledBeforeInpaint: filledBeforeInpaint, wallFlipped: wallFlipped)
     }
 
     /// Fill unfilled texels from filled 4-neighbours (seam/gap inpaint, push-out).

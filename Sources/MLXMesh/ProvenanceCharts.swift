@@ -198,7 +198,7 @@ extension Mesh {
                     let ta = simd_abs(tNrm)
                     let axis = ta.x >= ta.y && ta.x >= ta.z ? 0 : (ta.y >= ta.z ? 1 : 2)
                     let sign: Float = tNrm[axis] < 0 ? -1 : 1
-                    if sDir[axis] * sign > 0.15 {
+                    if sDir[axis] * sign > 0.45 {
                         union(small, nbrRoot)
                         break
                     }
@@ -292,9 +292,9 @@ extension Mesh {
                 let n = faceUnitNrm[fi]
                 guard simd_length_squared(n) > 0 else { continue }
                 let axis = Int(chartAxis[Int(chartIds[fi])])
-                guard abs(n[axis]) < 0.2 else { continue }   // edge-on for own chart
+                guard abs(n[axis]) < 0.45 else { continue }   // foreshortened >2.2x for own chart
                 var bestChart: Int32 = -1
-                var bestCos: Float = 0.3   // require a genuinely better fit
+                var bestCos: Float = 0.5   // require a genuinely better fit
                 for k in 0..<3 {
                     let nb = nbr[fi*3 + k]
                     guard nb >= 0 else { continue }
@@ -310,7 +310,7 @@ extension Mesh {
         for fi in 0..<faceCount where chartIds[fi] < Int32(chartCount) {
             let n = faceUnitNrm[fi]
             guard simd_length_squared(n) > 0 else { continue }
-            if abs(n[Int(chartAxis[Int(chartIds[fi])])] ) < 0.2 {
+            if abs(n[Int(chartAxis[Int(chartIds[fi])])] ) < 0.45 {
                 let an = simd_abs(n)
                 let own: UInt8 = an.x >= an.y && an.x >= an.z ? 0 : (an.y >= an.z ? 1 : 2)
                 chartIds[fi] = Int32(chartCount + extraAxis.count)

@@ -49,6 +49,11 @@ func argValue(_ name: String) -> Int? {
 sampleCount = argValue("samples") ?? sampleCount
 targetFaces = argValue("target") ?? targetFaces
 atlasSize = argValue("atlas") ?? atlasSize
+var remeshRes = argValue("remesh") ?? 256
+var onlyBackend: String? = nil
+if let i = CommandLine.arguments.firstIndex(of: "only"), i + 1 < CommandLine.arguments.count {
+    onlyBackend = CommandLine.arguments[i + 1]
+}
 let (shN, texN) = full ? ("shapedec_out_feats", "texdec_full_feats")
                        : ("shapedec_sm_out_feats", "texdec_out_feats")
 let coordsN = full ? "shapedec_out_coords" : "shapedec_sm_out_coords"
@@ -87,7 +92,7 @@ func evaluate(_ backend: UnwrapBackend) throws -> EvalResult {
     let t0 = CFAbsoluteTimeGetCurrent()
     let baked = try MeshBake.run(
         shapeFeats: shapeFeats, coords: coords, texBaseColor: baseColor,
-        fineRes: fineRes, remeshRes: 256, targetFaces: targetFaces, atlasSize: atlasSize,
+        fineRes: fineRes, remeshRes: remeshRes, targetFaces: targetFaces, atlasSize: atlasSize,
         backend: backend)
     let bakeSeconds = CFAbsoluteTimeGetCurrent() - t0
 
@@ -211,13 +216,13 @@ func evaluate(_ backend: UnwrapBackend) throws -> EvalResult {
                       badFrac: bad, coverage: baked.coverage, faces: F)
 }
 
-let rx = try evaluate(.xatlas)
-let rp = try evaluate(.provenance)
+let rx = onlyBackend == "provenance" ? nil : try evaluate(.xatlas)
+let rp = onlyBackend == "xatlas" ? nil : try evaluate(.provenance)
 func row(_ n: String, _ r: EvalResult) {
     print(String(format: "%12@  bake %7.1fs  faces %8d  coverage %.3f  meanErr %.4f  p95 %.4f  bad>0.1 %.3f%%",
                  n as NSString, r.bakeSeconds, r.faces, r.coverage, r.meanErr, r.p95Err, r.badFrac * 100))
 }
 print("--- RESULTS (color L2 vs voxel ground truth, \(sampleCount) surface samples)")
-row("xatlas", rx)
-row("provenance", rp)
+if let rx { row("xatlas", rx) }
+if let rp { row("provenance", rp) }
 print("BAKEAB DONE")

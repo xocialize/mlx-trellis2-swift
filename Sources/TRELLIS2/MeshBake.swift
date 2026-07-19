@@ -80,13 +80,26 @@ public enum MeshBake {
             finalNormals = finalMesh.vertexNormals()
             chartCount = uv.charts.count
         case .provenance:
-            let (tagged, faceAxis) = mesh.remeshDualContouringTagged(resolution: remeshRes)
-            MLX.eval(tagged.vertices, tagged.faces)
-            log("  remeshed(tagged): \(tagged.vertexCount) verts, \(tagged.faceCount) faces")
-            var provMesh = tagged
-            var provAxis: [UInt8]? = faceAxis
-            if tagged.faceCount > targetFaces {
-                provMesh = tagged.simplify(targetNumFaces: targetFaces)
+            // remeshRes <= 0 skips the DC remesh entirely (official-pipeline
+            // parity): the 256-grid remesh aliases the fine dual-grid's thin
+            // double shell into interpenetrating walls — the visible shard
+            // defect. The remesh exists to make xatlas tolerable (raw-mesh
+            // xatlas ≈ 2.2 h); the provenance unwrap doesn't need it.
+            var provMesh: Mesh
+            var provAxis: [UInt8]?
+            if remeshRes > 0 {
+                let (tagged, faceAxis) = mesh.remeshDualContouringTagged(resolution: remeshRes)
+                MLX.eval(tagged.vertices, tagged.faces)
+                log("  remeshed(tagged): \(tagged.vertexCount) verts, \(tagged.faceCount) faces")
+                provMesh = tagged
+                provAxis = faceAxis
+            } else {
+                provMesh = mesh
+                provAxis = nil   // axis from face normals
+                log("  remesh skipped (official-parity): \(provMesh.faceCount) raw faces")
+            }
+            if provMesh.faceCount > targetFaces {
+                provMesh = provMesh.simplify(targetNumFaces: targetFaces)
                 MLX.eval(provMesh.vertices, provMesh.faces)
                 // nil tags → axis from each simplified face's own normal;
                 // measured better than BVH tag transfer (mis-tagged large

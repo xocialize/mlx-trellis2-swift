@@ -114,6 +114,14 @@ public enum MeshBake {
                 // faces project near edge-on and starve of texels)
                 provAxis = nil
                 log("  simplified: \(provMesh.vertexCount) verts, \(provMesh.faceCount) faces")
+                // Simplify's collapses can STITCH the o-voxel shell's two walls
+                // together, seaming outward-wound outer faces to inward-wound
+                // inner faces (~10k winding-inconsistent edges measured — the
+                // seam-crack root cause). The full-xatlas backend silently
+                // repairs this by re-normalizing winding per chart; the
+                // pack-only path must repair it explicitly.
+                provMesh = provMesh.unifyFaceOrientations()
+                MLX.eval(provMesh.vertices, provMesh.faces)
             }
             // (padding gutters and stronger absorption were both measured NULL
             // on the seam-crack artifact and cost texel density — keep defaults)
@@ -143,12 +151,20 @@ public enum MeshBake {
         // rasterization with 4 half-texel-jittered passes appended after the
         // main one; later duplicate writes lose (first-write-wins below), so
         // jitter only fills otherwise-empty texels.
-        let uvPix = finalUVs * Float(atlasSize)
+        // Supersample 2×: bake into a double-resolution grid and box-average
+        // down. Each final texel becomes the mean of up to 4 surface samples —
+        // fixes the foreshortened-seam-texel footprint problem (texel covers
+        // ~2× surface, single center sample unrepresentative) and dilutes
+        // single-sample crevice pinning (measured: 64%/36% of provenance's
+        // remaining bad samples respectively).
+        let ss = 2
+        let ssSize = atlasSize * ss
+        let uvPix = finalUVs * Float(ssSize)
         var pixParts: [MLXArray] = [], fidParts: [MLXArray] = [], baryParts: [MLXArray] = []
         for (dx, dy): (Float, Float) in [(0, 0), (0.49, 0.49), (-0.49, 0.49), (0.49, -0.49), (-0.49, -0.49)] {
             let jittered = dx == 0 && dy == 0 ? uvPix
                 : MLX.stacked([uvPix[0..., 0] + dx, uvPix[0..., 1] + dy], axis: 1)
-            let (p, f, b) = UVRasterize.rasterize(uvsPix: jittered, faces: finalMesh.faces, textureSize: atlasSize)
+            let (p, f, b) = UVRasterize.rasterize(uvsPix: jittered, faces: finalMesh.faces, textureSize: ssSize)
             pixParts.append(p); fidParts.append(f); baryParts.append(b)
         }
         let pix = MLX.concatenated(pixParts, axis: 0)
@@ -196,23 +212,51 @@ public enum MeshBake {
         // 5) write texels + host-side dilation inpaint
         let px = pix.asType(.int32).asArray(Int32.self)                   // [K*2]
         let col = MLX.clip(sampled, min: 0, max: 1).asArray(Float.self)   // [K*3]
+        // --- write at supersample resolution, first-write-wins per sub-texel ---
+        var ssRgb = [Float](repeating: 0, count: ssSize * ssSize * 3)
+        var ssMr = mrSampled != nil ? [Float](repeating: 0, count: ssSize * ssSize * 2) : []
+        var ssFilled = [Bool](repeating: false, count: ssSize * ssSize)
+        var ssFlip = [Bool](repeating: false, count: ssSize * ssSize)
+        for k in 0..<K {
+            let x = Int(px[k*2]), y = Int(px[k*2+1])
+            if x < 0 || x >= ssSize || y < 0 || y >= ssSize { continue }  // jitter can push 1 texel out
+            let p = y * ssSize + x
+            if ssFilled[p] { continue }   // first write wins: center pass beats jitter passes
+            ssRgb[p*3] = col[k*3]; ssRgb[p*3+1] = col[k*3+1]; ssRgb[p*3+2] = col[k*3+2]
+            if let mrS = mrSampled { ssMr[p*2] = mrS[k*2]; ssMr[p*2+1] = mrS[k*2+1] }
+            ssFilled[p] = true
+            if flipArr[k] < 0 { ssFlip[p] = true }
+        }
+
+        // --- box-average down to the final atlas ---
         var rgb = [Float](repeating: 0, count: atlasSize * atlasSize * 3)
-        // MR ride-along: metallic in ch0, roughness in ch1, ch2 unused; shares
-        // fill state and inpaint with the base-color pass.
         var mrBuf = mrSampled != nil ? [Float](repeating: 0, count: atlasSize * atlasSize * 3) : []
         var filled = [Bool](repeating: false, count: atlasSize * atlasSize)
         var wallFlipped = [Bool](repeating: false, count: atlasSize * atlasSize)
-        for k in 0..<K {
-            let x = Int(px[k*2]), y = Int(px[k*2+1])
-            if x < 0 || x >= atlasSize || y < 0 || y >= atlasSize { continue }  // jitter can push 1 texel out
-            let p = y * atlasSize + x
-            if filled[p] { continue }   // first write wins: center pass beats jitter passes
-            rgb[p*3] = col[k*3]; rgb[p*3+1] = col[k*3+1]; rgb[p*3+2] = col[k*3+2]
-            if let mrS = mrSampled {
-                mrBuf[p*3] = mrS[k*2]; mrBuf[p*3+1] = mrS[k*2+1]
+        for y in 0..<atlasSize {
+            for x in 0..<atlasSize {
+                var r: Float = 0, g: Float = 0, b: Float = 0, m: Float = 0, ro: Float = 0
+                var cnt = 0
+                var anyFlip = false
+                for sy in 0..<ss {
+                    for sx in 0..<ss {
+                        let sp = (y * ss + sy) * ssSize + (x * ss + sx)
+                        if ssFilled[sp] {
+                            r += ssRgb[sp*3]; g += ssRgb[sp*3+1]; b += ssRgb[sp*3+2]
+                            if mrSampled != nil { m += ssMr[sp*2]; ro += ssMr[sp*2+1] }
+                            if ssFlip[sp] { anyFlip = true }
+                            cnt += 1
+                        }
+                    }
+                }
+                guard cnt > 0 else { continue }
+                let p = y * atlasSize + x
+                let inv = 1 / Float(cnt)
+                rgb[p*3] = r * inv; rgb[p*3+1] = g * inv; rgb[p*3+2] = b * inv
+                if mrSampled != nil { mrBuf[p*3] = m * inv; mrBuf[p*3+1] = ro * inv }
+                filled[p] = true
+                wallFlipped[p] = anyFlip
             }
-            filled[p] = true
-            if flipArr[k] < 0 { wallFlipped[p] = true }
         }
         let filledBeforeInpaint = filled
         let coverage = Float(filled.lazy.filter { $0 }.count) / Float(atlasSize * atlasSize)

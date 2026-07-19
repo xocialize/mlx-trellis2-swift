@@ -64,7 +64,7 @@ extension Mesh {
         faceAxis: [UInt8]?,
         smoothingIterations: Int = 2,
         minChartFaces: Int = 24
-    ) -> (chartIds: [Int32], chartCount: Int, chartAxis: [UInt8]) {
+    ) -> (chartIds: [Int32], chartCount: Int, chartAxis: [UInt8], chartSign: [Float]) {
         precondition(faceAxis == nil || faceAxis!.count == faceCount, "faceAxis must be per-face")
         let f = faces.asArray(Int32.self)
         let v = vertices.asArray(Float.self)
@@ -229,7 +229,10 @@ extension Mesh {
             let a = simd_abs(n)
             return a.x >= a.y && a.x >= a.z ? 0 : (a.y >= a.z ? 1 : 2)
         }
-        return (chartIds, chartOf.count, chartAxis)
+        let chartSign: [Float] = zip(axisAccum, chartAxis).map { n, a in
+            n[Int(a)] < 0 ? -1 : 1
+        }
+        return (chartIds, chartOf.count, chartAxis, chartSign)
     }
 
     /// Full provenance unwrap: charts from tags, axis-plane UVs, seam split,
@@ -240,7 +243,7 @@ extension Mesh {
         minChartFaces: Int = 24,
         packOptions: PackOptions = PackOptions()
     ) throws -> ProvenanceUnwrapResult {
-        var (chartIds, chartCount, chartAxis) = provenanceChartIds(
+        var (chartIds, chartCount, chartAxis, chartSign) = provenanceChartIds(
             faceAxis: faceAxis,
             smoothingIterations: smoothingIterations,
             minChartFaces: minChartFaces)
@@ -286,6 +289,7 @@ extension Mesh {
             }
         }
         var extraAxis: [UInt8] = []
+        var extraSign: [Float] = []
         for _ in 0..<3 {   // rounds: reassignment can unlock chains
             var moved = false
             for fi in 0..<faceCount where chartIds[fi] < Int32(chartCount) {
@@ -315,10 +319,12 @@ extension Mesh {
                 let own: UInt8 = an.x >= an.y && an.x >= an.z ? 0 : (an.y >= an.z ? 1 : 2)
                 chartIds[fi] = Int32(chartCount + extraAxis.count)
                 extraAxis.append(own)
+                extraSign.append(n[Int(own)] < 0 ? -1 : 1)
             }
         }
         if !extraAxis.isEmpty {
             chartAxis.append(contentsOf: extraAxis)
+            chartSign.append(contentsOf: extraSign)
             chartCount += extraAxis.count
         }
 
@@ -355,6 +361,22 @@ extension Mesh {
                     splitChart.append(chart)
                 }
                 splitFaces[fi*3 + k] = idx
+            }
+            // Per-chart winding normalization: flip faces whose geometric
+            // normal opposes the chart's signed axis. Simplify can stitch the
+            // shell's two walls into non-orientable patches (~10k inconsistent
+            // edges) that global unification cannot fix; per-chart consistency
+            // — what full xatlas produces implicitly — renders them
+            // camouflaged (winding front-facing + smooth carried normals).
+            let i0 = Int(f[fi*3]), i1 = Int(f[fi*3 + 1]), i2 = Int(f[fi*3 + 2])
+            let a3 = SIMD3<Float>(v[i0*3], v[i0*3+1], v[i0*3+2])
+            let b3 = SIMD3<Float>(v[i1*3], v[i1*3+1], v[i1*3+2])
+            let c3 = SIMD3<Float>(v[i2*3], v[i2*3+1], v[i2*3+2])
+            let nrm = simd_cross(b3 - a3, c3 - a3)
+            if nrm[axis] * chartSign[Int(chart)] < 0 {
+                let tmp = splitFaces[fi*3 + 1]
+                splitFaces[fi*3 + 1] = splitFaces[fi*3 + 2]
+                splitFaces[fi*3 + 2] = tmp
             }
         }
 

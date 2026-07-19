@@ -110,6 +110,25 @@ for path in cfg.paths {
         log("  xatlas: add \(String(format: "%.2f", tAdd))s | charts \(String(format: "%.2f", tCharts))s | pack \(String(format: "%.2f", tPack))s | \(atlas.chartCount) charts, \(atlas.width)x\(atlas.height), util \(atlas.utilization.first ?? -1)")
 
         if cfg.doProvenance {
+            func windingBad(_ m: Mesh) -> Int {
+                let ff = m.faces.asArray(Int32.self)
+                var dir = [UInt64: (Int8, Int8)]()   // edge -> (first dir, second dir)
+                let stride = UInt64(m.vertexCount) + 1
+                var bad = 0
+                for fi in 0..<(ff.count / 3) {
+                    for k in 0..<3 {
+                        let a = UInt32(bitPattern: ff[fi*3 + k])
+                        let b = UInt32(bitPattern: ff[fi*3 + (k + 1) % 3])
+                        let key = UInt64(min(a, b)) * stride + UInt64(max(a, b))
+                        let d: Int8 = a < b ? 1 : -1
+                        if let (d0, d1) = dir[key] {
+                            if d1 == 0 { dir[key] = (d0, d)
+                                if d0 == d { bad += 1 } }
+                        } else { dir[key] = (d, 0) }
+                    }
+                }
+                return bad
+            }
             // Phase-2 E2E: tagged remesh -> provenance charts -> axis UVs ->
             // seam split -> pack-only. Runs on the UNSIMPLIFIED remesh output
             // (label-preserving simplify is the next sub-phase).
@@ -122,10 +141,20 @@ for path in cfg.paths {
             MLX.eval(tagged.vertices, tagged.faces)
             let tTagRemesh = now() - t2
             t2 = now()
-            let prov = try tagged.provenanceUnwrap(
-                faceAxis: faceAxis,
+            var provIn = tagged
+            var provInAxis: [UInt8]? = faceAxis
+            if tagged.faceCount > cfg.targetFaces {
+                provIn = tagged.simplify(targetNumFaces: cfg.targetFaces)
+                    .unifyFaceOrientations()
+                MLX.eval(provIn.vertices, provIn.faces)
+                provInAxis = nil
+            }
+            log("  WINDING-AUDIT input(simplified): \(windingBad(provIn)) bad edges, \(provIn.faceCount) faces")
+            let prov = try provIn.provenanceUnwrap(
+                faceAxis: provInAxis,
                 smoothingIterations: cfg.smoothIters,
                 minChartFaces: cfg.minChartFaces)
+            log("  WINDING-AUDIT output(final): \(windingBad(prov.unwrap.mesh)) bad edges (note: split verts hide seam edges; merged-space audit needs vertexMap)")
             let tProv = now() - t2
             let u = prov.unwrap
             record["prov_remesh_s"] = tTagRemesh

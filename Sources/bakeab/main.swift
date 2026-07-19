@@ -207,9 +207,78 @@ func evaluate(_ backend: UnwrapBackend) throws -> EvalResult {
     }
     var badPoints: [Float] = []
     var badColors: [Float] = []
+    var badSampleIdx: [Int] = []
     for i in 0..<sampleCount where errs[i] > 0.1 && badPoints.count < 6000 {
         badPoints.append(pts[i*3]); badPoints.append(pts[i*3+1]); badPoints.append(pts[i*3+2])
         badColors.append(bakedCol[i*3]); badColors.append(bakedCol[i*3+1]); badColors.append(bakedCol[i*3+2])
+        badSampleIdx.append(i)
+    }
+
+    // Texel-center diagnosis for bad samples: is the texel color correct for
+    // the texel center's OWN surface position (footprint/aliasing problem —
+    // supersampling territory), or wrong even there (remap defect)?
+    if !badSampleIdx.isEmpty {
+        var centerPts: [Float] = []
+        for i in badSampleIdx {
+            let fi = sampleFace[i]
+            let i0 = Int(f[fi*3]), i1 = Int(f[fi*3+1]), i2 = Int(f[fi*3+2])
+            // the texel this sample read
+            let su = pts[0]; _ = su
+            // recompute sample's uv (same as read path)
+            // solve bary of the texel CENTER in the face's UV triangle
+            let u0 = uvArr[i0*2], w0 = uvArr[i0*2+1]
+            let u1 = uvArr[i1*2], w1 = uvArr[i1*2+1]
+            let u2 = uvArr[i2*2], w2 = uvArr[i2*2+1]
+            // sample's own uv:
+            // (recompute via stored face + the point's world pos is complex; use
+            // texel center = floor(sample uv * S) + 0.5)
+            // sample uv from its bary was not stored; reconstruct from the point
+            // by solving world-space bary:
+            let a3 = SIMD3<Float>(v[i0*3], v[i0*3+1], v[i0*3+2])
+            let b3 = SIMD3<Float>(v[i1*3], v[i1*3+1], v[i1*3+2])
+            let c3 = SIMD3<Float>(v[i2*3], v[i2*3+1], v[i2*3+2])
+            let pw = SIMD3<Float>(pts[i*3], pts[i*3+1], pts[i*3+2])
+            let e0 = b3 - a3, e1v = c3 - a3, e2v = pw - a3
+            let d00 = simd_dot(e0, e0), d01 = simd_dot(e0, e1v), d11 = simd_dot(e1v, e1v)
+            let d20 = simd_dot(e2v, e0), d21 = simd_dot(e2v, e1v)
+            let den = d00 * d11 - d01 * d01
+            var bw: Float = 0, cw: Float = 0
+            if abs(den) > 1e-20 { bw = (d11 * d20 - d01 * d21) / den; cw = (d00 * d21 - d01 * d20) / den }
+            let aw = 1 - bw - cw
+            let su2 = aw * u0 + bw * u1 + cw * u2
+            let sw2 = aw * w0 + bw * w1 + cw * w2
+            let tcu = (Float(Int(su2 * Float(S))) + 0.5) / Float(S)
+            let tcw = (Float(Int(sw2 * Float(S))) + 0.5) / Float(S)
+            // bary of texel center in UV triangle
+            let q0 = SIMD2<Float>(u1 - u0, w1 - w0)
+            let q1 = SIMD2<Float>(u2 - u0, w2 - w0)
+            let q2 = SIMD2<Float>(tcu - u0, tcw - w0)
+            let e00 = simd_dot(q0, q0), e01 = simd_dot(q0, q1), e11 = simd_dot(q1, q1)
+            let e20 = simd_dot(q2, q0), e21 = simd_dot(q2, q1)
+            let den2 = e00 * e11 - e01 * e01
+            var b2: Float = 0, c2: Float = 0
+            if abs(den2) > 1e-20 { b2 = (e11 * e20 - e01 * e21) / den2; c2 = (e00 * e21 - e01 * e20) / den2 }
+            let a2 = 1 - b2 - c2
+            // texel center's surface position via that bary (clamped to face)
+            let cb = max(0, min(1, b2)), cc = max(0, min(1, c2)), ca = max(0, min(1, a2))
+            let norm = max(ca + cb + cc, 1e-9)
+            let cpos = (a3 * ca + b3 * cb + c3 * cc) / norm
+            centerPts.append(cpos.x); centerPts.append(cpos.y); centerPts.append(cpos.z)
+        }
+        let n = badSampleIdx.count
+        let cArr = MLXArray(centerPts, [n, 3])
+        let cOnShell = shellBVH.closestPoints(mesh: shell, queries: cArr).points
+        let cQuery = ((cOnShell + 0.5) * fineRes).reshaped([1, n, 3])
+        let cTruth = GridSample3d.sample(feats: baseColor, coords: coords, grid: cQuery, mode: "trilinear")[0]
+        MLX.eval(cTruth)
+        let cT = MLX.clip(cTruth, min: 0, max: 1).asArray(Float.self)
+        var texelCorrect = 0
+        for j in 0..<n {
+            let dr = Double(badColors[j*3] - cT[j*3]), dg = Double(badColors[j*3+1] - cT[j*3+1]), db = Double(badColors[j*3+2] - cT[j*3+2])
+            if (dr*dr + dg*dg + db*db).squareRoot() < 0.08 { texelCorrect += 1 }
+        }
+        print(String(format: "    TEXEL-CENTER DIAG: %d bad samples | texel correct for its own center: %.1f%% (footprint/aliasing) | wrong even at center: %.1f%% (remap/sampling defect)",
+                     n, Double(texelCorrect) / Double(n) * 100, 100 - Double(texelCorrect) / Double(n) * 100))
     }
     errs.sort()
     let mean = errs.reduce(0, +) / Double(sampleCount)

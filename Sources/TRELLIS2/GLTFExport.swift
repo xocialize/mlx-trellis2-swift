@@ -20,10 +20,12 @@ public enum GLTFExport {
         indices: MLXArray,
         normals: MLXArray? = nil,
         uvs: MLXArray? = nil,
-        baseColorRGBA: (pixels: [UInt8], width: Int, height: Int)? = nil
+        baseColorRGBA: (pixels: [UInt8], width: Int, height: Int)? = nil,
+        metallicRoughnessRGBA: (pixels: [UInt8], width: Int, height: Int)? = nil
     ) throws {
         let glb = try glbData(positions: positions, indices: indices, normals: normals,
-                              uvs: uvs, baseColorRGBA: baseColorRGBA)
+                              uvs: uvs, baseColorRGBA: baseColorRGBA,
+                              metallicRoughnessRGBA: metallicRoughnessRGBA)
         try glb.write(to: url)
     }
 
@@ -35,7 +37,8 @@ public enum GLTFExport {
         indices: MLXArray,
         normals: MLXArray? = nil,
         uvs: MLXArray? = nil,
-        baseColorRGBA: (pixels: [UInt8], width: Int, height: Int)? = nil
+        baseColorRGBA: (pixels: [UInt8], width: Int, height: Int)? = nil,
+        metallicRoughnessRGBA: (pixels: [UInt8], width: Int, height: Int)? = nil
     ) throws -> Data {
         let V = positions.dim(0)
         let pos = positions.asType(.float32).asArray(Float.self)   // [V*3]
@@ -43,6 +46,7 @@ public enum GLTFExport {
         let nrm = normals.map { $0.asType(.float32).asArray(Float.self) }
         let uv = uvs.map { $0.asType(.float32).asArray(Float.self) }
         let png = baseColorRGBA.flatMap { encodePNG(pixels: $0.pixels, width: $0.width, height: $0.height) }
+        let mrPng = metallicRoughnessRGBA.flatMap { encodePNG(pixels: $0.pixels, width: $0.width, height: $0.height) }
 
         var bin = Data()
         var bufferViews: [[String: Any]] = []
@@ -105,6 +109,14 @@ public enum GLTFExport {
             bufferViews.append(["buffer": 0, "byteOffset": off, "byteLength": png.count])
             imgBV = bufferViews.count - 1
         }
+        var mrBV: Int? = nil
+        if let mrPng {
+            pad4()
+            let off = bin.count
+            bin.append(mrPng)
+            bufferViews.append(["buffer": 0, "byteOffset": off, "byteLength": mrPng.count])
+            mrBV = bufferViews.count - 1
+        }
 
         // --- assemble attributes / material ---
         var attributes: [String: Any] = ["POSITION": posAcc]
@@ -123,12 +135,27 @@ public enum GLTFExport {
             "accessors": accessors,
         ]
 
-        var pbr: [String: Any] = ["metallicFactor": 0.0, "roughnessFactor": 1.0]
+        // With a metallicRoughness texture the factors act as multipliers and
+        // must be 1.0 (glTF spec); without one, stay fully dielectric.
+        var pbr: [String: Any] = mrBV != nil
+            ? ["metallicFactor": 1.0, "roughnessFactor": 1.0]
+            : ["metallicFactor": 0.0, "roughnessFactor": 1.0]
+        var images: [[String: Any]] = []
+        var textures: [[String: Any]] = []
         if let imgBV {
-            root["images"] = [["bufferView": imgBV, "mimeType": "image/png"]]
+            images.append(["bufferView": imgBV, "mimeType": "image/png"])
+            textures.append(["source": images.count - 1, "sampler": 0])
+            pbr["baseColorTexture"] = ["index": textures.count - 1]
+        }
+        if let mrBV {
+            images.append(["bufferView": mrBV, "mimeType": "image/png"])
+            textures.append(["source": images.count - 1, "sampler": 0])
+            pbr["metallicRoughnessTexture"] = ["index": textures.count - 1]
+        }
+        if !images.isEmpty {
+            root["images"] = images
             root["samplers"] = [[String: Any]()]
-            root["textures"] = [["source": 0, "sampler": 0]]
-            pbr["baseColorTexture"] = ["index": 0]
+            root["textures"] = textures
         }
         let material: [String: Any] = [
             "pbrMetallicRoughness": pbr,

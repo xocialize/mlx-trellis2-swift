@@ -14,6 +14,9 @@ public struct BakedMesh {
     public let texRGBA: [UInt8]     // atlasSize*atlasSize*4
     public let atlasSize: Int
     public let coverage: Float      // fraction of texels covered before inpaint
+    /// glTF metallicRoughness atlas (G=roughness, B=metallic), when the tex
+    /// decoder's metallic/roughness channels were provided to the bake.
+    public let mrRGBA: [UInt8]?
     /// Diagnostics (atlasSize² each): texel rasterized before inpaint; texel's
     /// closest-point remap landed on an opposing-normal (wrong-wall) raw face.
     public let filledBeforeInpaint: [Bool]
@@ -41,6 +44,7 @@ public enum MeshBake {
         shapeFeats: MLXArray, coords: MLXArray, texBaseColor: MLXArray,
         fineRes: Float, remeshRes: Int = 256, targetFaces: Int = 120_000, atlasSize: Int = 1024,
         backend: UnwrapBackend = .xatlas,
+        texMetallicRoughness: MLXArray? = nil,   // [N,2] metallic, roughness in [0,1]
         log: (String) -> Void = { print($0) }
     ) throws -> BakedMesh {
         let margin: Float = 0.5
@@ -179,6 +183,12 @@ public enum MeshBake {
         let query = ((pos + 0.5) * fineRes).reshaped([1, K, 3])
         let sampled = GridSample3d.sample(feats: texBaseColor, coords: coords, grid: query, mode: "trilinear")[0]  // [K,3]
         MLX.eval(sampled)
+        var mrSampled: [Float]? = nil
+        if let mr = texMetallicRoughness {
+            let mrS = GridSample3d.sample(feats: mr, coords: coords, grid: query, mode: "trilinear")[0]  // [K,2]
+            MLX.eval(mrS)
+            mrSampled = MLX.clip(mrS, min: 0, max: 1).asArray(Float.self)
+        }
         let qmin = query.min(), qmax = query.max()
         let nonzero = (sampled.sum(axis: 1) .> 0).asType(.float32).mean().item(Float.self)
         log("  bake diag: baseColor mean=\(texBaseColor.mean().item(Float.self))  query[\(qmin.item(Float.self))..\(qmax.item(Float.self))]  sampled mean=\(sampled.mean().item(Float.self))  hitFrac=\(nonzero)")
@@ -187,6 +197,9 @@ public enum MeshBake {
         let px = pix.asType(.int32).asArray(Int32.self)                   // [K*2]
         let col = MLX.clip(sampled, min: 0, max: 1).asArray(Float.self)   // [K*3]
         var rgb = [Float](repeating: 0, count: atlasSize * atlasSize * 3)
+        // MR ride-along: metallic in ch0, roughness in ch1, ch2 unused; shares
+        // fill state and inpaint with the base-color pass.
+        var mrBuf = mrSampled != nil ? [Float](repeating: 0, count: atlasSize * atlasSize * 3) : []
         var filled = [Bool](repeating: false, count: atlasSize * atlasSize)
         var wallFlipped = [Bool](repeating: false, count: atlasSize * atlasSize)
         for k in 0..<K {
@@ -195,6 +208,9 @@ public enum MeshBake {
             let p = y * atlasSize + x
             if filled[p] { continue }   // first write wins: center pass beats jitter passes
             rgb[p*3] = col[k*3]; rgb[p*3+1] = col[k*3+1]; rgb[p*3+2] = col[k*3+2]
+            if let mrS = mrSampled {
+                mrBuf[p*3] = mrS[k*2]; mrBuf[p*3+1] = mrS[k*2+1]
+            }
             filled[p] = true
             if flipArr[k] < 0 { wallFlipped[p] = true }
         }
@@ -205,7 +221,19 @@ public enum MeshBake {
         // producing dark shard artifacts at distance (user-visible; worst for
         // the provenance backend's lower packing utilization). The dilation
         // loop exits as soon as nothing new fills, so completion is cheap.
+        var mrFilled = filled   // copy BEFORE base-color inpaint mutates it
         dilateInpaint(&rgb, &filled, atlasSize, iterations: atlasSize)
+        var mrRGBA: [UInt8]? = nil
+        if mrSampled != nil {
+            dilateInpaint(&mrBuf, &mrFilled, atlasSize, iterations: atlasSize)
+            var out = [UInt8](repeating: 255, count: atlasSize * atlasSize * 4)
+            for p in 0..<(atlasSize * atlasSize) {
+                out[p*4] = 0                                                        // R unused
+                out[p*4+1] = UInt8(max(0, min(255, Int(mrBuf[p*3+1] * 255 + 0.5)))) // G = roughness
+                out[p*4+2] = UInt8(max(0, min(255, Int(mrBuf[p*3] * 255 + 0.5))))   // B = metallic
+            }
+            mrRGBA = out
+        }
 
         var rgba = [UInt8](repeating: 0, count: atlasSize * atlasSize * 4)
         for p in 0..<(atlasSize * atlasSize) {
@@ -216,7 +244,7 @@ public enum MeshBake {
         }
         return BakedMesh(vertices: finalMesh.vertices, faces: finalMesh.faces,
                          normals: finalNormals, uvs: finalUVs, texRGBA: rgba,
-                         atlasSize: atlasSize, coverage: coverage,
+                         atlasSize: atlasSize, coverage: coverage, mrRGBA: mrRGBA,
                          filledBeforeInpaint: filledBeforeInpaint, wallFlipped: wallFlipped)
     }
 

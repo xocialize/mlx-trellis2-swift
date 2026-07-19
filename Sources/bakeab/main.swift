@@ -62,6 +62,7 @@ let shapeFeats = try golden(shN)
 let coords = (try golden(coordsN)).asType(.int32)
 let texFeats = try golden(texN)
 let baseColor = MLX.clip(texFeats[0..., 0..<3] * 0.5 + 0.5, min: 0, max: 1)
+let texMR = MLX.clip(texFeats[0..., 3..<5] * 0.5 + 0.5, min: 0, max: 1)   // metallic, roughness
 let fineRes: Float = 1024
 print("[bakeab] fixtures: \(coords.dim(0)) voxels (\(full ? "FULL" : "octant")), \(sampleCount) eval samples")
 
@@ -96,7 +97,7 @@ func evaluate(_ backend: UnwrapBackend) throws -> EvalResult {
     let baked = try MeshBake.run(
         shapeFeats: shapeFeats, coords: coords, texBaseColor: baseColor,
         fineRes: fineRes, remeshRes: remeshRes, targetFaces: targetFaces, atlasSize: atlasSize,
-        backend: backend)
+        backend: backend, texMetallicRoughness: texMR)
     let bakeSeconds = CFAbsoluteTimeGetCurrent() - t0
 
     // --- uniform surface samples (area-weighted faces, fixed seed) ---
@@ -234,7 +235,8 @@ func evaluate(_ backend: UnwrapBackend) throws -> EvalResult {
     let glbURL = URL(fileURLWithPath: "\(outDir)/bakeab_\(backend.rawValue).glb")
     try GLTFExport.writeGLB(to: glbURL, positions: baked.vertices, indices: baked.faces,
                             normals: baked.normals, uvs: baked.uvs,
-                            baseColorRGBA: (baked.texRGBA, S, S))
+                            baseColorRGBA: (baked.texRGBA, S, S),
+                            metallicRoughnessRGBA: baked.mrRGBA.map { ($0, S, S) })
     print("  wrote \(glbURL.lastPathComponent)")
     return EvalResult(bakeSeconds: bakeSeconds, meanErr: mean, p95Err: p95,
                       badFrac: bad, coverage: baked.coverage, faces: F,

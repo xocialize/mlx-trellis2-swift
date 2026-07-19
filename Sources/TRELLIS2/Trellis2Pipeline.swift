@@ -231,6 +231,7 @@ public final class Trellis2Pipeline {
             }
             baked = BakedMesh(vertices: toYUp(baked.vertices), faces: baked.faces, normals: toYUp(baked.normals),
                               uvs: baked.uvs, texRGBA: baked.texRGBA, atlasSize: baked.atlasSize, coverage: baked.coverage,
+                              mrRGBA: baked.mrRGBA,
                               filledBeforeInpaint: baked.filledBeforeInpaint, wallFlipped: baked.wallFlipped)
             log("  [7] reoriented Y-up")
         }

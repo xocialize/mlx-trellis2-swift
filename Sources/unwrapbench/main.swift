@@ -21,6 +21,7 @@ struct Config {
     var doProvenance = false
     var smoothIters = 2
     var minChartFaces = 24
+    var parallelBuckets = 0
     var paths: [String] = []
 }
 
@@ -36,6 +37,7 @@ while let a = it.next() {
     case "--provenance": cfg.doProvenance = true
     case "--smooth": cfg.smoothIters = Int(it.next() ?? "2") ?? 2
     case "--min-chart": cfg.minChartFaces = Int(it.next() ?? "24") ?? 24
+    case "--parallel": cfg.parallelBuckets = Int(it.next() ?? "16") ?? 16
     default: cfg.paths.append(a)
     }
 }
@@ -109,6 +111,92 @@ for path in cfg.paths {
         record["utilization"] = atlas.utilization.first.map { Double($0) } ?? -1
         log("  xatlas: add \(String(format: "%.2f", tAdd))s | charts \(String(format: "%.2f", tCharts))s | pack \(String(format: "%.2f", tPack))s | \(atlas.chartCount) charts, \(atlas.width)x\(atlas.height), util \(atlas.utilization.first ?? -1)")
 
+        if cfg.parallelBuckets > 1 {
+            // Per-component parallel xatlas: charts never span connected
+            // components, so bucketed independent Atlas instances are a
+            // LOSSLESS decomposition of the chart computation.
+            let N = cfg.parallelBuckets
+            var t3 = now()
+            let labels = mesh.connectedComponents().asArray(Int32.self)
+            let f = mesh.faces.asArray(Int32.self)
+            let vtx = mesh.vertices.asArray(Float.self)
+            let F = f.count / 3
+            var compFaces = [Int32: [Int32]]()
+            for fi in 0..<F {
+                compFaces[labels[Int(f[fi*3])], default: []].append(Int32(fi))
+            }
+            // Components don't balance when the remesh fuses the shell into a
+            // giant blob (measured: 200k of 277k faces in one component,
+            // parallel wall == single wall). Spatial BSP over face centroids
+            // instead: near-perfect balance; charts split only along the
+            // ~log2(N) cut planes (small chart-count increase, measured below).
+            var centroids = [SIMD3<Float>](repeating: .zero, count: F)
+            for fi in 0..<F {
+                let i0 = Int(f[fi*3])*3, i1 = Int(f[fi*3+1])*3, i2 = Int(f[fi*3+2])*3
+                centroids[fi] = SIMD3<Float>(
+                    (vtx[i0] + vtx[i1] + vtx[i2]) / 3,
+                    (vtx[i0+1] + vtx[i1+1] + vtx[i2+1]) / 3,
+                    (vtx[i0+2] + vtx[i1+2] + vtx[i2+2]) / 3)
+            }
+            func bsp(_ faces: [Int32], _ leaves: Int) -> [[Int32]] {
+                if leaves <= 1 || faces.count < 64 { return [faces] }
+                var mn = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
+                var mx = -mn
+                for fi in faces { mn = simd_min(mn, centroids[Int(fi)]); mx = simd_max(mx, centroids[Int(fi)]) }
+                let ext = mx - mn
+                let axis = ext.x >= ext.y && ext.x >= ext.z ? 0 : (ext.y >= ext.z ? 1 : 2)
+                let sorted = faces.sorted { centroids[Int($0)][axis] < centroids[Int($1)][axis] }
+                let lo = leaves / 2, hi = leaves - lo
+                let cut = sorted.count * lo / leaves
+                return bsp(Array(sorted[..<cut]), lo) + bsp(Array(sorted[cut...]), hi)
+            }
+            let buckets = bsp(Array(0..<Int32(F)), N)
+            let load = buckets.map(\.count)
+            // build per-bucket submeshes
+            struct Sub { var positions: [SIMD3<Float>]; var indices: [UInt32] }
+            var subs = [Sub]()
+            for b in 0..<N {
+                var remap = [Int32: UInt32]()
+                var pos = [SIMD3<Float>]()
+                var idx = [UInt32]()
+                for fi in buckets[b] {
+                    for k in 0..<3 {
+                        let ov = f[Int(fi)*3 + k]
+                        if let m = remap[ov] { idx.append(m) }
+                        else {
+                            let m = UInt32(pos.count)
+                            remap[ov] = m
+                            pos.append(SIMD3<Float>(vtx[Int(ov)*3], vtx[Int(ov)*3+1], vtx[Int(ov)*3+2]))
+                            idx.append(m)
+                        }
+                    }
+                }
+                subs.append(Sub(positions: pos, indices: idx))
+            }
+            let tPartition = now() - t3
+            log("  parallel-xatlas: \(compFaces.count) components -> \(N) buckets (partition \(String(format: "%.2f", tPartition))s, loads \(load))")
+            t3 = now()
+            nonisolated(unsafe) var chartTotals = [Int](repeating: 0, count: N)
+            nonisolated(unsafe) var bucketTimes = [Double](repeating: 0, count: N)
+            let subsF = subs
+            DispatchQueue.concurrentPerform(iterations: N) { b in
+                let tb = CFAbsoluteTimeGetCurrent()
+                let a = Atlas()
+                try? a.addMesh(MeshInput(positions: subsF[b].positions, indices: subsF[b].indices))
+                a.addMeshJoin()
+                a.computeCharts()
+                a.packCharts()
+                chartTotals[b] = Int(a.chartCount)
+                bucketTimes[b] = CFAbsoluteTimeGetCurrent() - tb
+            }
+            let tParallel = now() - t3
+            record["parallel_buckets"] = N
+            record["parallel_wall_s"] = tParallel
+            record["parallel_charts"] = chartTotals.reduce(0, +)
+            log(String(format: "  parallel-xatlas: wall %.2fs (vs single %.2fs = %.1fx) | charts %d (single: %d) | slowest bucket %.2fs",
+                        tParallel, tCharts + tPack, (tCharts + tPack) / max(tParallel, 0.001),
+                        chartTotals.reduce(0, +), Int(atlas.chartCount), bucketTimes.max() ?? 0))
+        }
         if cfg.doProvenance {
             func windingBad(_ m: Mesh) -> Int {
                 let ff = m.faces.asArray(Int32.self)

@@ -15,6 +15,15 @@ public struct BakedMesh {
     public let coverage: Float      // fraction of texels covered before inpaint
 }
 
+/// Which unwrap produces the bake's UV atlas (UV-UNWRAP-METAL-PLAN.md).
+/// `.xatlas`: remesh → simplify → xatlas chart computation (CPU, minutes on
+/// production meshes). `.provenance`: tagged remesh → grid-provenance charts →
+/// axis projection → xatlas pack only (seconds; simplify integration pending,
+/// so the mesh stays at remesh resolution).
+public enum UnwrapBackend: String, Sendable {
+    case xatlas, provenance
+}
+
 public enum MeshBake {
     static func softplus(_ x: MLXArray) -> MLXArray {   // stable: max(x,0)+log(1+exp(-|x|))
         MLX.maximum(x, 0) + MLX.log(1 + MLX.exp(-MLX.abs(x)))
@@ -26,6 +35,7 @@ public enum MeshBake {
     public static func run(
         shapeFeats: MLXArray, coords: MLXArray, texBaseColor: MLXArray,
         fineRes: Float, remeshRes: Int = 256, targetFaces: Int = 120_000, atlasSize: Int = 1024,
+        backend: UnwrapBackend = .xatlas,
         log: (String) -> Void = { print($0) }
     ) throws -> BakedMesh {
         let margin: Float = 0.5
@@ -45,25 +55,41 @@ public enum MeshBake {
         var mesh = origMesh
         log("  raw dual-grid: \(mesh.vertexCount) verts, \(mesh.faceCount) faces, \(mesh.numConnectedComponents) components, \(mesh.numBoundaryEdges) boundary edges")
 
-        // 2) clean: DC remesh (watertight) then simplify to budget
-        mesh = mesh.remeshDualContouring(resolution: remeshRes)
-        MLX.eval(mesh.vertices, mesh.faces)
-        log("  remeshed: \(mesh.vertexCount) verts, \(mesh.faceCount) faces, \(mesh.numConnectedComponents) components, \(mesh.numBoundaryEdges) boundary edges")
-        if mesh.faceCount > targetFaces {
-            mesh = mesh.simplify(targetNumFaces: targetFaces)
+        // 2+3) clean (DC remesh, watertight) then unwrap, per backend.
+        let finalMesh: Mesh
+        let finalUVs: MLXArray
+        let chartCount: Int
+        switch backend {
+        case .xatlas:
+            // simplify to budget, then xatlas. Unwrap MUST come after remesh+
+            // simplify: xatlas on the raw dual-grid mesh is pathologically slow
+            // (~2.2h); on the cleaned mesh it's ~minutes (measured, Phase 0).
+            mesh = mesh.remeshDualContouring(resolution: remeshRes)
             MLX.eval(mesh.vertices, mesh.faces)
-            log("  simplified: \(mesh.vertexCount) verts, \(mesh.faceCount) faces")
+            log("  remeshed: \(mesh.vertexCount) verts, \(mesh.faceCount) faces, \(mesh.numConnectedComponents) components, \(mesh.numBoundaryEdges) boundary edges")
+            if mesh.faceCount > targetFaces {
+                mesh = mesh.simplify(targetNumFaces: targetFaces)
+                MLX.eval(mesh.vertices, mesh.faces)
+                log("  simplified: \(mesh.vertexCount) verts, \(mesh.faceCount) faces")
+            }
+            let uv = try mesh.uvUnwrap()
+            finalMesh = uv.mesh
+            finalUVs = uv.uvs
+            chartCount = uv.charts.count
+        case .provenance:
+            let (tagged, faceAxis) = mesh.remeshDualContouringTagged(resolution: remeshRes)
+            MLX.eval(tagged.vertices, tagged.faces)
+            log("  remeshed(tagged): \(tagged.vertexCount) verts, \(tagged.faceCount) faces")
+            let prov = try tagged.provenanceUnwrap(faceAxis: faceAxis)
+            finalMesh = prov.unwrap.mesh
+            finalUVs = prov.unwrap.uvs
+            chartCount = prov.unwrap.charts.count
         }
-
-        // 3) UV unwrap (xatlas, via MLXMesh). MUST come AFTER the remesh+simplify above: xatlas on the
-        //    raw dual-grid mesh is pathologically slow (~2.2h); on the cleaned mesh it's fast.
-        let uv = try mesh.uvUnwrap()
-        let finalMesh = uv.mesh
-        MLX.eval(finalMesh.vertices, finalMesh.faces, uv.uvs)
-        log("  unwrapped: \(finalMesh.vertexCount) verts, atlas \(uv.atlasWidth)x\(uv.atlasHeight), \(uv.charts.count) charts")
+        MLX.eval(finalMesh.vertices, finalMesh.faces, finalUVs)
+        log("  unwrapped[\(backend.rawValue)]: \(finalMesh.vertexCount) verts, \(chartCount) charts")
 
         // 4) rasterize + bake
-        let uvPix = uv.uvs * Float(atlasSize)
+        let uvPix = finalUVs * Float(atlasSize)
         let (pix, fid, bary) = UVRasterize.rasterize(uvsPix: uvPix, faces: finalMesh.faces, textureSize: atlasSize)
         MLX.eval(pix, fid, bary)
         let K = fid.dim(0)
@@ -107,7 +133,7 @@ public enum MeshBake {
             rgba[p*4+3] = 255
         }
         return BakedMesh(vertices: finalMesh.vertices, faces: finalMesh.faces,
-                         normals: finalMesh.vertexNormals(), uvs: uv.uvs, texRGBA: rgba,
+                         normals: finalMesh.vertexNormals(), uvs: finalUVs, texRGBA: rgba,
                          atlasSize: atlasSize, coverage: coverage)
     }
 

@@ -80,6 +80,11 @@ let package = Package(
         .executableTarget(name: "unwrapbench", dependencies: [
             "MLXMesh", .product(name: "MLX", package: "mlx-swift"),
         ], swiftSettings: [.interoperabilityMode(.Cxx)]),
+        // Phase-2 gate: bake-quality A/B of UnwrapBackend.xatlas vs .provenance
+        // against voxel ground truth on the golden fixtures.
+        .executableTarget(name: "bakeab", dependencies: [
+            "TRELLIS2", .product(name: "MLX", package: "mlx-swift"),
+        ], swiftSettings: [.interoperabilityMode(.Cxx)]),
         .executableTarget(name: "scaletest", dependencies: [
             "TRELLIS2",
             .product(name: "MLX", package: "mlx-swift"),

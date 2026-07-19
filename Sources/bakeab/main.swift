@@ -1,0 +1,147 @@
+// bakeab — bake-quality A/B for UnwrapBackend (UV-UNWRAP-METAL-PLAN.md Phase 2 gate).
+//
+// Runs MeshBake.run with .xatlas and .provenance on the same golden fixtures,
+// then scores each bake against GROUND TRUTH: uniform surface samples on the
+// result mesh, baked color fetched via that mesh's UVs, truth color sampled
+// from the source voxel attribute field (BVH remap to raw shell + trilinear —
+// the same machinery the bake itself uses). Captures texel starvation, folds,
+// and seam bleed as color error. Writes both GLBs for visual inspection.
+//
+//   swift run -c release bakeab [octant] [samples N]
+import Foundation
+import MLX
+import MLXMesh
+import TRELLIS2
+
+let goldens = "/Volumes/Satechi/TrellisRedux/trellis2-port/goldens"
+func golden(_ n: String) throws -> MLXArray { try loadArray(url: URL(fileURLWithPath: "\(goldens)/\(n).npy")) }
+let outDir = "/private/tmp/claude-501/-Users-dustinnielson-Development-vroid-xwear-interop/af2c103b-8a4f-4a6b-a495-b75e5e787ea5/scratchpad"
+
+let full = !CommandLine.arguments.contains("octant")
+var sampleCount = 150_000
+if let i = CommandLine.arguments.firstIndex(of: "samples"), i + 1 < CommandLine.arguments.count {
+    sampleCount = Int(CommandLine.arguments[i + 1]) ?? sampleCount
+}
+let (shN, texN) = full ? ("shapedec_out_feats", "texdec_full_feats")
+                       : ("shapedec_sm_out_feats", "texdec_out_feats")
+let coordsN = full ? "shapedec_out_coords" : "shapedec_sm_out_coords"
+
+let shapeFeats = try golden(shN)
+let coords = (try golden(coordsN)).asType(.int32)
+let texFeats = try golden(texN)
+let baseColor = MLX.clip(texFeats[0..., 0..<3] * 0.5 + 0.5, min: 0, max: 1)
+let fineRes: Float = 1024
+print("[bakeab] fixtures: \(coords.dim(0)) voxels (\(full ? "FULL" : "octant")), \(sampleCount) eval samples")
+
+// Rebuild the raw dual-grid shell once — the truth-sampling reference surface
+// (mirrors MeshBake.run steps 0-1).
+func softplus(_ x: MLXArray) -> MLXArray { MLX.maximum(x, 0) + MLX.log(1 + MLX.exp(-MLX.abs(x))) }
+let margin: Float = 0.5
+let dv = (1 + 2 * margin) * MLX.sigmoid(shapeFeats[0..., 0..<3]) - margin
+let inter = shapeFeats[0..., 3..<6] .> 0
+let ql = softplus(shapeFeats[0..., 6..<7])
+let (rawV, rawF) = DualGridMesh.extract(
+    coords: coords[0..., 1..<4], dualVerts: dv, intersected: inter, quadLerp: ql, gridSize: fineRes)
+MLX.eval(rawV, rawF)
+let shell = Mesh(vertices: rawV, faces: rawF)
+let shellBVH = shell.bvh()
+
+struct EvalResult {
+    var bakeSeconds: Double
+    var meanErr: Double
+    var p95Err: Double
+    var badFrac: Double     // fraction of samples with L2 error > 0.1
+    var coverage: Float
+    var faces: Int
+}
+
+func evaluate(_ backend: UnwrapBackend) throws -> EvalResult {
+    print("=== backend \(backend.rawValue)")
+    let t0 = CFAbsoluteTimeGetCurrent()
+    let baked = try MeshBake.run(
+        shapeFeats: shapeFeats, coords: coords, texBaseColor: baseColor,
+        fineRes: fineRes, remeshRes: 256, targetFaces: 120_000, atlasSize: 1024,
+        backend: backend)
+    let bakeSeconds = CFAbsoluteTimeGetCurrent() - t0
+
+    // --- uniform surface samples (area-weighted faces, fixed seed) ---
+    let v = baked.vertices.asArray(Float.self)
+    let f = baked.faces.asArray(Int32.self)
+    let uvArr = baked.uvs.asArray(Float.self)
+    let F = f.count / 3
+    var cumArea = [Double](repeating: 0, count: F)
+    var acc = 0.0
+    for fi in 0..<F {
+        let i0 = Int(f[fi*3])*3, i1 = Int(f[fi*3+1])*3, i2 = Int(f[fi*3+2])*3
+        let e1 = SIMD3<Float>(v[i1]-v[i0], v[i1+1]-v[i0+1], v[i1+2]-v[i0+2])
+        let e2 = SIMD3<Float>(v[i2]-v[i0], v[i2+1]-v[i0+1], v[i2+2]-v[i0+2])
+        let cr = SIMD3<Float>(e1.y*e2.z - e1.z*e2.y, e1.z*e2.x - e1.x*e2.z, e1.x*e2.y - e1.y*e2.x)
+        acc += Double((cr.x*cr.x + cr.y*cr.y + cr.z*cr.z).squareRoot())
+        cumArea[fi] = acc
+    }
+    var rng = SystemRandomNumberGenerator()  // eval variance is fine; n is large
+    var pts = [Float](); pts.reserveCapacity(sampleCount * 3)
+    var bakedCol = [Float](); bakedCol.reserveCapacity(sampleCount * 3)
+    let S = baked.atlasSize
+    for _ in 0..<sampleCount {
+        let target = Double.random(in: 0..<acc, using: &rng)
+        var lo = 0, hi = F - 1
+        while lo < hi { let mid = (lo + hi) / 2; if cumArea[mid] < target { lo = mid + 1 } else { hi = mid } }
+        let fi = lo
+        var a = Float.random(in: 0...1, using: &rng), b = Float.random(in: 0...1, using: &rng)
+        if a + b > 1 { a = 1 - a; b = 1 - b }
+        let c = 1 - a - b
+        let i0 = Int(f[fi*3]), i1 = Int(f[fi*3+1]), i2 = Int(f[fi*3+2])
+        for k in 0..<3 {
+            pts.append(a * v[i0*3+k] + b * v[i1*3+k] + c * v[i2*3+k])
+        }
+        let u = a * uvArr[i0*2] + b * uvArr[i1*2] + c * uvArr[i2*2]
+        let w = a * uvArr[i0*2+1] + b * uvArr[i1*2+1] + c * uvArr[i2*2+1]
+        // nearest texel, same convention MeshBake.run writes (row = v*S)
+        let x = max(0, min(S - 1, Int(u * Float(S))))
+        let y = max(0, min(S - 1, Int(w * Float(S))))
+        let p = (y * S + x) * 4
+        bakedCol.append(Float(baked.texRGBA[p]) / 255)
+        bakedCol.append(Float(baked.texRGBA[p+1]) / 255)
+        bakedCol.append(Float(baked.texRGBA[p+2]) / 255)
+    }
+
+    // --- ground truth at the same points ---
+    let ptsArr = MLXArray(pts, [sampleCount, 3])
+    let onShell = shellBVH.closestPoints(mesh: shell, queries: ptsArr).points
+    let query = ((onShell + 0.5) * fineRes).reshaped([1, sampleCount, 3])
+    let truth = GridSample3d.sample(feats: baseColor, coords: coords, grid: query, mode: "trilinear")[0]
+    MLX.eval(truth)
+    let truthArr = MLX.clip(truth, min: 0, max: 1).asArray(Float.self)
+
+    var errs = [Double](repeating: 0, count: sampleCount)
+    for i in 0..<sampleCount {
+        let dr = Double(bakedCol[i*3] - truthArr[i*3])
+        let dg = Double(bakedCol[i*3+1] - truthArr[i*3+1])
+        let db = Double(bakedCol[i*3+2] - truthArr[i*3+2])
+        errs[i] = (dr*dr + dg*dg + db*db).squareRoot()
+    }
+    errs.sort()
+    let mean = errs.reduce(0, +) / Double(sampleCount)
+    let p95 = errs[Int(Double(sampleCount) * 0.95)]
+    let bad = Double(errs.lazy.filter { $0 > 0.1 }.count) / Double(sampleCount)
+
+    let glbURL = URL(fileURLWithPath: "\(outDir)/bakeab_\(backend.rawValue).glb")
+    try GLTFExport.writeGLB(to: glbURL, positions: baked.vertices, indices: baked.faces,
+                            normals: baked.normals, uvs: baked.uvs,
+                            baseColorRGBA: (baked.texRGBA, S, S))
+    print("  wrote \(glbURL.lastPathComponent)")
+    return EvalResult(bakeSeconds: bakeSeconds, meanErr: mean, p95Err: p95,
+                      badFrac: bad, coverage: baked.coverage, faces: F)
+}
+
+let rx = try evaluate(.xatlas)
+let rp = try evaluate(.provenance)
+func row(_ n: String, _ r: EvalResult) {
+    print(String(format: "%12@  bake %7.1fs  faces %8d  coverage %.3f  meanErr %.4f  p95 %.4f  bad>0.1 %.3f%%",
+                 n as NSString, r.bakeSeconds, r.faces, r.coverage, r.meanErr, r.p95Err, r.badFrac * 100))
+}
+print("--- RESULTS (color L2 vs voxel ground truth, \(sampleCount) surface samples)")
+row("xatlas", rx)
+row("provenance", rp)
+print("BAKEAB DONE")

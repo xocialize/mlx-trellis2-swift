@@ -249,11 +249,12 @@ extension Mesh {
 
         // A face nearly perpendicular to its chart's projection axis has ~zero
         // UV area; xatlas drops such faces from the chart and leaves their
-        // vertices UNPACKED at raw input coordinates — they normalize to the
-        // atlas origin and rasterize as atlas-crossing streaks (measured: ~180
-        // faces, dominant bake-error source). Give each such face its own
-        // micro-chart projected along its OWN dominant normal axis instead.
-        var extraAxis: [UInt8] = []
+        // vertices UNPACKED at raw input coordinates — atlas-crossing streaks.
+        // Point-collapsing them instead renders single-texel "fleck" triangles
+        // (user-visible). Correct fix: REASSIGN each edge-on face to an
+        // edge-adjacent chart whose axis actually suits it; only faces with no
+        // compatible neighbour get a micro-chart along their own dominant axis.
+        var faceUnitNrm = [SIMD3<Float>](repeating: .zero, count: faceCount)
         for fi in 0..<faceCount {
             let i0 = Int(f[fi*3]), i1 = Int(f[fi*3 + 1]), i2 = Int(f[fi*3 + 2])
             let ax = SIMD3<Float>(v[i0*3], v[i0*3+1], v[i0*3+2])
@@ -261,10 +262,56 @@ extension Mesh {
             let cx = SIMD3<Float>(v[i2*3], v[i2*3+1], v[i2*3+2])
             let nrm = simd_cross(bx - ax, cx - ax)
             let len = simd_length(nrm)
-            guard len > 0 else { continue }
-            let axis = Int(chartAxis[Int(chartIds[fi])])
-            if abs(nrm[axis]) / len < 0.2 {   // within ~11.5° of edge-on
-                let an = simd_abs(nrm)
+            if len > 0 { faceUnitNrm[fi] = nrm / len }
+        }
+        // face adjacency (same edge-pair construction as provenanceChartIds)
+        var nbr = [Int32](repeating: -1, count: faceCount * 3)
+        do {
+            let stride = UInt64(vertexCount) + 1
+            var edgeFace = [UInt64: Int32](minimumCapacity: faceCount * 3 / 2)
+            var nbrCount = [UInt8](repeating: 0, count: faceCount)
+            for fi in 0..<faceCount {
+                for k in 0..<3 {
+                    let a = UInt32(bitPattern: f[fi*3 + k])
+                    let b = UInt32(bitPattern: f[fi*3 + (k + 1) % 3])
+                    let key = UInt64(min(a, b)) * stride + UInt64(max(a, b))
+                    if let other = edgeFace[key], other != Int32(fi) {
+                        if nbrCount[fi] < 3 { nbr[fi*3 + Int(nbrCount[fi])] = other; nbrCount[fi] += 1 }
+                        let o = Int(other)
+                        if nbrCount[o] < 3 { nbr[o*3 + Int(nbrCount[o])] = Int32(fi); nbrCount[o] += 1 }
+                    } else {
+                        edgeFace[key] = Int32(fi)
+                    }
+                }
+            }
+        }
+        var extraAxis: [UInt8] = []
+        for _ in 0..<3 {   // rounds: reassignment can unlock chains
+            var moved = false
+            for fi in 0..<faceCount where chartIds[fi] < Int32(chartCount) {
+                let n = faceUnitNrm[fi]
+                guard simd_length_squared(n) > 0 else { continue }
+                let axis = Int(chartAxis[Int(chartIds[fi])])
+                guard abs(n[axis]) < 0.2 else { continue }   // edge-on for own chart
+                var bestChart: Int32 = -1
+                var bestCos: Float = 0.3   // require a genuinely better fit
+                for k in 0..<3 {
+                    let nb = nbr[fi*3 + k]
+                    guard nb >= 0 else { continue }
+                    let c = chartIds[Int(nb)]
+                    guard c != chartIds[fi], c < Int32(chartCount) else { continue }
+                    let cCos = abs(n[Int(chartAxis[Int(c)])])
+                    if cCos > bestCos { bestCos = cCos; bestChart = c }
+                }
+                if bestChart >= 0 { chartIds[fi] = bestChart; moved = true }
+            }
+            if !moved { break }
+        }
+        for fi in 0..<faceCount where chartIds[fi] < Int32(chartCount) {
+            let n = faceUnitNrm[fi]
+            guard simd_length_squared(n) > 0 else { continue }
+            if abs(n[Int(chartAxis[Int(chartIds[fi])])] ) < 0.2 {
+                let an = simd_abs(n)
                 let own: UInt8 = an.x >= an.y && an.x >= an.z ? 0 : (an.y >= an.z ? 1 : 2)
                 chartIds[fi] = Int32(chartCount + extraAxis.count)
                 extraAxis.append(own)

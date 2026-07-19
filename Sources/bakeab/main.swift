@@ -9,6 +9,7 @@
 //
 //   swift run -c release bakeab [octant] [samples N]
 import Foundation
+import simd
 import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
@@ -165,6 +166,24 @@ func evaluate(_ backend: UnwrapBackend) throws -> EvalResult {
         if (us.max()! - us.min()!) > 0.1 || (vs.max()! - vs.min()!) > 0.1 { spanning += 1 }
     }
     print("    atlas-spanning faces (UV extent > 0.1): \(spanning)")
+    // fleck proxy: faces with real 3D area but sub-texel UV footprint render
+    // as solid single-texel triangles (user-visible dark shards)
+    var fleckCount = 0
+    var fleckArea = 0.0, total3DArea = 0.0
+    for fi in 0..<F {
+        let i0 = Int(f[fi*3]), i1 = Int(f[fi*3+1]), i2 = Int(f[fi*3+2])
+        let e1 = SIMD3<Float>(v[i1*3]-v[i0*3], v[i1*3+1]-v[i0*3+1], v[i1*3+2]-v[i0*3+2])
+        let e2 = SIMD3<Float>(v[i2*3]-v[i0*3], v[i2*3+1]-v[i0*3+1], v[i2*3+2]-v[i0*3+2])
+        let cr = SIMD3<Float>(e1.y*e2.z - e1.z*e2.y, e1.z*e2.x - e1.x*e2.z, e1.x*e2.y - e1.y*e2.x)
+        let a3d = Double(simd_length(cr)) / 2
+        total3DArea += a3d
+        let us = [uvArr[i0*2], uvArr[i1*2], uvArr[i2*2]]
+        let vs = [uvArr[i0*2+1], uvArr[i1*2+1], uvArr[i2*2+1]]
+        let ext = max(us.max()! - us.min()!, vs.max()! - vs.min()!) * Float(S)
+        if ext < 1.0 && a3d > 0 { fleckCount += 1; fleckArea += a3d }
+    }
+    print(String(format: "    sub-texel faces w/ real 3D area (flecks): %d, %.4f%% of surface",
+                 fleckCount, fleckArea / max(total3DArea, 1e-12) * 100))
     for (b, name) in [(0, "<2tx"), (1, "2-8tx"), (2, ">8tx")] {
         let share = Double(bucketAll[b]) / Double(sampleCount) * 100
         let bad = bucketAll[b] > 0 ? Double(bucketBad[b]) / Double(bucketAll[b]) * 100 : 0

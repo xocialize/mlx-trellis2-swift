@@ -372,9 +372,25 @@ extension Mesh {
             minU[c] = min(minU[c], splitUVs[i*2]);     maxU[c] = max(maxU[c], splitUVs[i*2])
             minV[c] = min(minV[c], splitUVs[i*2 + 1]); maxV[c] = max(maxV[c], splitUVs[i*2 + 1])
         }
+        // Minimum chart footprint: charts far smaller than the mean pack to
+        // sub-texel islands that die in the renderer's mip chain. Scale tiny
+        // charts up to a floor tied to the total UV area (≈2 texels at a
+        // 1024-class atlas); they are small in 3D, so the extra texels are
+        // effectively free.
+        var totalUVArea: Float = 0
+        for c in 0..<chartCount where maxU[c] >= minU[c] {
+            totalUVArea += (maxU[c] - minU[c]) * (maxV[c] - minV[c])
+        }
+        let minExtent = totalUVArea.squareRoot() / 512
+        var chartScale = [Float](repeating: 1, count: chartCount)
+        for c in 0..<chartCount where maxU[c] >= minU[c] {
+            let ext = max(maxU[c] - minU[c], maxV[c] - minV[c])
+            if ext > 0, ext < minExtent { chartScale[c] = minExtent / ext }
+        }
+
         var pitch: Float = 0
         for c in 0..<chartCount where maxU[c] >= minU[c] {
-            pitch = max(pitch, max(maxU[c] - minU[c], maxV[c] - minV[c]))
+            pitch = max(pitch, max(maxU[c] - minU[c], maxV[c] - minV[c]) * chartScale[c])
         }
         pitch *= 1.05
         if pitch <= 0 { pitch = 1 }
@@ -383,8 +399,8 @@ extension Mesh {
             let c = Int(splitChart[i])
             let cellU = Float(c % cols) * pitch
             let cellV = Float(c / cols) * pitch
-            splitUVs[i*2]     += cellU - minU[c]
-            splitUVs[i*2 + 1] += cellV - minV[c]
+            splitUVs[i*2]     = (splitUVs[i*2]     - minU[c]) * chartScale[c] + cellU
+            splitUVs[i*2 + 1] = (splitUVs[i*2 + 1] - minV[c]) * chartScale[c] + cellV
         }
 
         let splitMesh = Mesh(

@@ -135,7 +135,12 @@ public enum MeshBake {
             filled[p] = true
         }
         let coverage = Float(filled.lazy.filter { $0 }.count) / Float(atlasSize * atlasSize)
-        dilateInpaint(&rgb, &filled, atlasSize, iterations: 12)
+        // Inpaint to COMPLETION, not a fixed ring count: any unfilled texel is
+        // black, and the renderer's mip chain averages small charts against it,
+        // producing dark shard artifacts at distance (user-visible; worst for
+        // the provenance backend's lower packing utilization). The dilation
+        // loop exits as soon as nothing new fills, so completion is cheap.
+        dilateInpaint(&rgb, &filled, atlasSize, iterations: atlasSize)
 
         var rgba = [UInt8](repeating: 0, count: atlasSize * atlasSize * 4)
         for p in 0..<(atlasSize * atlasSize) {

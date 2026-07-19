@@ -27,6 +27,28 @@ public struct ProvenanceUnwrapResult {
 }
 
 extension Mesh {
+    /// Transfer per-face tags from `source` to this mesh via nearest source
+    /// face per face centroid. Used to carry provenance axis tags across
+    /// `simplify` (which has no face mapping). Boundary wobble is tolerated
+    /// downstream — the provenance pipeline smooths and CCs tags anyway.
+    public func transferFaceTags(
+        from source: Mesh, tags: [UInt8], sourceBVH: BVH? = nil
+    ) -> [UInt8] {
+        precondition(tags.count == source.faceCount, "tags must be per source face")
+        let f = faces.asArray(Int32.self)
+        let v = vertices.asArray(Float.self)
+        var centroids = [Float](repeating: 0, count: faceCount * 3)
+        for fi in 0..<faceCount {
+            let i0 = Int(f[fi*3])*3, i1 = Int(f[fi*3+1])*3, i2 = Int(f[fi*3+2])*3
+            for k in 0..<3 {
+                centroids[fi*3 + k] = (v[i0+k] + v[i1+k] + v[i2+k]) / 3
+            }
+        }
+        let bvh = sourceBVH ?? source.bvh()
+        let cp = bvh.closestPoints(mesh: source, queries: MLXArray(centroids, [faceCount, 3]))
+        return cp.faceIndices.asArray(Int32.self).map { tags[Int($0)] }
+    }
+
     /// Per-face chart ids from provenance axis tags, with tag-field smoothing
     /// (kills single-face noise islands at the source) and small-chart
     /// absorption into their strongest edge-adjacent neighbour.
@@ -39,16 +61,21 @@ extension Mesh {
     ///     (distortion from off-axis projection is bounded and localized).
     /// - Returns: per-face chart id, chart count, and each chart's projection axis.
     public func provenanceChartIds(
-        faceAxis: [UInt8],
+        faceAxis: [UInt8]?,
         smoothingIterations: Int = 2,
         minChartFaces: Int = 24
     ) -> (chartIds: [Int32], chartCount: Int, chartAxis: [UInt8]) {
-        precondition(faceAxis.count == faceCount, "faceAxis must be per-face")
+        precondition(faceAxis == nil || faceAxis!.count == faceCount, "faceAxis must be per-face")
         let f = faces.asArray(Int32.self)
         let v = vertices.asArray(Float.self)
 
         // 6-way tag: axis*2 + (normal[axis] < 0 ? 1 : 0). Sign is derived from
         // the *final* winding (post-unify), so it reflects rendered facing.
+        // With exact grid tags (raw DC mesh), the axis comes from provenance;
+        // without (e.g. after simplify, where faces are large arbitrary
+        // triangles), the face normal's dominant axis IS the best tag — it
+        // guarantees cos ≥ 1/√3 projection density per face, which transferred
+        // grid tags cannot (a mis-tagged big face projects near edge-on).
         var tag = [UInt8](repeating: 0, count: faceCount)
         for fi in 0..<faceCount {
             let i0 = Int(f[fi*3]), i1 = Int(f[fi*3 + 1]), i2 = Int(f[fi*3 + 2])
@@ -56,7 +83,13 @@ extension Mesh {
             let bx = SIMD3<Float>(v[i1*3], v[i1*3+1], v[i1*3+2])
             let cx = SIMD3<Float>(v[i2*3], v[i2*3+1], v[i2*3+2])
             let nrm = simd_cross(bx - ax, cx - ax)
-            let a = Int(faceAxis[fi])
+            let a: Int
+            if let fa = faceAxis {
+                a = Int(fa[fi])
+            } else {
+                let an = simd_abs(nrm)
+                a = an.x >= an.y && an.x >= an.z ? 0 : (an.y >= an.z ? 1 : 2)
+            }
             tag[fi] = UInt8(a * 2 + (nrm[a] < 0 ? 1 : 0))
         }
 
@@ -202,17 +235,45 @@ extension Mesh {
     /// Full provenance unwrap: charts from tags, axis-plane UVs, seam split,
     /// then pack-only via `uvUnwrap(existingUVs:)`.
     public func provenanceUnwrap(
-        faceAxis: [UInt8],
+        faceAxis: [UInt8]?,
         smoothingIterations: Int = 2,
         minChartFaces: Int = 24,
         packOptions: PackOptions = PackOptions()
     ) throws -> ProvenanceUnwrapResult {
-        let (chartIds, chartCount, chartAxis) = provenanceChartIds(
+        var (chartIds, chartCount, chartAxis) = provenanceChartIds(
             faceAxis: faceAxis,
             smoothingIterations: smoothingIterations,
             minChartFaces: minChartFaces)
         let f = faces.asArray(Int32.self)
         let v = vertices.asArray(Float.self)
+
+        // A face nearly perpendicular to its chart's projection axis has ~zero
+        // UV area; xatlas drops such faces from the chart and leaves their
+        // vertices UNPACKED at raw input coordinates — they normalize to the
+        // atlas origin and rasterize as atlas-crossing streaks (measured: ~180
+        // faces, dominant bake-error source). Give each such face its own
+        // micro-chart projected along its OWN dominant normal axis instead.
+        var extraAxis: [UInt8] = []
+        for fi in 0..<faceCount {
+            let i0 = Int(f[fi*3]), i1 = Int(f[fi*3 + 1]), i2 = Int(f[fi*3 + 2])
+            let ax = SIMD3<Float>(v[i0*3], v[i0*3+1], v[i0*3+2])
+            let bx = SIMD3<Float>(v[i1*3], v[i1*3+1], v[i1*3+2])
+            let cx = SIMD3<Float>(v[i2*3], v[i2*3+1], v[i2*3+2])
+            let nrm = simd_cross(bx - ax, cx - ax)
+            let len = simd_length(nrm)
+            guard len > 0 else { continue }
+            let axis = Int(chartAxis[Int(chartIds[fi])])
+            if abs(nrm[axis]) / len < 0.2 {   // within ~11.5° of edge-on
+                let an = simd_abs(nrm)
+                let own: UInt8 = an.x >= an.y && an.x >= an.z ? 0 : (an.y >= an.z ? 1 : 2)
+                chartIds[fi] = Int32(chartCount + extraAxis.count)
+                extraAxis.append(own)
+            }
+        }
+        if !extraAxis.isEmpty {
+            chartAxis.append(contentsOf: extraAxis)
+            chartCount += extraAxis.count
+        }
 
         // Seam split: one output vertex per (original vertex, chart) pair.
         // UV = world-space projection onto the chart's axis plane; world scale
@@ -225,6 +286,7 @@ extension Mesh {
         var splitFaces = [Int32](repeating: 0, count: faceCount * 3)
         splitVerts.reserveCapacity(vertexCount * 3 * 5 / 4)
 
+        _ = faceAxis   // axis decisions are chart-level from here on
         for fi in 0..<faceCount {
             let chart = chartIds[fi]
             let axis = Int(chartAxis[Int(chart)])   // chart-level axis (post-merge)
@@ -282,10 +344,46 @@ extension Mesh {
             vertices: MLXArray(splitVerts, [splitMap.count, 3]),
             faces: MLXArray(splitFaces, [faceCount, 3])
         )
-        let unwrap = try splitMesh.uvUnwrap(
+        var unwrap = try splitMesh.uvUnwrap(
             existingUVs: MLXArray(splitUVs, [splitMap.count, 2]),
+            faceMaterials: chartIds.map { UInt32(bitPattern: $0) },
             packOptions: packOptions
         )
+
+        // Safety net: any face still spanning the atlas (xatlas dropped it from
+        // its chart and left vertices unpacked — degenerate slivers) gets its
+        // UVs collapsed to a point: zero extent, never rasterized, no streak.
+        // The face's vertices are DUPLICATED first — collapsing shared vertices
+        // in place would re-stretch healthy neighbouring faces.
+        var outF = unwrap.mesh.faces.asArray(Int32.self)
+        var outUV = unwrap.uvs.asArray(Float.self)
+        var outV = unwrap.mesh.vertices.asArray(Float.self)
+        var outMap = unwrap.vertexMap.asArray(Int32.self)
+        var collapsed = false
+        for fi in 0..<(outF.count / 3) {
+            let i0 = Int(outF[fi*3]), i1 = Int(outF[fi*3+1]), i2 = Int(outF[fi*3+2])
+            let us = [outUV[i0*2], outUV[i1*2], outUV[i2*2]]
+            let ws = [outUV[i0*2+1], outUV[i1*2+1], outUV[i2*2+1]]
+            if us.max()! - us.min()! > 0.05 || ws.max()! - ws.min()! > 0.05 {
+                for (slot, src) in [(1, i1), (2, i2)] {
+                    let newIdx = Int32(outMap.count)
+                    outV.append(outV[src*3]); outV.append(outV[src*3+1]); outV.append(outV[src*3+2])
+                    outUV.append(outUV[i0*2]); outUV.append(outUV[i0*2+1])
+                    outMap.append(outMap[src])
+                    outF[fi*3 + slot] = newIdx
+                }
+                collapsed = true
+            }
+        }
+        if collapsed {
+            let V = outMap.count
+            unwrap = UVUnwrapResult(
+                mesh: Mesh(vertices: MLXArray(outV, [V, 3]),
+                           faces: MLXArray(outF, [outF.count / 3, 3])),
+                uvs: MLXArray(outUV, [V, 2]),
+                vertexMap: MLXArray(outMap, [V]), atlasWidth: unwrap.atlasWidth,
+                atlasHeight: unwrap.atlasHeight, charts: unwrap.charts)
+        }
         return ProvenanceUnwrapResult(
             unwrap: unwrap, splitVertexMap: splitMap, chartCount: chartCount)
     }

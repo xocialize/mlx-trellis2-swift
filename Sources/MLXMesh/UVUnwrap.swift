@@ -77,8 +77,13 @@ extension Mesh {
     /// (provenance/GPU) parameterisations; see UV-UNWRAP-METAL-PLAN.md Phase 1.
     ///
     /// - Parameter existingUVs: `[V, 2]` float32, aligned with `vertices`.
+    /// - Parameter faceMaterials: optional `[F]` per-face material ids; xatlas
+    ///   never merges charts across materials, which also prevents its UV weld
+    ///   (epsilon scales with the UV bbox) from fusing distinct charts whose
+    ///   coordinates land close together.
     public func uvUnwrap(
         existingUVs: MLXArray,
+        faceMaterials: [UInt32]? = nil,
         packOptions: PackOptions = PackOptions()
     ) throws -> UVUnwrapResult {
         precondition(vertexCount > 0 && faceCount > 0, "uvUnwrap requires a non-empty mesh")
@@ -101,7 +106,8 @@ extension Mesh {
         }
 
         let atlas = Atlas()
-        try atlas.addUvMesh(UvMeshInput(uvs: uvs, indices: indices))
+        try atlas.addUvMesh(UvMeshInput(
+            uvs: uvs, indices: indices, faceMaterial: faceMaterials ?? []))
         atlas.computeCharts()
         atlas.packCharts(options: packOptions)
 

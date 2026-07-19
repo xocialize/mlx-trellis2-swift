@@ -1,6 +1,7 @@
 import Foundation
 import MLX
 import MLXMesh
+import Xatlas
 
 /// End-to-end mesh+texture stage: shape/tex decoder voxel outputs -> clean textured
 /// mesh. Chains the verified ops: FlexiDualGrid head -> DualGridMesh -> mlx-swift-mesh
@@ -80,7 +81,18 @@ public enum MeshBake {
             let (tagged, faceAxis) = mesh.remeshDualContouringTagged(resolution: remeshRes)
             MLX.eval(tagged.vertices, tagged.faces)
             log("  remeshed(tagged): \(tagged.vertexCount) verts, \(tagged.faceCount) faces")
-            let prov = try tagged.provenanceUnwrap(faceAxis: faceAxis)
+            var provMesh = tagged
+            var provAxis: [UInt8]? = faceAxis
+            if tagged.faceCount > targetFaces {
+                provMesh = tagged.simplify(targetNumFaces: targetFaces)
+                MLX.eval(provMesh.vertices, provMesh.faces)
+                // nil tags → axis from each simplified face's own normal;
+                // measured better than BVH tag transfer (mis-tagged large
+                // faces project near edge-on and starve of texels)
+                provAxis = nil
+                log("  simplified: \(provMesh.vertexCount) verts, \(provMesh.faceCount) faces")
+            }
+            let prov = try provMesh.provenanceUnwrap(faceAxis: provAxis)
             finalMesh = prov.unwrap.mesh
             finalUVs = prov.unwrap.uvs
             chartCount = prov.unwrap.charts.count

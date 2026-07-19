@@ -9,9 +9,28 @@
 //
 //   swift run -c release bakeab [octant] [samples N]
 import Foundation
+import CoreGraphics
+import ImageIO
+import UniformTypeIdentifiers
 import MLX
 import MLXMesh
 import TRELLIS2
+
+func writePNG(_ pixels: [UInt8], _ width: Int, _ height: Int, to path: String) {
+    let cs = CGColorSpace(name: CGColorSpace.sRGB)!
+    var px = pixels
+    let ctx = px.withUnsafeMutableBytes { buf in
+        CGContext(data: buf.baseAddress, width: width, height: height,
+                  bitsPerComponent: 8, bytesPerRow: width * 4, space: cs,
+                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+    }
+    guard let img = ctx?.makeImage(),
+          let dest = CGImageDestinationCreateWithURL(
+            URL(fileURLWithPath: path) as CFURL, UTType.png.identifier as CFString, 1, nil)
+    else { return }
+    CGImageDestinationAddImage(dest, img, nil)
+    CGImageDestinationFinalize(dest)
+}
 
 let goldens = "/Volumes/Satechi/TrellisRedux/trellis2-port/goldens"
 func golden(_ n: String) throws -> MLXArray { try loadArray(url: URL(fileURLWithPath: "\(goldens)/\(n).npy")) }
@@ -82,12 +101,14 @@ func evaluate(_ backend: UnwrapBackend) throws -> EvalResult {
     var rng = SystemRandomNumberGenerator()  // eval variance is fine; n is large
     var pts = [Float](); pts.reserveCapacity(sampleCount * 3)
     var bakedCol = [Float](); bakedCol.reserveCapacity(sampleCount * 3)
+    var sampleFace = [Int](); sampleFace.reserveCapacity(sampleCount)
     let S = baked.atlasSize
     for _ in 0..<sampleCount {
         let target = Double.random(in: 0..<acc, using: &rng)
         var lo = 0, hi = F - 1
         while lo < hi { let mid = (lo + hi) / 2; if cumArea[mid] < target { lo = mid + 1 } else { hi = mid } }
         let fi = lo
+        sampleFace.append(fi)
         var a = Float.random(in: 0...1, using: &rng), b = Float.random(in: 0...1, using: &rng)
         if a + b > 1 { a = 1 - a; b = 1 - b }
         let c = 1 - a - b
@@ -121,11 +142,40 @@ func evaluate(_ backend: UnwrapBackend) throws -> EvalResult {
         let db = Double(bakedCol[i*3+2] - truthArr[i*3+2])
         errs[i] = (dr*dr + dg*dg + db*db).squareRoot()
     }
+
+    // Diagnosis: bucket bad-rate by the sampled face's UV footprint in texels
+    // (separates texel starvation from seam/fold/other causes).
+    var bucketBad = [0, 0, 0], bucketAll = [0, 0, 0]
+    for i in 0..<sampleCount {
+        let fi = sampleFace[i]
+        let i0 = Int(f[fi*3]), i1 = Int(f[fi*3+1]), i2 = Int(f[fi*3+2])
+        let e1u = uvArr[i1*2]-uvArr[i0*2], e1v = uvArr[i1*2+1]-uvArr[i0*2+1]
+        let e2u = uvArr[i2*2]-uvArr[i0*2], e2v = uvArr[i2*2+1]-uvArr[i0*2+1]
+        let texArea = 0.5 * abs(Double(e1u*e2v - e1v*e2u)) * Double(S) * Double(S)
+        let b = texArea < 2 ? 0 : (texArea < 8 ? 1 : 2)
+        bucketAll[b] += 1
+        if errs[i] > 0.1 { bucketBad[b] += 1 }
+    }
+    // atlas-spanning faces: UV bbox extent > 10% of atlas — should be ~zero
+    var spanning = 0
+    for fi in 0..<F {
+        let i0 = Int(f[fi*3]), i1 = Int(f[fi*3+1]), i2 = Int(f[fi*3+2])
+        let us = [uvArr[i0*2], uvArr[i1*2], uvArr[i2*2]]
+        let vs = [uvArr[i0*2+1], uvArr[i1*2+1], uvArr[i2*2+1]]
+        if (us.max()! - us.min()!) > 0.1 || (vs.max()! - vs.min()!) > 0.1 { spanning += 1 }
+    }
+    print("    atlas-spanning faces (UV extent > 0.1): \(spanning)")
+    for (b, name) in [(0, "<2tx"), (1, "2-8tx"), (2, ">8tx")] {
+        let share = Double(bucketAll[b]) / Double(sampleCount) * 100
+        let bad = bucketAll[b] > 0 ? Double(bucketBad[b]) / Double(bucketAll[b]) * 100 : 0
+        print(String(format: "    faceArea %@: %5.1f%% of samples, bad %5.1f%%", name as NSString, share, bad))
+    }
     errs.sort()
     let mean = errs.reduce(0, +) / Double(sampleCount)
     let p95 = errs[Int(Double(sampleCount) * 0.95)]
     let bad = Double(errs.lazy.filter { $0 > 0.1 }.count) / Double(sampleCount)
 
+    writePNG(baked.texRGBA, S, S, to: "\(outDir)/bakeab_\(backend.rawValue)_atlas.png")
     let glbURL = URL(fileURLWithPath: "\(outDir)/bakeab_\(backend.rawValue).glb")
     try GLTFExport.writeGLB(to: glbURL, positions: baked.vertices, indices: baked.faces,
                             normals: baked.normals, uvs: baked.uvs,

@@ -125,6 +125,7 @@ public final class Trellis2Pipeline {
                          cond1024: MLXArray, negCond1024: MLXArray, ssNoise: MLXArray, ssPhases: MLXArray,
                          shapeMean: MLXArray, shapeStd: MLXArray, texMean: MLXArray, texStd: MLXArray,
                          texture: Bool = true, targetFaces: Int = 120_000, yUp: Bool = false,
+                         unwrapBackend: UnwrapBackend = .xatlas,
                          remeshRes: Int? = nil, seed: UInt64 = 0,
                          log: (String) -> Void = { print($0) }) throws -> (mesh: BakedMesh, hrResolution: Int) {
         // Bound flow residency to this tier's working set.
@@ -222,7 +223,8 @@ public final class Trellis2Pipeline {
         let remesh = remeshRes ?? (hrResolution >= 1536 ? 384 : 256)
         var baked = try MeshBake.run(shapeFeats: shapeOut.feats, coords: shapeOut.coords, texBaseColor: baseColor,
                                      fineRes: Float(hrResolution), remeshRes: remesh,
-                                     targetFaces: targetFaces, atlasSize: 1024, log: log)
+                                     targetFaces: targetFaces, atlasSize: 1024,
+                                     backend: unwrapBackend, log: log)
 
         // 7) optional Y-up reorientation (x,y,z)→(x,z,−y): a proper rotation, winding preserved.
         if yUp {

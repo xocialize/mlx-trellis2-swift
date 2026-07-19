@@ -36,6 +36,9 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
     /// Decimate the extracted mesh to this face target before GLB encode (matches the HF `to_glb`
     /// tail). nil = MeshBake's default (~120k).
     public var decimateFaces: Int?
+    /// UV unwrap backend for the bake: "xatlas" (default) or "provenance"
+    /// (UV-UNWRAP-METAL-PLAN.md — ~8x faster bake, near-parity quality).
+    public var unwrapBackend: String?
 
     /// Emit the GLB Y-up (glTF/VRM convention) instead of TRELLIS's native Z-up: bakes the
     /// (x,y,z)→(x,z,−y) rotation into the vertices/normals before encode. REQUIRED for the
@@ -57,7 +60,7 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
     /// Explicit Codable surface: everything except the `matting` closure (which decodes to nil).
     enum CodingKeys: String, CodingKey {
         case quant, defaultMode, modelsRootDirectory, weightsRootOverride
-        case steps, seed, texture, decimateFaces, yUpOutput
+        case steps, seed, texture, decimateFaces, yUpOutput, unwrapBackend
     }
 
     public init(quant: Quant = .bf16,
@@ -68,6 +71,7 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
                 seed: UInt64 = 0,
                 texture: Bool = true,
                 decimateFaces: Int? = 300_000,
+                unwrapBackend: String? = nil,
                 yUpOutput: Bool = false,
                 matting: Trellis2Matting? = nil) {
         self.quant = quant
@@ -78,6 +82,7 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
         self.seed = seed
         self.texture = texture
         self.decimateFaces = decimateFaces
+        self.unwrapBackend = unwrapBackend
         self.yUpOutput = yUpOutput
         self.matting = matting
     }
@@ -382,7 +387,9 @@ public final class Trellis2Package: ModelPackage {
             shapeMean: MLXArray(shapeMean), shapeStd: MLXArray(shapeStd),
             texMean: MLXArray(texMean), texStd: MLXArray(texStd),
             texture: configuration.texture, targetFaces: configuration.decimateFaces ?? 120_000,
-            yUp: configuration.yUpOutput, seed: configuration.seed, log: { _ in })
+            yUp: configuration.yUpOutput,
+            unwrapBackend: configuration.unwrapBackend == "provenance" ? .provenance : .xatlas,
+            seed: configuration.seed, log: { _ in })
         try Task.checkCancellation()
 
         let glb = try GLTFExport.glbData(

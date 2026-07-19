@@ -60,7 +60,9 @@ do {
     let weightsOverride = env["WEIGHTS_DIR"].map { URL(fileURLWithPath: $0) }
     if let w = weightsOverride { print("[engine] weights override: \(w.path)") }
     let pkgID = try await engine.register(Trellis2Package.registration,
-                                          configuration: Trellis2Configuration(weightsRootOverride: weightsOverride))
+                                          configuration: Trellis2Configuration(
+                                              weightsRootOverride: weightsOverride,
+                                              unwrapBackend: env["UNWRAP_BACKEND"]))
     print("[engine] registered packageID=\(pkgID) | backers(imageTo3D)=\(await engine.packages(for: .imageTo3D))")
 
     let tLoad = Date()

@@ -88,6 +88,61 @@ extension Mesh {
         // pairwise distance ≥ 2, so they touch disjoint face sets and each is
         // exactly the serial link-condition-checked case, which preserves
         // manifoldness. Rejected edges stay for later iterations.
+        // Vertex → incident faces (flat CSR), for the normal-flip guard.
+        var vfOff = [Int32](repeating: 0, count: vertexCount + 1)
+        for fi in 0..<faceCount {
+            for k in 0..<3 { vfOff[Int(facesArr[fi*3 + k]) + 1] += 1 }
+        }
+        for v in 0..<vertexCount { vfOff[v + 1] += vfOff[v] }
+        var vfFaces = [Int32](repeating: 0, count: Int(vfOff[vertexCount]))
+        var vfFill = vfOff
+        for fi in 0..<faceCount {
+            for k in 0..<3 {
+                let v = Int(facesArr[fi*3 + k])
+                vfFaces[Int(vfFill[v])] = Int32(fi)
+                vfFill[v] += 1
+            }
+        }
+
+        // Normal-flip guard: simulate the collapse (a→v*, b→v*) and reject it
+        // if any surviving incident face's normal reverses. Without this,
+        // collapses on thin double-shell geometry (o-voxel meshes) pull walls
+        // through each other — the measured "shard" defect. This is the
+        // standard QEM guard; CuMesh's simplify survives the same inputs.
+        func normalFlips(_ a: Int, _ b: Int, _ tx: Float, _ ty: Float, _ tz: Float) -> Bool {
+            for endpoint in [a, b] {
+                for i in Int(vfOff[endpoint])..<Int(vfOff[endpoint + 1]) {
+                    let fi = Int(vfFaces[i])
+                    let i0 = Int(facesArr[fi*3]), i1 = Int(facesArr[fi*3 + 1]), i2 = Int(facesArr[fi*3 + 2])
+                    // faces containing both endpoints degenerate away — skip
+                    let hasA = i0 == a || i1 == a || i2 == a
+                    let hasB = i0 == b || i1 == b || i2 == b
+                    if hasA && hasB { continue }
+                    func pos(_ v: Int) -> (Float, Float, Float) {
+                        if v == a || v == b { return (tx, ty, tz) }
+                        return (verts[v*3], verts[v*3 + 1], verts[v*3 + 2])
+                    }
+                    let o0 = (verts[i0*3], verts[i0*3 + 1], verts[i0*3 + 2])
+                    let o1 = (verts[i1*3], verts[i1*3 + 1], verts[i1*3 + 2])
+                    let o2 = (verts[i2*3], verts[i2*3 + 1], verts[i2*3 + 2])
+                    let n0 = pos(i0), n1 = pos(i1), n2 = pos(i2)
+                    // unnormalized normals before / after
+                    let oe1 = (o1.0 - o0.0, o1.1 - o0.1, o1.2 - o0.2)
+                    let oe2 = (o2.0 - o0.0, o2.1 - o0.1, o2.2 - o0.2)
+                    let ne1 = (n1.0 - n0.0, n1.1 - n0.1, n1.2 - n0.2)
+                    let ne2 = (n2.0 - n0.0, n2.1 - n0.1, n2.2 - n0.2)
+                    let ox = oe1.1 * oe2.2 - oe1.2 * oe2.1
+                    let oy = oe1.2 * oe2.0 - oe1.0 * oe2.2
+                    let oz = oe1.0 * oe2.1 - oe1.1 * oe2.0
+                    let nx = ne1.1 * ne2.2 - ne1.2 * ne2.1
+                    let ny = ne1.2 * ne2.0 - ne1.0 * ne2.2
+                    let nz = ne1.0 * ne2.1 - ne1.1 * ne2.0
+                    if ox * nx + oy * ny + oz * nz <= 0 { return true }
+                }
+            }
+            return false
+        }
+
         var acceptedEndpoint = [Bool](repeating: false, count: vertexCount)
         var remap = (0..<vertexCount).map { Int32($0) }
         for e in 0..<table.count where selected[e] {
@@ -103,6 +158,7 @@ extension Mesh {
                 }
             }
             if blocked { continue }
+            if normalFlips(a, b, tgt[e*3], tgt[e*3 + 1], tgt[e*3 + 2]) { continue }
             acceptedEndpoint[a] = true
             acceptedEndpoint[b] = true
             verts[a*3 + 0] = tgt[e*3 + 0]

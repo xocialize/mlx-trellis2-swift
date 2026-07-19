@@ -75,6 +75,11 @@ let package = Package(
         .executableTarget(name: "meshbake", dependencies: [
             "TRELLIS2", .product(name: "MLX", package: "mlx-swift"),
         ], swiftSettings: [.interoperabilityMode(.Cxx)]),
+        // Phase-0 UV-unwrap baseline (UV-UNWRAP-METAL-PLAN.md): stage-split xatlas timing
+        // + ModelIO comparison on corpus meshes. Bench-only PLY/GLB readers live here.
+        .executableTarget(name: "unwrapbench", dependencies: [
+            "MLXMesh", .product(name: "MLX", package: "mlx-swift"),
+        ], swiftSettings: [.interoperabilityMode(.Cxx)]),
         .executableTarget(name: "scaletest", dependencies: [
             "TRELLIS2",
             .product(name: "MLX", package: "mlx-swift"),

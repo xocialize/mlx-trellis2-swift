@@ -19,6 +19,8 @@ struct Config {
     var doModelIO = false
     var doGolden = false
     var doProvenance = false
+    var smoothIters = 2
+    var minChartFaces = 24
     var paths: [String] = []
 }
 
@@ -32,6 +34,8 @@ while let a = it.next() {
     case "--modelio": cfg.doModelIO = true
     case "--golden": cfg.doGolden = true
     case "--provenance": cfg.doProvenance = true
+    case "--smooth": cfg.smoothIters = Int(it.next() ?? "2") ?? 2
+    case "--min-chart": cfg.minChartFaces = Int(it.next() ?? "24") ?? 24
     default: cfg.paths.append(a)
     }
 }
@@ -118,7 +122,10 @@ for path in cfg.paths {
             MLX.eval(tagged.vertices, tagged.faces)
             let tTagRemesh = now() - t2
             t2 = now()
-            let prov = try tagged.provenanceUnwrap(faceAxis: faceAxis)
+            let prov = try tagged.provenanceUnwrap(
+                faceAxis: faceAxis,
+                smoothingIterations: cfg.smoothIters,
+                minChartFaces: cfg.minChartFaces)
             let tProv = now() - t2
             let u = prov.unwrap
             record["prov_remesh_s"] = tTagRemesh
@@ -133,7 +140,35 @@ for path in cfg.paths {
             var uvOK = true
             for x in uvArr where !x.isFinite || x < -0.001 || x > 1.001 { uvOK = false; break }
             record["prov_uvs_valid"] = uvOK
-            log("  provenance: remesh+tags \(String(format: "%.2f", tTagRemesh))s | charts+split+pack \(String(format: "%.2f", tProv))s | \(tagged.faceCount) faces -> \(prov.chartCount) charts (\(u.charts.count) packed), atlas \(u.atlasWidth)x\(u.atlasHeight), uvs valid: \(uvOK)")
+            // Foldover metric: per packed chart, area of the minority UV winding.
+            // Mirrored charts are fine (uniform sign); folds are mixed signs.
+            let outF = u.mesh.faces.asArray(Int32.self)
+            var foldedCharts = 0
+            var foldedArea = 0.0, totalArea = 0.0
+            for chart in u.charts {
+                var pos = 0.0, neg = 0.0
+                for fIdx in chart.faceIndices {
+                    let b = Int(fIdx) * 3
+                    let i0 = Int(outF[b]), i1 = Int(outF[b+1]), i2 = Int(outF[b+2])
+                    let e1u = uvArr[i1*2] - uvArr[i0*2], e1v = uvArr[i1*2+1] - uvArr[i0*2+1]
+                    let e2u = uvArr[i2*2] - uvArr[i0*2], e2v = uvArr[i2*2+1] - uvArr[i0*2+1]
+                    let a2 = Double(e1u * e2v - e1v * e2u)
+                    if a2 >= 0 { pos += a2 } else { neg -= a2 }
+                }
+                let minority = min(pos, neg)
+                if pos + neg > 0, minority / (pos + neg) > 0.01 { foldedCharts += 1 }
+                foldedArea += minority
+                totalArea += pos + neg
+            }
+            let foldFrac = totalArea > 0 ? foldedArea / totalArea : 0
+            // uvArr is normalized [0,1): summed |triangle area|*2 / 2 = fraction
+            // of the atlas actually covered = utilization (atlas dims themselves
+            // are cosmetic — production rasterizes at its own atlasSize).
+            let utilization = totalArea / 2
+            record["prov_folded_charts"] = foldedCharts
+            record["prov_fold_area_frac"] = foldFrac
+            record["prov_utilization"] = utilization
+            log("  provenance: remesh+tags \(String(format: "%.2f", tTagRemesh))s | charts+split+pack \(String(format: "%.2f", tProv))s | \(tagged.faceCount) faces -> \(prov.chartCount) charts (\(u.charts.count) packed), util \(String(format: "%.3f", utilization)), uvs valid: \(uvOK), folded: \(foldedCharts) charts / \(String(format: "%.3f", foldFrac * 100))% area")
         }
         if cfg.doGolden {
             // Phase-1 golden round-trip: full unwrap, then feed its own output

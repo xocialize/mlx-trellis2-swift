@@ -27,12 +27,22 @@ public struct ProvenanceUnwrapResult {
 }
 
 extension Mesh {
-    /// Per-face chart ids from provenance axis tags.
+    /// Per-face chart ids from provenance axis tags, with tag-field smoothing
+    /// (kills single-face noise islands at the source) and small-chart
+    /// absorption into their strongest edge-adjacent neighbour.
     ///
-    /// - Parameter faceAxis: `[F]` values in 0...2 from `extractMeshTagged` /
-    ///   `remeshDualContouringTagged`.
-    /// - Returns: `[F]` chart id per face, plus the chart count.
-    public func provenanceChartIds(faceAxis: [UInt8]) -> (chartIds: [Int32], chartCount: Int) {
+    /// - Parameters:
+    ///   - faceAxis: `[F]` values in 0...2 from `extractMeshTagged` /
+    ///     `remeshDualContouringTagged`.
+    ///   - smoothingIterations: majority-relabel sweeps over the 6-way tag field.
+    ///   - minChartFaces: charts smaller than this merge into a neighbour
+    ///     (distortion from off-axis projection is bounded and localized).
+    /// - Returns: per-face chart id, chart count, and each chart's projection axis.
+    public func provenanceChartIds(
+        faceAxis: [UInt8],
+        smoothingIterations: Int = 2,
+        minChartFaces: Int = 24
+    ) -> (chartIds: [Int32], chartCount: Int, chartAxis: [UInt8]) {
         precondition(faceAxis.count == faceCount, "faceAxis must be per-face")
         let f = faces.asArray(Int32.self)
         let v = vertices.asArray(Float.self)
@@ -50,7 +60,8 @@ extension Mesh {
             tag[fi] = UInt8(a * 2 + (nrm[a] < 0 ? 1 : 0))
         }
 
-        // Edge → incident faces (same construction as unifyFaceOrientations).
+        // Face adjacency across shared edges (manifold pairs only; extra
+        // non-manifold incidences are ignored for charting).
         let stride = UInt64(vertexCount) + 1
         var edgeFaces = [UInt64: (Int32, Int32)](minimumCapacity: faceCount * 3 / 2)
         for fi in 0..<faceCount {
@@ -60,11 +71,34 @@ extension Mesh {
                 let key = UInt64(min(a, b)) * stride + UInt64(max(a, b))
                 if var pair = edgeFaces[key] {
                     if pair.1 < 0 { pair.1 = Int32(fi); edgeFaces[key] = pair }
-                    // non-manifold extra incidences are ignored for charting
                 } else {
                     edgeFaces[key] = (Int32(fi), -1)
                 }
             }
+        }
+        var nbr = [Int32](repeating: -1, count: faceCount * 3)
+        var nbrCount = [UInt8](repeating: 0, count: faceCount)
+        for (_, pair) in edgeFaces where pair.1 >= 0 {
+            let a = Int(pair.0), b = Int(pair.1)
+            if nbrCount[a] < 3 { nbr[a*3 + Int(nbrCount[a])] = pair.1; nbrCount[a] += 1 }
+            if nbrCount[b] < 3 { nbr[b*3 + Int(nbrCount[b])] = pair.0; nbrCount[b] += 1 }
+        }
+
+        // Tag smoothing: relabel a face when ≥2 of its neighbours agree on a
+        // different tag. Removes staircase noise and single-face islands.
+        for _ in 0..<smoothingIterations {
+            var next = tag
+            for fi in 0..<faceCount {
+                var votes: [UInt8: Int] = [:]
+                for k in 0..<Int(nbrCount[fi]) {
+                    votes[tag[Int(nbr[fi*3 + k])], default: 0] += 1
+                }
+                if let (winner, n) = votes.max(by: { $0.value < $1.value }),
+                   n >= 2, winner != tag[fi] {
+                    next[fi] = winner
+                }
+            }
+            tag = next
         }
 
         // Union-find over same-tag edge-adjacent faces.
@@ -77,35 +111,106 @@ extension Mesh {
             while parent[Int(c)] != r { let nxt = parent[Int(c)]; parent[Int(c)] = r; c = nxt }
             return r
         }
+        func union(_ a: Int32, _ b: Int32) {
+            let ra = find(a), rb = find(b)
+            if ra != rb { parent[Int(ra)] = rb }
+        }
         for (_, pair) in edgeFaces where pair.1 >= 0 {
-            if tag[Int(pair.0)] == tag[Int(pair.1)] {
+            if tag[Int(pair.0)] == tag[Int(pair.1)] { union(pair.0, pair.1) }
+        }
+
+        // Face normals (2*area-weighted) once, for the merge cone test.
+        var faceNrm = [SIMD3<Float>](repeating: .zero, count: faceCount)
+        for fi in 0..<faceCount {
+            let i0 = Int(f[fi*3]), i1 = Int(f[fi*3 + 1]), i2 = Int(f[fi*3 + 2])
+            let ax = SIMD3<Float>(v[i0*3], v[i0*3+1], v[i0*3+2])
+            let bx = SIMD3<Float>(v[i1*3], v[i1*3+1], v[i1*3+2])
+            let cx = SIMD3<Float>(v[i2*3], v[i2*3+1], v[i2*3+2])
+            faceNrm[fi] = simd_cross(bx - ax, cx - ax)
+        }
+
+        // Small-chart absorption: iteratively merge charts below the face
+        // threshold into the neighbouring chart sharing the most edges — but
+        // only when the small chart's normal agrees with the neighbour's signed
+        // projection direction (cone test), so merged faces don't back-face the
+        // chart axis and fold over in UV space.
+        for _ in 0..<4 {
+            var rootFaces: [Int32: Int] = [:]
+            var rootNrm: [Int32: SIMD3<Float>] = [:]
+            for fi in 0..<faceCount {
+                let r = find(Int32(fi))
+                rootFaces[r, default: 0] += 1
+                rootNrm[r, default: .zero] += faceNrm[fi]
+            }
+            var link: [Int32: [Int32: Int]] = [:]   // small root -> (nbr root -> shared edges)
+            var anySmall = false
+            for (_, pair) in edgeFaces where pair.1 >= 0 {
                 let ra = find(pair.0), rb = find(pair.1)
-                if ra != rb { parent[Int(ra)] = rb }
+                guard ra != rb else { continue }
+                if rootFaces[ra]! < minChartFaces { link[ra, default: [:]][rb, default: 0] += 1; anySmall = true }
+                if rootFaces[rb]! < minChartFaces { link[rb, default: [:]][ra, default: 0] += 1; anySmall = true }
+            }
+            if !anySmall { break }
+            for (small, nbrs) in link {
+                let sNrm = rootNrm[small] ?? .zero
+                let sLen = simd_length(sNrm)
+                guard sLen > 0 else {
+                    if let best = nbrs.max(by: { $0.value < $1.value }) { union(small, best.key) }
+                    continue
+                }
+                let sDir = sNrm / sLen
+                // strongest-first neighbours; take the first passing the cone test
+                for (nbrRoot, _) in nbrs.sorted(by: { $0.value > $1.value }) {
+                    let tNrm = rootNrm[find(nbrRoot)] ?? .zero
+                    let ta = simd_abs(tNrm)
+                    let axis = ta.x >= ta.y && ta.x >= ta.z ? 0 : (ta.y >= ta.z ? 1 : 2)
+                    let sign: Float = tNrm[axis] < 0 ? -1 : 1
+                    if sDir[axis] * sign > 0.15 {
+                        union(small, nbrRoot)
+                        break
+                    }
+                }
+                // no passing neighbour: chart stays separate (bounded distortion
+                // beats foldover corruption in the bake)
             }
         }
 
+        // Compact ids + per-chart projection axis (area-weighted normal).
         var chartOf = [Int32: Int32]()
         var chartIds = [Int32](repeating: 0, count: faceCount)
+        var axisAccum: [SIMD3<Float>] = []
         for fi in 0..<faceCount {
             let root = find(Int32(fi))
-            if let c = chartOf[root] {
-                chartIds[fi] = c
+            let c: Int32
+            if let existing = chartOf[root] {
+                c = existing
             } else {
-                let c = Int32(chartOf.count)
+                c = Int32(chartOf.count)
                 chartOf[root] = c
-                chartIds[fi] = c
+                axisAccum.append(.zero)
             }
+            chartIds[fi] = c
+            axisAccum[Int(c)] += faceNrm[fi]   // 2*area*normal
         }
-        return (chartIds, chartOf.count)
+        let chartAxis = axisAccum.map { n -> UInt8 in
+            let a = simd_abs(n)
+            return a.x >= a.y && a.x >= a.z ? 0 : (a.y >= a.z ? 1 : 2)
+        }
+        return (chartIds, chartOf.count, chartAxis)
     }
 
     /// Full provenance unwrap: charts from tags, axis-plane UVs, seam split,
     /// then pack-only via `uvUnwrap(existingUVs:)`.
     public func provenanceUnwrap(
         faceAxis: [UInt8],
+        smoothingIterations: Int = 2,
+        minChartFaces: Int = 24,
         packOptions: PackOptions = PackOptions()
     ) throws -> ProvenanceUnwrapResult {
-        let (chartIds, chartCount) = provenanceChartIds(faceAxis: faceAxis)
+        let (chartIds, chartCount, chartAxis) = provenanceChartIds(
+            faceAxis: faceAxis,
+            smoothingIterations: smoothingIterations,
+            minChartFaces: minChartFaces)
         let f = faces.asArray(Int32.self)
         let v = vertices.asArray(Float.self)
 
@@ -116,12 +221,13 @@ extension Mesh {
         var splitVerts: [Float] = []
         var splitUVs: [Float] = []
         var splitMap: [Int32] = []
+        var splitChart: [Int32] = []
         var splitFaces = [Int32](repeating: 0, count: faceCount * 3)
         splitVerts.reserveCapacity(vertexCount * 3 * 5 / 4)
 
         for fi in 0..<faceCount {
             let chart = chartIds[fi]
-            let axis = Int(faceAxis[fi])
+            let axis = Int(chartAxis[Int(chart)])   // chart-level axis (post-merge)
             let uAxis = (axis + 1) % 3
             let vAxis = (axis + 2) % 3
             for k in 0..<3 {
@@ -137,9 +243,39 @@ extension Mesh {
                     splitVerts.append(v[o]); splitVerts.append(v[o+1]); splitVerts.append(v[o+2])
                     splitUVs.append(v[o + uAxis]); splitUVs.append(v[o + vAxis])
                     splitMap.append(orig)
+                    splitChart.append(chart)
                 }
                 splitFaces[fi*3 + k] = idx
             }
+        }
+
+        // Charts from different world regions can project onto IDENTICAL UV
+        // coordinates (stacked surfaces along the axis). UvMeshDecl carries only
+        // UVs, so xatlas would weld coincident vertices and fuse unrelated charts
+        // into folded islands. Translate every chart into its own disjoint cell
+        // of a coarse grid — xatlas repositions charts during packing anyway.
+        var minU = [Float](repeating: .greatestFiniteMagnitude, count: chartCount)
+        var minV = [Float](repeating: .greatestFiniteMagnitude, count: chartCount)
+        var maxU = [Float](repeating: -.greatestFiniteMagnitude, count: chartCount)
+        var maxV = [Float](repeating: -.greatestFiniteMagnitude, count: chartCount)
+        for i in 0..<splitMap.count {
+            let c = Int(splitChart[i])
+            minU[c] = min(minU[c], splitUVs[i*2]);     maxU[c] = max(maxU[c], splitUVs[i*2])
+            minV[c] = min(minV[c], splitUVs[i*2 + 1]); maxV[c] = max(maxV[c], splitUVs[i*2 + 1])
+        }
+        var pitch: Float = 0
+        for c in 0..<chartCount where maxU[c] >= minU[c] {
+            pitch = max(pitch, max(maxU[c] - minU[c], maxV[c] - minV[c]))
+        }
+        pitch *= 1.05
+        if pitch <= 0 { pitch = 1 }
+        let cols = Int(Float(chartCount).squareRoot().rounded(.up))
+        for i in 0..<splitMap.count {
+            let c = Int(splitChart[i])
+            let cellU = Float(c % cols) * pitch
+            let cellV = Float(c / cols) * pitch
+            splitUVs[i*2]     += cellU - minU[c]
+            splitUVs[i*2 + 1] += cellV - minV[c]
         }
 
         let splitMesh = Mesh(

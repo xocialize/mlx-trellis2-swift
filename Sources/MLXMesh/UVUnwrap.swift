@@ -67,6 +67,48 @@ extension Mesh {
         try atlas.addMesh(MeshInput(positions: positions, indices: indices))
         atlas.generate(chartOptions: chartOptions, packOptions: packOptions)
 
+        return try Self.buildResult(atlas: atlas, vRaw: vRaw)
+    }
+
+    /// Pack-only unwrap: the mesh already carries per-vertex UVs (seams pre-split,
+    /// so faces index UV and position arrays identically). xatlas derives charts
+    /// from UV islands and packs them into an atlas — no chart computation, no
+    /// re-parameterisation. This is the integration seam for precomputed
+    /// (provenance/GPU) parameterisations; see UV-UNWRAP-METAL-PLAN.md Phase 1.
+    ///
+    /// - Parameter existingUVs: `[V, 2]` float32, aligned with `vertices`.
+    public func uvUnwrap(
+        existingUVs: MLXArray,
+        packOptions: PackOptions = PackOptions()
+    ) throws -> UVUnwrapResult {
+        precondition(vertexCount > 0 && faceCount > 0, "uvUnwrap requires a non-empty mesh")
+        precondition(existingUVs.dim(0) == vertexCount && existingUVs.dim(1) == 2,
+                     "existingUVs must be [V, 2] aligned with mesh vertices")
+
+        let vRaw = vertices.asArray(Float.self)
+        let uvRaw = existingUVs.asArray(Float.self)
+        var uvs = [SIMD2<Float>]()
+        uvs.reserveCapacity(vertexCount)
+        for i in 0..<vertexCount {
+            uvs.append(SIMD2<Float>(uvRaw[i*2], uvRaw[i*2 + 1]))
+        }
+        let fRaw = faces.asArray(Int32.self)
+        var indices = [UInt32]()
+        indices.reserveCapacity(faceCount * 3)
+        for v in fRaw {
+            precondition(v >= 0, "face indices must be non-negative")
+            indices.append(UInt32(bitPattern: v))
+        }
+
+        let atlas = Atlas()
+        try atlas.addUvMesh(UvMeshInput(uvs: uvs, indices: indices))
+        atlas.computeCharts()
+        atlas.packCharts(options: packOptions)
+
+        return try Self.buildResult(atlas: atlas, vRaw: vRaw)
+    }
+
+    private static func buildResult(atlas: Atlas, vRaw: [Float]) throws -> UVUnwrapResult {
         guard atlas.meshCount > 0 else {
             throw UVUnwrapError.noMeshesProduced
         }

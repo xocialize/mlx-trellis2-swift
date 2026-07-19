@@ -17,6 +17,7 @@ struct Config {
     var targetFaces = 120_000
     var doRemesh = true
     var doModelIO = false
+    var doGolden = false
     var paths: [String] = []
 }
 
@@ -28,6 +29,7 @@ while let a = it.next() {
     case "--target": cfg.targetFaces = Int(it.next() ?? "120000") ?? 120_000
     case "--no-remesh": cfg.doRemesh = false
     case "--modelio": cfg.doModelIO = true
+    case "--golden": cfg.doGolden = true
     default: cfg.paths.append(a)
     }
 }
@@ -101,6 +103,33 @@ for path in cfg.paths {
         record["utilization"] = atlas.utilization.first.map { Double($0) } ?? -1
         log("  xatlas: add \(String(format: "%.2f", tAdd))s | charts \(String(format: "%.2f", tCharts))s | pack \(String(format: "%.2f", tPack))s | \(atlas.chartCount) charts, \(atlas.width)x\(atlas.height), util \(atlas.utilization.first ?? -1)")
 
+        if cfg.doGolden {
+            // Phase-1 golden round-trip: full unwrap, then feed its own output
+            // through the pack-only seam; atlas metrics must reproduce.
+            t = now()
+            let full = try mesh.uvUnwrap()
+            let tFull = now() - t
+            t = now()
+            let repack = try full.mesh.uvUnwrap(existingUVs: full.uvs)
+            let tRepack = now() - t
+            let chartsMatch = abs(repack.charts.count - full.charts.count) <= max(5, full.charts.count / 200)
+            let utilFull = full.atlasWidth > 0 ? Double(full.atlasWidth) * Double(full.atlasHeight) : 0
+            let utilRepack = repack.atlasWidth > 0 ? Double(repack.atlasWidth) * Double(repack.atlasHeight) : 0
+            let areaRatio = utilFull > 0 ? utilRepack / utilFull : -1
+            record["golden_full_s"] = tFull
+            record["golden_repack_s"] = tRepack
+            record["golden_charts_full"] = full.charts.count
+            record["golden_charts_repack"] = repack.charts.count
+            record["golden_area_ratio"] = areaRatio
+            record["golden_verts_full"] = full.mesh.vertexCount
+            record["golden_verts_repack"] = repack.mesh.vertexCount
+            // Equal-or-better packing passes: smaller repacked atlas (ratio < 1) is a win,
+            // only penalize a repack that needs >10% MORE area or loses vertices/charts.
+            let pass = chartsMatch && areaRatio < 1.1 && areaRatio > 0.5
+                && repack.mesh.vertexCount == full.mesh.vertexCount
+            record["golden_pass"] = pass
+            log("  golden: full \(String(format: "%.2f", tFull))s (\(full.charts.count) charts) -> repack \(String(format: "%.2f", tRepack))s (\(repack.charts.count) charts), area ratio \(String(format: "%.3f", areaRatio)) => \(pass ? "PASS" : "FAIL")")
+        }
         if cfg.doModelIO {
             t = now()
             let alloc = MDLMeshBufferDataAllocator()

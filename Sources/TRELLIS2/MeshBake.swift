@@ -82,7 +82,10 @@ public enum MeshBake {
                 MLX.eval(mesh.vertices, mesh.faces)
                 log("  simplified: \(mesh.vertexCount) verts, \(mesh.faceCount) faces")
             }
-            let uv = try mesh.uvUnwrap()
+            // Parallel partitioned xatlas (measured 64.8–510.6× over the single
+            // instance at identical chart quality within ~5%); falls back to the
+            // direct path automatically for small meshes.
+            let uv = try mesh.uvUnwrapParallel()
             finalMesh = uv.mesh
             finalUVs = uv.uvs
             finalNormals = finalMesh.vertexNormals()

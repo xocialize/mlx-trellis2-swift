@@ -11,6 +11,25 @@ texture, `alphaMode=OPAQUE`).
 Successor to the archived `mlx-trellis2-swift-old` (which hit a geometry-holes wall);
 this is a from-scratch verified re-port built against a PyTorch-on-Apple-Silicon oracle.
 
+## Mesh + bake stage (v0.8.0)
+
+`MeshBake.run` turns decoder voxel output into a textured GLB:
+dual-grid extract → DC remesh → simplify (QEM + normal-flip collapse guard) →
+**UV unwrap** → conservative 5-pass rasterize at 2× supersample → BVH remap +
+trilinear attribute bake (baseColor + metallicRoughness) → inpaint-to-completion
+→ glTF export with both PBR textures.
+
+**Unwrap backends** (`Trellis2Configuration.unwrapBackend`):
+
+| backend | how | production bake (300k faces / 2048 atlas) |
+|---|---|---|
+| `.xatlas` **(default)** — `Mesh.uvUnwrapParallel()` | BSP-partition → concurrent per-bucket xatlas → union repack via the pack-only seam | **24.8s**, meanErr 0.0128, bad 1.62% |
+| `.provenance` | grid/normal tags → CC charts → axis projection → pack-only | 25.4s, meanErr 0.0146, bad 2.19% |
+
+Single-instance xatlas on the same input: 188.9s (and 628.6s for the chart
+stage alone at 300k). See `BENCHMARKS.md` for the harnesses and
+`mlxengine-3d/UV-UNWRAP-METAL-PLAN.md` for the full measurement record.
+
 ## Runs at production scale
 
 The decode → mesh → texture → GLB half runs end-to-end in Swift on the full object:

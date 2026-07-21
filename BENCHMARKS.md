@@ -44,14 +44,20 @@ acceptable as an opt-in fast mode. 8 = REJECTED (white blotch texture artifacts)
 Changing steps changes SS too → different sample; judge end-to-end, not per-stage.
 
 **Corpus scaling + matting (t31 canonical, res1024, 2026-07-20):** e2e scales with
-TOKEN COUNT, not tier — top 10,044 tok/191s · shoes 12,314/358s · skirt 18,709/699s ·
-hair 21,118/836s · dress 23,715/1078s; the O(N²) shapeHR fit from one asset predicts
-the others within ~8%. tex-bf16 validated across all 5 classes (no washout). The
-run-engine path has NO matting hook → stochastic background-slab leak (2/5 classes
-grew a photographic floor plane, plus a color shift on the asset) even on clean
-white-bg sources. Threshold-matte harness inputs (alpha via ~242 white threshold);
-matting also crops-to-bbox, RAISING hr_tokens (+12% on skirt) — don't compare
-matted-vs-unmatted timings.
+TOKEN COUNT, not tier; the O(N²) shapeHR fit from one asset predicts the others
+within ~8%. tex-bf16 validated across all 5 classes (no washout). The run-engine
+path has NO matting hook → background leak on raw white-bg inputs: a photographic
+slab fused to the mesh (shoes, skirt — visually obvious), a color shift on the
+asset (skirt teal-tinted vs true navy), and a SILENT token inflation even on
+visually-clean outputs (dress carried ~1.8k background tokens with no visible
+slab). MATTED baseline (border-connected flood-fill matte — `matte.py` in
+mlxengine-3d/DEV/Trellis2Metrics; global threshold would hole out white-interior
+assets like top/shoes):
+  top 10,928 tok / 222 s · shoes 11,053 / 309 · skirt 20,990 / 763 ·
+  dress 21,932 / 789 · hair 23,247 / 864   (sequential batch, thermally soaked —
+  first-run-of-batch clean numbers are ~15-25 % lower).
+Matting crops-to-bbox (raises tokens on clean assets, lowers them on contaminated
+ones) — never compare matted-vs-unmatted timings.
 
 **SDPA precision (controlled seeded A/B, mode-split visual review, 2026-07-20):**
 tex flow (CFG-free) bf16 = output-identical shape path (bit-equal decoded

@@ -43,6 +43,16 @@ drape, mild trim-continuity erosion (broken dashes), ~15% e2e off cascade —
 acceptable as an opt-in fast mode. 8 = REJECTED (white blotch texture artifacts).
 Changing steps changes SS too → different sample; judge end-to-end, not per-stage.
 
+**Corpus scaling + matting (t31 canonical, res1024, 2026-07-20):** e2e scales with
+TOKEN COUNT, not tier — top 10,044 tok/191s · shoes 12,314/358s · skirt 18,709/699s ·
+hair 21,118/836s · dress 23,715/1078s; the O(N²) shapeHR fit from one asset predicts
+the others within ~8%. tex-bf16 validated across all 5 classes (no washout). The
+run-engine path has NO matting hook → stochastic background-slab leak (2/5 classes
+grew a photographic floor plane, plus a color shift on the asset) even on clean
+white-bg sources. Threshold-matte harness inputs (alpha via ~242 white threshold);
+matting also crops-to-bbox, RAISING hr_tokens (+12% on skirt) — don't compare
+matted-vs-unmatted timings.
+
 **SDPA precision (controlled seeded A/B, mode-split visual review, 2026-07-20):**
 tex flow (CFG-free) bf16 = output-identical shape path (bit-equal decoded
 voxels) + visually indistinguishable texture → engine DEFAULT since this date

@@ -127,6 +127,7 @@ public final class Trellis2Pipeline {
                          texture: Bool = true, targetFaces: Int = 120_000, yUp: Bool = false,
                          unwrapBackend: UnwrapBackend = .xatlas,
                          slatCfgSDPA: SDPAPrecision = .fp32, texSDPA: SDPAPrecision? = nil,
+                         steps: Int = 12,
                          remeshRes: Int? = nil, seed: UInt64 = 0,
                          log: (String) -> Void = { print($0) }) throws -> (mesh: BakedMesh, hrResolution: Int, metrics: Trellis2StageMetrics) {
         // Bound flow residency to this tier's working set.
@@ -151,13 +152,15 @@ public final class Trellis2Pipeline {
         defer { TRELLIS2Config.sdpaCastDtype = savedCast }
         metrics.slatCfgSdpa = slatCfgSDPA.rawValue
         metrics.texSdpa = texSDPA?.rawValue ?? (savedCast == .bfloat16 ? "bf16" : "fp32")
+        metrics.stepsSS = steps
+        metrics.stepsSLat = steps
 
         // 1) sparse structure: SS sampler → z_s → decode → occupancy coords on the 32³
         //    SLat grid (all tiers: upstream ss_res=32 for '512' and both cascades).
         var t = Date()
         TRELLIS2Config.sdpaCastDtype = nil   // SS: fp32 SDPA, unconditionally
         let zs = FlowEulerSampler.sampleSS(model: ssDit, noise: ssNoise, cond: cond, negCond: negCond, phases: ssPhases,
-                                           steps: 12, guidanceStrength: 7.5, guidanceRescale: 0.7,
+                                           steps: steps, guidanceStrength: 7.5, guidanceRescale: 0.7,
                                            guidanceInterval: (0.6, 1.0), rescaleT: 5.0)
         MLX.eval(zs); metrics.ssSampleS = -t.timeIntervalSinceNow   // [1a] SS flow sampler
         t = Date()
@@ -173,7 +176,7 @@ public final class Trellis2Pipeline {
         var shapeSlat = FlowEulerSampler.sampleSLat(
             model: try flow(.shape512), noiseFeats: MLXRandom.normal([coords.dim(0), 32]), coords: coords,
             cond: cond, negCond: negCond,
-            guidanceStrength: 7.5, guidanceRescale: 0.5, guidanceInterval: (0.6, 1.0), rescaleT: 3.0)
+            steps: steps, guidanceStrength: 7.5, guidanceRescale: 0.5, guidanceInterval: (0.6, 1.0), rescaleT: 3.0)
         MLX.eval(shapeSlat)
         metrics.shapeSlatS = -t.timeIntervalSinceNow
         metrics.shapeTokens = coords.dim(0)
@@ -205,7 +208,7 @@ public final class Trellis2Pipeline {
             shapeSlat = FlowEulerSampler.sampleSLat(
                 model: try flow(.shape1024), noiseFeats: MLXRandom.normal([hrCoords.dim(0), 32]), coords: hrCoords,
                 cond: cond1024, negCond: negCond1024,
-                guidanceStrength: 7.5, guidanceRescale: 0.5, guidanceInterval: (0.6, 1.0), rescaleT: 3.0)
+                steps: steps, guidanceStrength: 7.5, guidanceRescale: 0.5, guidanceInterval: (0.6, 1.0), rescaleT: 3.0)
             MLX.eval(shapeSlat)
             metrics.shapeSlatHrS = -t.timeIntervalSinceNow
             log("  [2c] HR shape SLat sampled: \(hrCoords.dim(0)) tokens (\(String(format: "%.1f", metrics.shapeSlatHrS ?? 0))s)")
@@ -235,7 +238,7 @@ public final class Trellis2Pipeline {
                 model: try flow(tier.isCascade ? .tex1024 : .tex512),
                 noiseFeats: MLXRandom.normal([hrCoords.dim(0), 32]), coords: hrCoords,
                 cond: tier.isCascade ? cond1024 : cond, negCond: tier.isCascade ? negCond1024 : negCond,
-                concatCond: shapeSlat, guidanceStrength: 1.0, guidanceRescale: 0.0, guidanceInterval: (0.6, 0.9), rescaleT: 3.0)
+                concatCond: shapeSlat, steps: steps, guidanceStrength: 1.0, guidanceRescale: 0.0, guidanceInterval: (0.6, 0.9), rescaleT: 3.0)
             MLX.eval(texSlat)
             metrics.texSlatS = -t.timeIntervalSinceNow
             log("  [4] tex SLat sampled (\(String(format: "%.1f", metrics.texSlatS ?? 0))s)")

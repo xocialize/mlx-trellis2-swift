@@ -67,9 +67,12 @@ do {
     // TEX_SDPA = the CFG-free tex flow. Unset = fp32 (the pre-knob behavior).
     if let v = env["HR_SDPA"] { print("[engine] slat CFG SDPA: \(v)") }
     if let v = env["TEX_SDPA"] { print("[engine] tex SDPA: \(v)") }
+    let steps = env["STEPS"].flatMap { Int($0) } ?? 12
+    if steps != 12 { print("[engine] sampler steps: \(steps)") }
     let pkgID = try await engine.register(Trellis2Package.registration,
                                           configuration: Trellis2Configuration(
                                               weightsRootOverride: weightsOverride,
+                                              steps: steps,
                                               unwrapBackend: env["UNWRAP_BACKEND"],
                                               metricsPath: metricsPath,
                                               slatCfgAttention: env["HR_SDPA"],

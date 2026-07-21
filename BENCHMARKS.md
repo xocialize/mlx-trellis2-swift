@@ -28,6 +28,21 @@ The HR SLat flows are 72–83 % of cascade e2e; bake is 3.5–5 %.
 - SDPA lanes are recorded per record (`slat_cfg_sdpa`, `tex_sdpa`) — state
   them with any timing, same rule as the xatlas lane.
 
+**TF32 / NAX (M5-class GPUs, macOS ≥26.2, discovered 2026-07-20):** MLX dispatches
+SDPA (and fp32 GEMMs) to the NAX kernel with TF32 operand rounding whenever
+`MLX_ENABLE_TF32` is unset (it DEFAULTS ON) — so "fp32" on gen≥17 hardware is
+TF32 storage-fp32/accumulate-fp32, proven by the voxel gate (`MLX_ENABLE_TF32=0`
+changes coords/voxels). True steel-fp32 is 1.7–1.9× slower on every fp32 matmul
+and produced no visual improvement (different sample; pale + a streak defect on
+the test asset) → keep TF32 on. The quality cliff is HALF-PRECISION STORAGE
+(fp16/bf16 casts), not operand mantissa. `mlx_tf32_env` is recorded per record.
+
+**Sampler steps (wired 2026-07-20 — `Trellis2Configuration.steps` was a dead
+knob before; env `STEPS`):** 12 (default) = reference quality. 10 = same color/
+drape, mild trim-continuity erosion (broken dashes), ~15% e2e off cascade —
+acceptable as an opt-in fast mode. 8 = REJECTED (white blotch texture artifacts).
+Changing steps changes SS too → different sample; judge end-to-end, not per-stage.
+
 **SDPA precision (controlled seeded A/B, mode-split visual review, 2026-07-20):**
 tex flow (CFG-free) bf16 = output-identical shape path (bit-equal decoded
 voxels) + visually indistinguishable texture → engine DEFAULT since this date

@@ -428,6 +428,7 @@ public final class Trellis2Package: ModelPackage {
             unwrapBackend: configuration.unwrapBackend == "provenance" ? .provenance : .xatlas,
             slatCfgSDPA: configuration.slatCfgAttention.flatMap { SDPAPrecision(rawValue: $0) } ?? .fp32,
             texSDPA: configuration.texAttention.flatMap { SDPAPrecision(rawValue: $0) } ?? .bf16,
+            steps: configuration.steps,
             seed: configuration.seed, log: { _ in })
         try Task.checkCancellation()
 
@@ -455,6 +456,10 @@ public final class Trellis2Package: ModelPackage {
             rec["atlas_size"] = baked.atlasSize
             rec["glb_bytes"] = glb.count
             rec["gpu_peak_bytes"] = Int(GPU.peakMemory)
+            // SDPA kernel lane (M5/NAX): MLX_ENABLE_TF32 defaults ON, so "fp32" SDPA runs
+            // the NAX kernel with TF32 (10-bit-mantissa) matmuls on gen>=17 GPUs unless
+            // explicitly disabled. State the lane with every timing.
+            rec["mlx_tf32_env"] = ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"] ?? "unset(=on)"
             rec["e2e_total_s"] = preprocessS + dinoEncode512S + dinoEncode1024S
                 + stageMetrics.generateTotalS + glbExportS
             if let data = try? JSONSerialization.data(withJSONObject: rec, options: [.sortedKeys]),

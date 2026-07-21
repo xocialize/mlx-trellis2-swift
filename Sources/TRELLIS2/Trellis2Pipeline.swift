@@ -128,6 +128,8 @@ public final class Trellis2Pipeline {
                          unwrapBackend: UnwrapBackend = .xatlas,
                          slatCfgSDPA: SDPAPrecision = .fp32, texSDPA: SDPAPrecision? = nil,
                          steps: Int = 12,
+                         slatCfgInterval: (Float, Float)? = nil,   // nil = upstream (0.6, 1.0)
+                         slatNegEvery: Int = 1,                    // CFG cache: 1 = off (upstream)
                          remeshRes: Int? = nil, seed: UInt64 = 0,
                          log: (String) -> Void = { print($0) }) throws -> (mesh: BakedMesh, hrResolution: Int, metrics: Trellis2StageMetrics) {
         // Bound flow residency to this tier's working set.
@@ -154,6 +156,9 @@ public final class Trellis2Pipeline {
         metrics.texSdpa = texSDPA?.rawValue ?? (savedCast == .bfloat16 ? "bf16" : "fp32")
         metrics.stepsSS = steps
         metrics.stepsSLat = steps
+        let cfgInterval = slatCfgInterval ?? (0.6, 1.0)
+        metrics.slatCfgInterval = "\(cfgInterval.0),\(cfgInterval.1)"
+        metrics.slatNegEvery = slatNegEvery
 
         // 1) sparse structure: SS sampler → z_s → decode → occupancy coords on the 32³
         //    SLat grid (all tiers: upstream ss_res=32 for '512' and both cascades).
@@ -176,7 +181,8 @@ public final class Trellis2Pipeline {
         var shapeSlat = FlowEulerSampler.sampleSLat(
             model: try flow(.shape512), noiseFeats: MLXRandom.normal([coords.dim(0), 32]), coords: coords,
             cond: cond, negCond: negCond,
-            steps: steps, guidanceStrength: 7.5, guidanceRescale: 0.5, guidanceInterval: (0.6, 1.0), rescaleT: 3.0)
+            steps: steps, guidanceStrength: 7.5, guidanceRescale: 0.5, guidanceInterval: cfgInterval,
+            rescaleT: 3.0, negEvery: slatNegEvery)
         MLX.eval(shapeSlat)
         metrics.shapeSlatS = -t.timeIntervalSinceNow
         metrics.shapeTokens = coords.dim(0)
@@ -208,7 +214,8 @@ public final class Trellis2Pipeline {
             shapeSlat = FlowEulerSampler.sampleSLat(
                 model: try flow(.shape1024), noiseFeats: MLXRandom.normal([hrCoords.dim(0), 32]), coords: hrCoords,
                 cond: cond1024, negCond: negCond1024,
-                steps: steps, guidanceStrength: 7.5, guidanceRescale: 0.5, guidanceInterval: (0.6, 1.0), rescaleT: 3.0)
+                steps: steps, guidanceStrength: 7.5, guidanceRescale: 0.5, guidanceInterval: cfgInterval,
+                rescaleT: 3.0, negEvery: slatNegEvery)
             MLX.eval(shapeSlat)
             metrics.shapeSlatHrS = -t.timeIntervalSinceNow
             log("  [2c] HR shape SLat sampled: \(hrCoords.dim(0)) tokens (\(String(format: "%.1f", metrics.shapeSlatHrS ?? 0))s)")

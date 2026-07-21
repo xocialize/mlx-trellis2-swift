@@ -52,6 +52,15 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
     /// but CFG amplifies SDPA rounding noise (speckle), hence the conservative default.
     /// SS always runs fp32 regardless. Unrecognized values fall back to fp32.
     public var slatCfgAttention: String?
+    /// EXPERIMENTAL CFG-cost knobs for the shape SLat flows (both upstream-exact when nil/default;
+    /// verdicts in BENCHMARKS.md before changing either in production):
+    /// `slatCfgInterval` — "lo,hi" guidance interval override (upstream "0.6,1.0"). Narrowing
+    /// trims double-forward steps at the schedule edges.
+    /// `slatCfgNegEvery` — CFG cache stride: recompute vNeg only every N-th CFG step, reuse
+    /// between (fresh vPos + CFG combination every step). 1/nil = off. N=2 ≈ −19% flow forwards.
+    public var slatCfgInterval: String?
+    public var slatCfgNegEvery: Int?
+
     /// SDPA precision for the CFG-free tex SLat flow. nil (default) = "bf16": the tex flow
     /// runs guidance 1.0 (single forward, no CFG cancellation), and the controlled A/B
     /// (2026-07-20, seeded, mode-split visual review) showed bf16 tex is output-identical
@@ -80,7 +89,7 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
     enum CodingKeys: String, CodingKey {
         case quant, defaultMode, modelsRootDirectory, weightsRootOverride
         case steps, seed, texture, decimateFaces, yUpOutput, unwrapBackend, metricsPath
-        case slatCfgAttention, texAttention
+        case slatCfgAttention, texAttention, slatCfgInterval, slatCfgNegEvery
     }
 
     public init(quant: Quant = .bf16,
@@ -96,6 +105,8 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
                 metricsPath: String? = nil,
                 slatCfgAttention: String? = nil,
                 texAttention: String? = nil,
+                slatCfgInterval: String? = nil,
+                slatCfgNegEvery: Int? = nil,
                 matting: Trellis2Matting? = nil) {
         self.quant = quant
         self.defaultMode = defaultMode
@@ -110,6 +121,8 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
         self.metricsPath = metricsPath
         self.slatCfgAttention = slatCfgAttention
         self.texAttention = texAttention
+        self.slatCfgInterval = slatCfgInterval
+        self.slatCfgNegEvery = slatCfgNegEvery
         self.matting = matting
     }
 }
@@ -431,6 +444,11 @@ public final class Trellis2Package: ModelPackage {
             slatCfgSDPA: configuration.slatCfgAttention.flatMap { SDPAPrecision(rawValue: $0) } ?? .fp32,
             texSDPA: configuration.texAttention.flatMap { SDPAPrecision(rawValue: $0) } ?? .bf16,
             steps: configuration.steps,
+            slatCfgInterval: configuration.slatCfgInterval.flatMap { s -> (Float, Float)? in
+                let p = s.split(separator: ",").compactMap { Float($0.trimmingCharacters(in: .whitespaces)) }
+                return p.count == 2 && p[0] < p[1] ? (p[0], p[1]) : nil   // malformed -> upstream default
+            },
+            slatNegEvery: max(1, configuration.slatCfgNegEvery ?? 1),
             seed: configuration.seed, log: { _ in })
         try Task.checkCancellation()
 

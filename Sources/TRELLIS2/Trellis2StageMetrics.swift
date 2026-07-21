@@ -44,6 +44,8 @@ public struct Trellis2StageMetrics: Codable, Sendable {
     public var stepsSLat = 12          // FlowEulerSampler.sampleSLat default
     public var slatCfgSdpa = "fp32"    // SDPA precision of the CFG shape flows (state-the-lane)
     public var texSdpa = "fp32"        // SDPA precision of the CFG-free tex flow
+    public var slatCfgInterval = "0.6,1.0"   // CFG guidance interval of the shape flows
+    public var slatNegEvery = 1        // CFG cache stride (1 = off, vNeg recomputed every CFG step)
 
     // stage seconds (see generate() [1]..[7])
     public var ssSampleS = 0.0         // [1a] SS flow Euler sampler (fp32 CFG)
@@ -81,6 +83,7 @@ public struct Trellis2StageMetrics: Codable, Sendable {
             "tier": tier, "hr_resolution": hrResolution, "seed": seed, "backend": backend,
             "xatlas_lane": xatlasLane, "steps_ss": stepsSS, "steps_slat": stepsSLat,
             "slat_cfg_sdpa": slatCfgSdpa, "tex_sdpa": texSdpa,
+            "slat_cfg_interval": slatCfgInterval, "slat_neg_every": slatNegEvery,
             "ss_sample_s": ssSampleS, "ss_decode_s": ssDecodeS,
             "shape_slat_s": shapeSlatS, "shape_decode_s": shapeDecodeS,
             "meshbake_s": meshbakeS, "yup_s": yupS,

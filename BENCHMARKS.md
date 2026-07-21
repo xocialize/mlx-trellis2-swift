@@ -65,6 +65,31 @@ offline fallback. MATTED baseline (threshold-matte era):
 Matting crops-to-bbox (raises tokens on clean assets, lowers them on contaminated
 ones) — never compare matted-vs-unmatted timings.
 
+**Canonical v0.9.2+ baseline (BiRefNet matting, res1024, raw corpus inputs):**
+shoes 8,849 tok/195 s · top 11,202/295 · skirt 20,598/858 · dress 21,531/928 ·
+hair 24,016/1023 (top/shoes first-run-clean; rest soaked). Matting ≈ 0.4 s/view
+warm (first-ever run pays ~6 s Metal shader compile, OS-cached after).
+NOTE the matted colors are the FAITHFUL ones (pastel-blue top, true navy) —
+pre-matting "reference" renders were background-tinted.
+
+**res1536 stress (dress, 43,054 HR tokens, 2026-07-21):** token back-off engaged
+(effective 1408); e2e 2,520 s (42 min), shape HR flow 1,770 s (70 %);
+**GPU peak 92.96 GB vs the manifest's declared 23+56=79 GB admission basis** —
+token-heavy assets exceed the declared res1536 footprint by ~14 GB (and the
+49,152-token cap permits bigger still). OPEN: re-baseline the res1536
+QuantFootprint or make admission token-aware; a machine admitted at 79 GB can
+OOM. Bake was 26 s (1 %).
+
+**CFG-cost reduction: ALL REJECTED (seeded A/B + viewer, 2026-07-21).** The two
+sampler knobs exist for reproduction (`SLAT_NEG_EVERY`, `SLAT_CFG_INTERVAL` env;
+`slatCfgNegEvery`/`slatCfgInterval` config; recorded in metrics) but both fail
+visually on top_01@res1024: vNeg caching (negEvery=2, −19 % forwards) loses the
+back-hem graphic + flattens shading; interval (0.6,0.9) (−14 %) shifts color
+toward violet + erases trim. Combined with fp16/bf16 SDPA and steps 8, EVERY
+tried approximation to the CFG shape flows degrades visibly — upstream-exact
+CFG (12 steps, (0.6,1.0), fresh vNeg, fp32-storage SDPA) is the quality floor.
+21 forwards per CFG flow is the price of the look.
+
 **SDPA precision (controlled seeded A/B, mode-split visual review, 2026-07-20):**
 tex flow (CFG-free) bf16 = output-identical shape path (bit-equal decoded
 voxels) + visually indistinguishable texture → engine DEFAULT since this date

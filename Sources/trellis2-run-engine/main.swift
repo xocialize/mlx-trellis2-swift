@@ -70,6 +70,9 @@ do {
     if let v = env["TEX_SDPA"] { print("[engine] tex SDPA: \(v)") }
     let steps = env["STEPS"].flatMap { Int($0) } ?? 12
     if steps != 12 { print("[engine] sampler steps: \(steps)") }
+    // CFG-cost experiment knobs (shape SLat flows): interval "lo,hi" + vNeg cache stride.
+    if let v = env["SLAT_CFG_INTERVAL"] { print("[engine] slat CFG interval: \(v)") }
+    if let v = env["SLAT_NEG_EVERY"] { print("[engine] slat CFG neg-every: \(v)") }
 
     // Foreground matting hook (T0.4), composed the way the app does it: BiRefNet registered as a
     // second package, prepared, and injected as the Trellis2Matting closure. Default ON — raw
@@ -105,6 +108,8 @@ do {
                                               metricsPath: metricsPath,
                                               slatCfgAttention: env["HR_SDPA"],
                                               texAttention: env["TEX_SDPA"],
+                                              slatCfgInterval: env["SLAT_CFG_INTERVAL"],
+                                              slatCfgNegEvery: env["SLAT_NEG_EVERY"].flatMap { Int($0) },
                                               matting: matting))
     print("[engine] registered packageID=\(pkgID) | backers(imageTo3D)=\(await engine.packages(for: .imageTo3D))")
 

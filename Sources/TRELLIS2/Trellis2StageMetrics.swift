@@ -46,6 +46,7 @@ public struct Trellis2StageMetrics: Codable, Sendable {
     public var texSdpa = "fp32"        // SDPA precision of the CFG-free tex flow
     public var slatCfgInterval = "0.6,1.0"   // CFG guidance interval of the shape flows
     public var slatNegEvery = 1        // CFG cache stride (1 = off, vNeg recomputed every CFG step)
+    public var hrTokenCap = 49_152     // effective HR token cap (budget-derived; cascade only)
 
     // stage seconds (see generate() [1]..[7])
     public var ssSampleS = 0.0         // [1a] SS flow Euler sampler (fp32 CFG)
@@ -84,6 +85,7 @@ public struct Trellis2StageMetrics: Codable, Sendable {
             "xatlas_lane": xatlasLane, "steps_ss": stepsSS, "steps_slat": stepsSLat,
             "slat_cfg_sdpa": slatCfgSdpa, "tex_sdpa": texSdpa,
             "slat_cfg_interval": slatCfgInterval, "slat_neg_every": slatNegEvery,
+            "hr_token_cap": hrTokenCap,
             "ss_sample_s": ssSampleS, "ss_decode_s": ssDecodeS,
             "shape_slat_s": shapeSlatS, "shape_decode_s": shapeDecodeS,
             "meshbake_s": meshbakeS, "yup_s": yupS,

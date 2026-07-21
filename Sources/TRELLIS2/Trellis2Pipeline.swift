@@ -1,4 +1,5 @@
 import Foundation
+import Metal
 import MLX
 import MLXRandom
 
@@ -130,6 +131,7 @@ public final class Trellis2Pipeline {
                          steps: Int = 12,
                          slatCfgInterval: (Float, Float)? = nil,   // nil = upstream (0.6, 1.0)
                          slatNegEvery: Int = 1,                    // CFG cache: 1 = off (upstream)
+                         maxHRTokens: Int? = nil,                  // nil = budget-derived (see [2b])
                          remeshRes: Int? = nil, seed: UInt64 = 0,
                          log: (String) -> Void = { print($0) }) throws -> (mesh: BakedMesh, hrResolution: Int, metrics: Trellis2StageMetrics) {
         // Bound flow residency to this tier's working set.
@@ -200,8 +202,29 @@ public final class Trellis2Pipeline {
             let lrDenorm = shapeSlat * shapeStd + shapeMean
             let upCoords = shapeDec(SparseTensor(feats: lrDenorm, coords: coords)).coords
             MLX.eval(upCoords)
+            // Budget-aware token cap (BENCHMARKS.md 2026-07-21): measured GPU peak fits
+            // peak ≈ 28 GB + 1.55 MB/token, RESOLUTION-INDEPENDENT (22 runs; the 43k-token
+            // res1408 stress point sits on the same line as the res1024 corpus). The upstream
+            // cap alone (49,152) extrapolates to ~104 GB — past many machines' Metal
+            // working-set budget (~75 % of RAM; the dress stress run hit 96.6 % of this
+            // machine's). Cap tokens so predicted peak stays under budget − 5 GB margin and
+            // let the existing resolution back-off absorb it. `maxHRTokens` (app/engine
+            // hook) overrides the derivation; the upstream cap stays the ceiling either way;
+            // 12k floor keeps small machines generating (floorResolution bounds below).
+            // Budget basis = min(Metal recommendedMaxWorkingSetSize, 0.70×RAM). Metal reports
+            // 0.8×RAM on M5/macOS 26.2 (110 GB here) but the ENGINE admits against its own
+            // 0.70×RAM policy (96.21 GB here) — the package must not out-spend its admitter.
+            // (First validation run failed exactly here: Metal-only basis left the cap at the
+            // upstream ceiling and the back-off never engaged.)
+            let physBudget = Double(ProcessInfo.processInfo.physicalMemory) * 0.70
+            let metalBudget = MTLCreateSystemDefaultDevice().map { Double($0.recommendedMaxWorkingSetSize) }
+            let budgetBytes = min(metalBudget ?? physBudget, physBudget)
+            let derivedCap = Int((budgetBytes - 5e9 - 28e9) / 1.55e6)
+            let tokenCap = min(49_152, maxHRTokens ?? max(12_000, derivedCap))
+            metrics.hrTokenCap = tokenCap
             (hrCoords, hrResolution) = CascadeQuantize.requantize(
-                upCoords: upCoords, lrResolution: 512, targetResolution: tier.targetResolution)
+                upCoords: upCoords, lrResolution: 512, targetResolution: tier.targetResolution,
+                maxNumTokens: tokenCap)
             MLX.eval(hrCoords)
             metrics.upsampleRequantizeS = -t.timeIntervalSinceNow
             metrics.hrTokens = hrCoords.dim(0)

@@ -61,6 +61,13 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
     public var slatCfgInterval: String?
     public var slatCfgNegEvery: Int?
 
+    /// Cascade HR token cap override. nil (default) = budget-derived: measured GPU peak fits
+    /// ≈ 28 GB + 1.55 MB/token (resolution-independent), so the pipeline caps tokens to keep
+    /// predicted peak under 75 % of physical RAM − 5 GB and lets the resolution back-off absorb
+    /// it (a 43k-token asset hit 96.6 % of this basis under the upstream 49,152 cap alone).
+    /// Set explicitly when the engine/app knows the true available budget.
+    public var maxHRTokens: Int?
+
     /// SDPA precision for the CFG-free tex SLat flow. nil (default) = "bf16": the tex flow
     /// runs guidance 1.0 (single forward, no CFG cancellation), and the controlled A/B
     /// (2026-07-20, seeded, mode-split visual review) showed bf16 tex is output-identical
@@ -89,7 +96,7 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
     enum CodingKeys: String, CodingKey {
         case quant, defaultMode, modelsRootDirectory, weightsRootOverride
         case steps, seed, texture, decimateFaces, yUpOutput, unwrapBackend, metricsPath
-        case slatCfgAttention, texAttention, slatCfgInterval, slatCfgNegEvery
+        case slatCfgAttention, texAttention, slatCfgInterval, slatCfgNegEvery, maxHRTokens
     }
 
     public init(quant: Quant = .bf16,
@@ -107,6 +114,7 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
                 texAttention: String? = nil,
                 slatCfgInterval: String? = nil,
                 slatCfgNegEvery: Int? = nil,
+                maxHRTokens: Int? = nil,
                 matting: Trellis2Matting? = nil) {
         self.quant = quant
         self.defaultMode = defaultMode
@@ -123,6 +131,7 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
         self.texAttention = texAttention
         self.slatCfgInterval = slatCfgInterval
         self.slatCfgNegEvery = slatCfgNegEvery
+        self.maxHRTokens = maxHRTokens
         self.matting = matting
     }
 }
@@ -449,6 +458,7 @@ public final class Trellis2Package: ModelPackage {
                 return p.count == 2 && p[0] < p[1] ? (p[0], p[1]) : nil   // malformed -> upstream default
             },
             slatNegEvery: max(1, configuration.slatCfgNegEvery ?? 1),
+            maxHRTokens: configuration.maxHRTokens,
             seed: configuration.seed, log: { _ in })
         try Task.checkCancellation()
 

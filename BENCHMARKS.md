@@ -76,9 +76,21 @@ pre-matting "reference" renders were background-tinted.
 (effective 1408); e2e 2,520 s (42 min), shape HR flow 1,770 s (70 %);
 **GPU peak 92.96 GB vs the manifest's declared 23+56=79 GB admission basis** —
 token-heavy assets exceed the declared res1536 footprint by ~14 GB (and the
-49,152-token cap permits bigger still). OPEN: re-baseline the res1536
-QuantFootprint or make admission token-aware; a machine admitted at 79 GB can
-OOM. Bake was 26 s (1 %).
+49,152-token cap permits bigger still). Bake was 26 s (1 %).
+RESOLVED (v0.9.4) — **budget-aware token cap**: measured peak fits
+**≈ 28 GB + 1.55 MB/token, resolution-independent** (22 runs); the cascade now
+derives its token cap from min(Metal recommendedMaxWorkingSetSize, 0.70×RAM)
+− 5 GB margin (Metal reports 0.8×RAM on M5/macOS 26.2, but the ENGINE admits
+at 0.70×RAM — the package must not out-spend its admitter; the first
+validation failed on exactly that basis mismatch). `maxHRTokens` config /
+`MAX_HR_TOKENS` env override for engines that know true availability;
+`hr_token_cap` recorded per metrics record. Machines with ≥ ~114 GB budgets
+keep the upstream 49,152 ceiling unchanged. Validated end-to-end (dress@1536):
+cap 40,778 → backed off 1408→1280, 35,024 tokens, peak 81.4 GB (predicted
+82.3 — the model's first extrapolated use, within 1 GB), e2e 1,873 s.
+Smoke a cap change with any cheap cascade run (`hr_token_cap` in the record)
+BEFORE a long validation — the first attempt burned 44 min discovering the
+basis bug a 4-min run would have caught.
 
 **CFG-cost reduction: ALL REJECTED (seeded A/B + viewer, 2026-07-21).** The two
 sampler knobs exist for reproduction (`SLAT_NEG_EVERY`, `SLAT_CFG_INTERVAL` env;
@@ -89,6 +101,21 @@ toward violet + erases trim. Combined with fp16/bf16 SDPA and steps 8, EVERY
 tried approximation to the CFG shape flows degrades visibly — upstream-exact
 CFG (12 steps, (0.6,1.0), fresh vNeg, fp32-storage SDPA) is the quality floor.
 21 forwards per CFG flow is the price of the look.
+
+**TRAINING RECOMMENDATION (for the planned multi-image training/testing runs):**
+inference-time CFG approximations are exhausted (all rejected above), so the
+remaining shape-flow speed lever is DISTILLATION — fold it into the multi-image
+training agenda rather than a standalone project:
+1. Guidance distillation of the shape SLat flows (student matches the CFG-combined
+   teacher velocity in ONE forward): 21 → 12 forwards ≈ −43 % on the dominant
+   stage (70 % of res1536 e2e) — unlike the rejected runtime tricks, the student
+   TRAINS to match the guided output instead of approximating it.
+2. Optional second stage: step distillation (12 → 4–6 steps) multiplies on top.
+3. Evaluation machinery is ready and cheap: seeded determinism gate (voxel-count
+   equality), per-stage metrics JSON, t31 corpus baseline, mode-split A/B viewer.
+   Gate any distilled student against the canonical baseline exactly like the
+   SDPA arms were judged. Distill per-flow (shape512 and shape1024 separately);
+   the tex flow is CFG-free and needs nothing.
 
 **SDPA precision (controlled seeded A/B, mode-split visual review, 2026-07-20):**
 tex flow (CFG-free) bf16 = output-identical shape path (bit-equal decoded

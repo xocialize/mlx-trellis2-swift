@@ -94,7 +94,7 @@ struct EvalResult {
 func evaluate(_ backend: UnwrapBackend) throws -> EvalResult {
     print("=== backend \(backend.rawValue)")
     let t0 = CFAbsoluteTimeGetCurrent()
-    let baked = try MeshBake.run(
+    let (baked, _) = try MeshBake.run(
         shapeFeats: shapeFeats, coords: coords, texBaseColor: baseColor,
         fineRes: fineRes, remeshRes: remeshRes, targetFaces: targetFaces, atlasSize: atlasSize,
         backend: backend, texMetallicRoughness: texMR)

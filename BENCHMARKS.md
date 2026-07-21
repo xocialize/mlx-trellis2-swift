@@ -2,8 +2,40 @@
 
 Measurement infrastructure from the UV-unwrap campaign (see
 `mlxengine-3d/UV-UNWRAP-METAL-PLAN.md` for the full record and reference
-numbers). These are the foundation for the planned full-workflow metrics
-harness — extend them rather than starting over.
+numbers). These are the foundation for the full-workflow metrics
+harness (below) — extend them rather than starting over.
+
+## Full-workflow metrics harness (trellis2-run-engine)
+
+Every `Trellis2Package.run` with `metricsPath` set (env `METRICS_JSON` in
+`trellis2-run-engine`) emits ONE flat JSON record — per-stage wall seconds
+(each timer window ends on that stage's `MLX.eval` barrier; MLX is lazy, so a
+timer without a barrier mis-attributes to the next eval), token/voxel/face
+counts, SDPA lanes, GPU peak. run-engine dumps a cost-sorted stage table.
+
+Reference profiles (top_01.png, seed 0, first-run-of-batch, canary ≈20 s):
+res512 = 54 s · res1024 ≈ 300 s (fp32 tex) / 216 s (bf16 tex) · res1536 ≈ 1153 s.
+The HR SLat flows are 72–83 % of cascade e2e; bake is 3.5–5 %.
+
+**Measurement protocol (each rule was violated once today and caught):**
+- `ss_sample_s` is the built-in machine-speed canary — always fp32, identical
+  work every run. Reject any cross-run comparison whose canaries differ.
+- Sequential heavy runs thermally soak the SoC: first-run-of-batch canaries
+  were 19.4–20.6 s all day; every subsequent run 36–55 s. Compare
+  first-runs-of-batch only (or interleave + repeat the baseline).
+- No WebGL/viewer tab open during timing (GPU contention), no builds.
+- Stage timers include lazy flow-weight load on each process's first use.
+- SDPA lanes are recorded per record (`slat_cfg_sdpa`, `tex_sdpa`) — state
+  them with any timing, same rule as the xatlas lane.
+
+**SDPA precision (controlled seeded A/B, mode-split visual review, 2026-07-20):**
+tex flow (CFG-free) bf16 = output-identical shape path (bit-equal decoded
+voxels) + visually indistinguishable texture → engine DEFAULT since this date
+(`texAttention` nil = bf16; "fp32" opts out). CFG shape flows: fp32 REQUIRED —
+fp16 AND bf16 both visibly degrade the final asset (texture washout, lost
+grain, missing trim, seam artifacts) via concatCond + geometry propagation.
+Per-dtype latents are cross-process deterministic → voxel-count equality is a
+cheap no-render regression gate for future attention changes.
 
 ## unwrapbench — stage-split unwrap timing
 

@@ -40,6 +40,25 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
     /// (UV-UNWRAP-METAL-PLAN.md — ~8x faster bake, near-parity quality).
     public var unwrapBackend: String?
 
+    /// Opt-in full-workflow profiling (BENCHMARKS.md). When set, `run()` writes one flat
+    /// per-generation stage-timing record (JSONSerialization, sortedKeys — the unwrapbench/bakeab
+    /// house convention) to this path AND logs a `JSON {…}` line. nil (default) = no profiling,
+    /// zero overhead. Set from env `METRICS_JSON` by `trellis2-run-engine`.
+    public var metricsPath: String?
+
+    /// SDPA precision for the CFG shape SLat flows: "fp32" (default — parity-safe),
+    /// "fp16", or "bf16". Same fused kernel either way; this is only the Q/K/V cast.
+    /// The cascade's HR shape flow is ~54% of res1536 e2e, so this is THE speed lever —
+    /// but CFG amplifies SDPA rounding noise (speckle), hence the conservative default.
+    /// SS always runs fp32 regardless. Unrecognized values fall back to fp32.
+    public var slatCfgAttention: String?
+    /// SDPA precision for the CFG-free tex SLat flow. nil (default) = "bf16": the tex flow
+    /// runs guidance 1.0 (single forward, no CFG cancellation), and the controlled A/B
+    /// (2026-07-20, seeded, mode-split visual review) showed bf16 tex is output-identical
+    /// on the shape path (bit-equal decoded voxels) and visually indistinguishable, at
+    /// ~2.5× on the stage (−27% res1024 e2e). Set "fp32" to restore the old behavior.
+    public var texAttention: String?
+
     /// Emit the GLB Y-up (glTF/VRM convention) instead of TRELLIS's native Z-up: bakes the
     /// (x,y,z)→(x,z,−y) rotation into the vertices/normals before encode. REQUIRED for the
     /// rig→USDZ→RealityKit path (a post-rig reorientation mis-composes with clip playback).
@@ -60,7 +79,8 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
     /// Explicit Codable surface: everything except the `matting` closure (which decodes to nil).
     enum CodingKeys: String, CodingKey {
         case quant, defaultMode, modelsRootDirectory, weightsRootOverride
-        case steps, seed, texture, decimateFaces, yUpOutput, unwrapBackend
+        case steps, seed, texture, decimateFaces, yUpOutput, unwrapBackend, metricsPath
+        case slatCfgAttention, texAttention
     }
 
     public init(quant: Quant = .bf16,
@@ -73,6 +93,9 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
                 decimateFaces: Int? = 300_000,
                 unwrapBackend: String? = nil,
                 yUpOutput: Bool = false,
+                metricsPath: String? = nil,
+                slatCfgAttention: String? = nil,
+                texAttention: String? = nil,
                 matting: Trellis2Matting? = nil) {
         self.quant = quant
         self.defaultMode = defaultMode
@@ -84,6 +107,9 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
         self.decimateFaces = decimateFaces
         self.unwrapBackend = unwrapBackend
         self.yUpOutput = yUpOutput
+        self.metricsPath = metricsPath
+        self.slatCfgAttention = slatCfgAttention
+        self.texAttention = texAttention
         self.matting = matting
     }
 }
@@ -361,14 +387,25 @@ public final class Trellis2Package: ModelPackage {
                 try Task.checkCancellation()   // the matter may itself be a model run
             }
         }
+        // Profiling bookends (metricsPath set): preprocessing (CPU) is timed separately from the
+        // DINOv3 encode (GPU) — each encode is eval-barriered so the delta is real wall-clock.
+        let tPre = Date()
         let px512 = try views.map { try ImagePreprocess.dinoPixels(from: $0, size: 512) }
+        let px1024: [MLXArray]? = tier.isCascade ? try views.map { try ImagePreprocess.dinoPixels(from: $0, size: 1024) } : nil
+        let preprocessS = -tPre.timeIntervalSinceNow
         try Task.checkCancellation()
 
+        let tDino512 = Date()
         let (cond, negCond) = pipeline.encodeImages(px512)
+        MLX.eval(cond, negCond)
+        let dinoEncode512S = -tDino512.timeIntervalSinceNow
         let (cond1024, negCond1024): (MLXArray, MLXArray)
-        if tier.isCascade {
-            let px1024 = try views.map { try ImagePreprocess.dinoPixels(from: $0, size: 1024) }
+        var dinoEncode1024S = 0.0
+        if let px1024 {
+            let tDino1024 = Date()
             (cond1024, negCond1024) = pipeline.encodeImages(px1024)
+            MLX.eval(cond1024, negCond1024)
+            dinoEncode1024S = -tDino1024.timeIntervalSinceNow
         } else {
             (cond1024, negCond1024) = (cond, negCond)
         }
@@ -380,7 +417,7 @@ public final class Trellis2Package: ModelPackage {
 
         // The pipeline's samplers/decoders honor cooperative cancellation at their step/layer seams
         // (they read the ambient Task); generate() is the long-running body.
-        let (baked, _) = try pipeline.generate(
+        let (baked, _, stageMetrics) = try pipeline.generate(
             tier: tier,
             cond: cond, negCond: negCond, cond1024: cond1024, negCond1024: negCond1024,
             ssNoise: ssNoise, ssPhases: ssPhases,
@@ -389,16 +426,43 @@ public final class Trellis2Package: ModelPackage {
             texture: configuration.texture, targetFaces: configuration.decimateFaces ?? 120_000,
             yUp: configuration.yUpOutput,
             unwrapBackend: configuration.unwrapBackend == "provenance" ? .provenance : .xatlas,
+            slatCfgSDPA: configuration.slatCfgAttention.flatMap { SDPAPrecision(rawValue: $0) } ?? .fp32,
+            texSDPA: configuration.texAttention.flatMap { SDPAPrecision(rawValue: $0) } ?? .bf16,
             seed: configuration.seed, log: { _ in })
         try Task.checkCancellation()
 
+        let tGlb = Date()
         let glb = try GLTFExport.glbData(
             positions: baked.vertices, indices: baked.faces,
             normals: baked.normals, uvs: baked.uvs,
             baseColorRGBA: (baked.texRGBA, baked.atlasSize, baked.atlasSize))
+        let glbExportS = -tGlb.timeIntervalSinceNow
         let mesh = Mesh(format: .glb, data: glb,
                         vertexCount: baked.vertices.dim(0), faceCount: baked.faces.dim(0),
                         hasVertexColors: false)   // UV-textured, not vertex colors
+
+        // Full-workflow profile record (opt-in): generate()-scope stage timers + the DINO/GLB
+        // bookends this method owns. One flat JSON line (sortedKeys) — unwrapbench/bakeab convention.
+        if let path = configuration.metricsPath {
+            var rec = stageMetrics.flatRecord()
+            rec["preprocess_s"] = preprocessS
+            rec["dino_encode_512_s"] = dinoEncode512S
+            rec["dino_encode_1024_s"] = dinoEncode1024S
+            rec["glb_export_s"] = glbExportS
+            rec["views"] = views.count
+            rec["mesh_verts"] = baked.vertices.dim(0)
+            rec["mesh_faces"] = baked.faces.dim(0)
+            rec["atlas_size"] = baked.atlasSize
+            rec["glb_bytes"] = glb.count
+            rec["gpu_peak_bytes"] = Int(GPU.peakMemory)
+            rec["e2e_total_s"] = preprocessS + dinoEncode512S + dinoEncode1024S
+                + stageMetrics.generateTotalS + glbExportS
+            if let data = try? JSONSerialization.data(withJSONObject: rec, options: [.sortedKeys]),
+               let str = String(data: data, encoding: .utf8) {
+                print("JSON \(str)")
+                try? str.write(toFile: path, atomically: true, encoding: .utf8)
+            }
+        }
         return ImageTo3DResponse(mesh: mesh)
     }
 

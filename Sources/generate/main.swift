@@ -47,7 +47,7 @@ let (cond1024, negCond1024) = tier.isCascade ? pipe.encodeImage(try golden("dino
 MLX.eval(cond1024)
 log("[generate] DINOv3 cond \(cond.shape) / \(cond1024.shape) computed natively")
 
-let (baked, hrRes) = try pipe.generate(
+let (baked, hrRes, _) = try pipe.generate(
     tier: tier,
     cond: cond, negCond: negCond, cond1024: cond1024, negCond1024: negCond1024,
     ssNoise: try golden("ss_noise"), ssPhases: try golden("rope_phases_cossin"),

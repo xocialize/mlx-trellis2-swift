@@ -59,10 +59,21 @@ print("[engine] device budget: \(gb(await engine.memory.budgetBytes)) | availabl
 do {
     let weightsOverride = env["WEIGHTS_DIR"].map { URL(fileURLWithPath: $0) }
     if let w = weightsOverride { print("[engine] weights override: \(w.path)") }
+    // Full-workflow stage-timing profile (BENCHMARKS.md). The package writes one flat JSON
+    // record here + logs a `JSON {…}` line; we read it back below and dump a stage table.
+    let metricsPath = env["METRICS_JSON"] ?? "\(here)/trellis2_metrics.json"
+    print("[engine] metrics → \(metricsPath)")
+    // SDPA precision A/B knobs (fp32|fp16|bf16): HR_SDPA = the CFG shape SLat flows,
+    // TEX_SDPA = the CFG-free tex flow. Unset = fp32 (the pre-knob behavior).
+    if let v = env["HR_SDPA"] { print("[engine] slat CFG SDPA: \(v)") }
+    if let v = env["TEX_SDPA"] { print("[engine] tex SDPA: \(v)") }
     let pkgID = try await engine.register(Trellis2Package.registration,
                                           configuration: Trellis2Configuration(
                                               weightsRootOverride: weightsOverride,
-                                              unwrapBackend: env["UNWRAP_BACKEND"]))
+                                              unwrapBackend: env["UNWRAP_BACKEND"],
+                                              metricsPath: metricsPath,
+                                              slatCfgAttention: env["HR_SDPA"],
+                                              texAttention: env["TEX_SDPA"]))
     print("[engine] registered packageID=\(pkgID) | backers(imageTo3D)=\(await engine.packages(for: .imageTo3D))")
 
     let tLoad = Date()
@@ -88,6 +99,24 @@ do {
         + "vertexColors=\(resp.mesh.hasVertexColors) bytes=\(resp.mesh.data.count)")
     print("[engine] engine-charged footprint(imageTo3D)=\(gb((await engine.memory).residents[.imageTo3D] ?? 0))")
     print("[engine] wrote GLB → \(outGLB)")
+
+    // Dump the stage-timing profile (the point of this harness): stages sorted by cost,
+    // each with its share of the end-to-end wall clock. Measure before optimizing.
+    if let data = FileManager.default.contents(atPath: metricsPath),
+       let rec = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+        let e2e = (rec["e2e_total_s"] as? Double) ?? 0
+        print("================ STAGE PROFILE (e2e \(String(format: "%.1f", e2e))s) ================")
+        let stages = rec.filter { $0.key.hasSuffix("_s") && $0.key != "e2e_total_s" && $0.key != "generate_total_s" }
+            .compactMap { k, v -> (String, Double)? in (v as? Double).map { (k, $0) } }
+            .sorted { $0.1 > $1.1 }
+        for (k, s) in stages where s > 0.05 {
+            let pct = e2e > 0 ? s / e2e * 100 : 0
+            print(String(format: "  %-26@ %7.1fs  %5.1f%%", k as NSString, s, pct))
+        }
+        print("========================================================")
+    } else {
+        print("[engine] no metrics record at \(metricsPath)")
+    }
 
     await engine.evict(.imageTo3D, package: pkgID)
     print("[engine] evicted. resident now \(gb(await engine.memory.residentBytes))")

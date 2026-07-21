@@ -37,10 +37,10 @@ public struct MultiHeadAttention {
         // [B,L,H,Dh] -> [B,H,L,Dh] for SDPA
         let qt = q.transposed(0, 2, 1, 3), kt = k.transposed(0, 2, 1, 3), vt = v.transposed(0, 2, 1, 3)
         let scale = Float(1.0 / Double(headDim).squareRoot())
-        let fast = TRELLIS2Config.fastAttention
-        let (qs, ks, vs) = fast ? (qt.asType(.bfloat16), kt.asType(.bfloat16), vt.asType(.bfloat16)) : (qt, kt, vt)
+        let cast = TRELLIS2Config.sdpaCastDtype
+        let (qs, ks, vs) = cast.map { (qt.asType($0), kt.asType($0), vt.asType($0)) } ?? (qt, kt, vt)
         let oRaw = MLXFast.scaledDotProductAttention(queries: qs, keys: ks, values: vs, scale: scale, mask: nil)
-        let o = fast ? oRaw.asType(.float32) : oRaw
+        let o = cast != nil ? oRaw.asType(.float32) : oRaw
         let oo = o.transposed(0, 2, 1, 3).reshaped([B, L, numHeads * headDim])
         return matmul(oo, toOutW.transposed()) + toOutB
     }

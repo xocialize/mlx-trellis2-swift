@@ -46,7 +46,12 @@ public enum MeshBake {
         backend: UnwrapBackend = .xatlas,
         texMetallicRoughness: MLXArray? = nil,   // [N,2] metallic, roughness in [0,1]
         log: (String) -> Void = { print($0) }
-    ) throws -> BakedMesh {
+    ) throws -> (BakedMesh, BakeStageMetrics) {
+        // Sub-stage timers: each `-t.timeIntervalSinceNow` read is preceded by the
+        // MLX.eval that forces the stage's GPU work to complete, so the delta is real
+        // wall-clock (MLX is lazy). Do not move a read ahead of its barrier.
+        var m = BakeStageMetrics()
+        var t = Date()
         let margin: Float = 0.5
         let dv = (1 + 2 * margin) * MLX.sigmoid(shapeFeats[0..., 0..<3]) - margin
         let inter = shapeFeats[0..., 3..<6] .> 0
@@ -62,6 +67,8 @@ public enum MeshBake {
         let origMesh = Mesh(vertices: rawV, faces: rawF)
         let origBVH = origMesh.bvh()
         var mesh = origMesh
+        m.rawDualgridS = -t.timeIntervalSinceNow   // includes the raw-shell BVH build (CPU, synchronous)
+        m.rawFaces = mesh.faceCount
         log("  raw dual-grid: \(mesh.vertexCount) verts, \(mesh.faceCount) faces, \(mesh.numConnectedComponents) components, \(mesh.numBoundaryEdges) boundary edges")
 
         // 2+3) clean (DC remesh, watertight) then unwrap, per backend.
@@ -74,22 +81,28 @@ public enum MeshBake {
             // simplify to budget, then xatlas. Unwrap MUST come after remesh+
             // simplify: xatlas on the raw dual-grid mesh is pathologically slow
             // (~2.2h); on the cleaned mesh it's ~minutes (measured, Phase 0).
+            t = Date()
             mesh = mesh.remeshDualContouring(resolution: remeshRes)
             MLX.eval(mesh.vertices, mesh.faces)
+            m.remeshS = -t.timeIntervalSinceNow; m.remeshFaces = mesh.faceCount; m.simplifyFaces = mesh.faceCount
             log("  remeshed: \(mesh.vertexCount) verts, \(mesh.faceCount) faces, \(mesh.numConnectedComponents) components, \(mesh.numBoundaryEdges) boundary edges")
             if mesh.faceCount > targetFaces {
+                t = Date()
                 mesh = mesh.simplify(targetNumFaces: targetFaces)
                 MLX.eval(mesh.vertices, mesh.faces)
+                m.simplifyS = -t.timeIntervalSinceNow; m.simplifyFaces = mesh.faceCount
                 log("  simplified: \(mesh.vertexCount) verts, \(mesh.faceCount) faces")
             }
             // Parallel partitioned xatlas (measured 64.8–510.6× over the single
             // instance at identical chart quality within ~5%); falls back to the
             // direct path automatically for small meshes.
+            t = Date()
             let uv = try mesh.uvUnwrapParallel()
             finalMesh = uv.mesh
             finalUVs = uv.uvs
             finalNormals = finalMesh.vertexNormals()
             chartCount = uv.charts.count
+            m.unwrapS = -t.timeIntervalSinceNow   // CPU xatlas (swift-vendored-parallel lane), synchronous
         case .provenance:
             // remeshRes <= 0 skips the DC remesh entirely (official-pipeline
             // parity): the 256-grid remesh aliases the fine dual-grid's thin
@@ -98,6 +111,7 @@ public enum MeshBake {
             // xatlas ≈ 2.2 h); the provenance unwrap doesn't need it.
             var provMesh: Mesh
             var provAxis: [UInt8]?
+            t = Date()
             if remeshRes > 0 {
                 let (tagged, faceAxis) = mesh.remeshDualContouringTagged(resolution: remeshRes)
                 MLX.eval(tagged.vertices, tagged.faces)
@@ -109,7 +123,9 @@ public enum MeshBake {
                 provAxis = nil   // axis from face normals
                 log("  remesh skipped (official-parity): \(provMesh.faceCount) raw faces")
             }
+            m.remeshS = -t.timeIntervalSinceNow; m.remeshFaces = provMesh.faceCount; m.simplifyFaces = provMesh.faceCount
             if provMesh.faceCount > targetFaces {
+                t = Date()
                 provMesh = provMesh.simplify(targetNumFaces: targetFaces)
                 MLX.eval(provMesh.vertices, provMesh.faces)
                 // nil tags → axis from each simplified face's own normal;
@@ -125,13 +141,16 @@ public enum MeshBake {
                 // pack-only path must repair it explicitly.
                 provMesh = provMesh.unifyFaceOrientations()
                 MLX.eval(provMesh.vertices, provMesh.faces)
+                m.simplifyS = -t.timeIntervalSinceNow; m.simplifyFaces = provMesh.faceCount
             }
             // (padding gutters and stronger absorption were both measured NULL
             // on the seam-crack artifact and cost texel density — keep defaults)
+            t = Date()
             let prov = try provMesh.provenanceUnwrap(faceAxis: provAxis)
             finalMesh = prov.unwrap.mesh
             finalUVs = prov.unwrap.uvs
             chartCount = prov.unwrap.charts.count
+            m.unwrapS = -t.timeIntervalSinceNow
             // Normals from the PRE-split mesh, carried through the split maps.
             // Computing them on the seam-split mesh gives every chart-border
             // vertex one-sided normals; sliver/poke-through triangles then
@@ -144,6 +163,7 @@ public enum MeshBake {
             finalNormals = preNormals.take(origIdx, axis: 0)
         }
         MLX.eval(finalMesh.vertices, finalMesh.faces, finalUVs)
+        m.finalFaces = finalMesh.faceCount; m.charts = chartCount
         log("  unwrapped[\(backend.rawValue)]: \(finalMesh.vertexCount) verts, \(chartCount) charts")
 
         // 4) rasterize + bake. Center-inside rasterization leaves sub-texel
@@ -160,6 +180,7 @@ public enum MeshBake {
         // ~2× surface, single center sample unrepresentative) and dilutes
         // single-sample crevice pinning (measured: 64%/36% of provenance's
         // remaining bad samples respectively).
+        t = Date()
         let ss = 2
         let ssSize = atlasSize * ss
         let uvPix = finalUVs * Float(ssSize)
@@ -174,10 +195,13 @@ public enum MeshBake {
         let fid = MLX.concatenated(fidParts, axis: 0)
         let bary = MLX.concatenated(baryParts, axis: 0)
         MLX.eval(pix, fid, bary)
+        m.rasterizeS = -t.timeIntervalSinceNow
         let K = fid.dim(0)
+        m.coveredTexelWrites = K
         log("  rasterized: \(K) covered texel-writes (5-pass conservative)")
 
         // surface position per texel: Σ bary · verts[faces[fid]]
+        t = Date()
         let faceVerts = finalMesh.faces.take(fid, axis: 0)                 // [K,3] vertex ids
         let v0 = finalMesh.vertices.take(faceVerts[0..., 0], axis: 0)      // [K,3]
         let v1 = finalMesh.vertices.take(faceVerts[0..., 1], axis: 0)
@@ -208,11 +232,13 @@ public enum MeshBake {
             MLX.eval(mrS)
             mrSampled = MLX.clip(mrS, min: 0, max: 1).asArray(Float.self)
         }
+        m.bakeSampleS = -t.timeIntervalSinceNow   // BVH closest-point remap + GridSample3d trilinear
         let qmin = query.min(), qmax = query.max()
         let nonzero = (sampled.sum(axis: 1) .> 0).asType(.float32).mean().item(Float.self)
         log("  bake diag: baseColor mean=\(texBaseColor.mean().item(Float.self))  query[\(qmin.item(Float.self))..\(qmax.item(Float.self))]  sampled mean=\(sampled.mean().item(Float.self))  hitFrac=\(nonzero)")
 
         // 5) write texels + host-side dilation inpaint
+        t = Date()
         let px = pix.asType(.int32).asArray(Int32.self)                   // [K*2]
         let col = MLX.clip(sampled, min: 0, max: 1).asArray(Float.self)   // [K*3]
         // --- write at supersample resolution, first-write-wins per sub-texel ---
@@ -261,13 +287,16 @@ public enum MeshBake {
                 wallFlipped[p] = anyFlip
             }
         }
+        m.writeDownsampleS = -t.timeIntervalSinceNow
         let filledBeforeInpaint = filled
         let coverage = Float(filled.lazy.filter { $0 }.count) / Float(atlasSize * atlasSize)
+        m.coverage = coverage
         // Inpaint to COMPLETION, not a fixed ring count: any unfilled texel is
         // black, and the renderer's mip chain averages small charts against it,
         // producing dark shard artifacts at distance (user-visible; worst for
         // the provenance backend's lower packing utilization). The dilation
         // loop exits as soon as nothing new fills, so completion is cheap.
+        t = Date()
         var mrFilled = filled   // copy BEFORE base-color inpaint mutates it
         dilateInpaint(&rgb, &filled, atlasSize, iterations: atlasSize)
         var mrRGBA: [UInt8]? = nil
@@ -289,10 +318,12 @@ public enum MeshBake {
             rgba[p*4+2] = UInt8(max(0, min(255, Int(rgb[p*3+2] * 255 + 0.5))))
             rgba[p*4+3] = 255
         }
-        return BakedMesh(vertices: finalMesh.vertices, faces: finalMesh.faces,
-                         normals: finalNormals, uvs: finalUVs, texRGBA: rgba,
-                         atlasSize: atlasSize, coverage: coverage, mrRGBA: mrRGBA,
-                         filledBeforeInpaint: filledBeforeInpaint, wallFlipped: wallFlipped)
+        m.inpaintS = -t.timeIntervalSinceNow
+        let baked = BakedMesh(vertices: finalMesh.vertices, faces: finalMesh.faces,
+                              normals: finalNormals, uvs: finalUVs, texRGBA: rgba,
+                              atlasSize: atlasSize, coverage: coverage, mrRGBA: mrRGBA,
+                              filledBeforeInpaint: filledBeforeInpaint, wallFlipped: wallFlipped)
+        return (baked, m)
     }
 
     /// Fill unfilled texels from filled 4-neighbours (seam/gap inpaint, push-out).

@@ -126,36 +126,59 @@ public final class Trellis2Pipeline {
                          shapeMean: MLXArray, shapeStd: MLXArray, texMean: MLXArray, texStd: MLXArray,
                          texture: Bool = true, targetFaces: Int = 120_000, yUp: Bool = false,
                          unwrapBackend: UnwrapBackend = .xatlas,
+                         slatCfgSDPA: SDPAPrecision = .fp32, texSDPA: SDPAPrecision? = nil,
                          remeshRes: Int? = nil, seed: UInt64 = 0,
-                         log: (String) -> Void = { print($0) }) throws -> (mesh: BakedMesh, hrResolution: Int) {
+                         log: (String) -> Void = { print($0) }) throws -> (mesh: BakedMesh, hrResolution: Int, metrics: Trellis2StageMetrics) {
         // Bound flow residency to this tier's working set.
         releaseFlows(keeping: tier.isCascade ? [.shape512, .shape1024, .tex1024] : [.shape512, .tex512])
 
+        // Per-stage timing (BENCHMARKS.md full-workflow harness). Each `-t.timeIntervalSinceNow`
+        // read below follows the stage's MLX.eval barrier, so deltas are real wall-clock.
+        var metrics = Trellis2StageMetrics()
+        metrics.tier = tier.rawValue
+        metrics.seed = seed
+        metrics.backend = unwrapBackend.rawValue
+
         // High-guidance CFG (SS r0.7, shape r0.5) is fp-sensitive — the g·vPos−(g−1)·vNeg
         // near-cancellation amplifies per-forward noise, so bf16-SDPA noise there shows up
-        // as surface speckle. Run the CFG samplers in fp32; keep bf16 for the CFG-free tex.
-        let fastRequested = TRELLIS2Config.fastAttention
-        defer { TRELLIS2Config.fastAttention = fastRequested }
+        // as surface speckle. Per-stage SDPA precision (same fused kernel, cast only):
+        //   SS         — ALWAYS fp32 (highest rescale 0.7, knife-edge schedule; ~5% of cascade e2e)
+        //   shape SLat — `slatCfgSDPA` (default fp32; fp16 is the A/B candidate — 10-bit
+        //                mantissa vs bf16's 7, so ~8× less rounding noise under CFG)
+        //   tex SLat   — `texSDPA`; nil = legacy (the ambient fastAttention request). The tex
+        //                flow is CFG-free (guidance 1.0, single forward), the documented bf16-safe case.
+        let savedCast = TRELLIS2Config.sdpaCastDtype
+        defer { TRELLIS2Config.sdpaCastDtype = savedCast }
+        metrics.slatCfgSdpa = slatCfgSDPA.rawValue
+        metrics.texSdpa = texSDPA?.rawValue ?? (savedCast == .bfloat16 ? "bf16" : "fp32")
 
         // 1) sparse structure: SS sampler → z_s → decode → occupancy coords on the 32³
         //    SLat grid (all tiers: upstream ss_res=32 for '512' and both cascades).
         var t = Date()
-        TRELLIS2Config.fastAttention = false
+        TRELLIS2Config.sdpaCastDtype = nil   // SS: fp32 SDPA, unconditionally
         let zs = FlowEulerSampler.sampleSS(model: ssDit, noise: ssNoise, cond: cond, negCond: negCond, phases: ssPhases,
                                            steps: 12, guidanceStrength: 7.5, guidanceRescale: 0.7,
                                            guidanceInterval: (0.6, 1.0), rescaleT: 5.0)
+        MLX.eval(zs); metrics.ssSampleS = -t.timeIntervalSinceNow   // [1a] SS flow sampler
+        t = Date()
         let coords = ssDec.coords(ssDec(zs), resolution: 32); MLX.eval(coords)
-        log("  [1] sparse structure: \(coords.dim(0)) voxels @32³ (\(String(format: "%.1f", -t.timeIntervalSinceNow))s)")
+        metrics.ssDecodeS = -t.timeIntervalSinceNow                 // [1b] SS decoder → coords
+        metrics.voxels32 = coords.dim(0)
+        log("  [1] sparse structure: \(coords.dim(0)) voxels @32³ (\(String(format: "%.1f", metrics.ssSampleS + metrics.ssDecodeS))s)")
 
-        // 2) shape SLat (fp32 SDPA — CFG quality). res512: the 512 flow IS the final pass.
-        //    Cascade: the 512 flow is the LR pass, conditioned like res512 (cond_512).
+        // 2) shape SLat (SDPA per `slatCfgSDPA`; default fp32 — CFG quality). res512: the 512
+        //    flow IS the final pass. Cascade: the 512 flow is the LR pass, conditioned like res512.
+        TRELLIS2Config.sdpaCastDtype = slatCfgSDPA.castDtype
         t = Date(); MLXRandom.seed(seed)
         var shapeSlat = FlowEulerSampler.sampleSLat(
             model: try flow(.shape512), noiseFeats: MLXRandom.normal([coords.dim(0), 32]), coords: coords,
             cond: cond, negCond: negCond,
             guidanceStrength: 7.5, guidanceRescale: 0.5, guidanceInterval: (0.6, 1.0), rescaleT: 3.0)
         MLX.eval(shapeSlat)
-        log("  [2] \(tier.isCascade ? "LR " : "")shape SLat sampled: \(coords.dim(0)) tokens (\(String(format: "%.1f", -t.timeIntervalSinceNow))s)")
+        metrics.shapeSlatS = -t.timeIntervalSinceNow
+        metrics.shapeTokens = coords.dim(0)
+        metrics.hrTokens = coords.dim(0)   // overwritten below on the cascade tiers
+        log("  [2] \(tier.isCascade ? "LR " : "")shape SLat sampled: \(coords.dim(0)) tokens (\(String(format: "%.1f", metrics.shapeSlatS))s)")
 
         // 2b) cascade: "upsample" = the shape DECODER's forward-output coords on the LR slat
         //     (upstream `upsample(slat, 4)` is the decoder run to full depth), re-quantized onto
@@ -171,6 +194,8 @@ public final class Trellis2Pipeline {
             (hrCoords, hrResolution) = CascadeQuantize.requantize(
                 upCoords: upCoords, lrResolution: 512, targetResolution: tier.targetResolution)
             MLX.eval(hrCoords)
+            metrics.upsampleRequantizeS = -t.timeIntervalSinceNow
+            metrics.hrTokens = hrCoords.dim(0)
             if hrResolution != tier.targetResolution {
                 log("  [2b] token back-off: resolution reduced to \(hrResolution)")
             }
@@ -182,9 +207,12 @@ public final class Trellis2Pipeline {
                 cond: cond1024, negCond: negCond1024,
                 guidanceStrength: 7.5, guidanceRescale: 0.5, guidanceInterval: (0.6, 1.0), rescaleT: 3.0)
             MLX.eval(shapeSlat)
-            log("  [2c] HR shape SLat sampled: \(hrCoords.dim(0)) tokens (\(String(format: "%.1f", -t.timeIntervalSinceNow))s)")
+            metrics.shapeSlatHrS = -t.timeIntervalSinceNow
+            log("  [2c] HR shape SLat sampled: \(hrCoords.dim(0)) tokens (\(String(format: "%.1f", metrics.shapeSlatHrS ?? 0))s)")
         }
-        TRELLIS2Config.fastAttention = fastRequested   // CFG samplers done; tex (CFG-free) may run bf16
+        // CFG samplers done; tex (CFG-free, single forward) runs at `texSDPA`,
+        // falling back to the ambient request (bf16 when the CLI set fastAttention).
+        TRELLIS2Config.sdpaCastDtype = texSDPA?.castDtype ?? savedCast
 
         // 3) shape decode → 7-ch dual-grid + subdivision masks. Denormalize the latent
         //    (sampler emits normalized; decoder expects std·x+mean).
@@ -192,7 +220,9 @@ public final class Trellis2Pipeline {
         let shapeSlatDenorm = shapeSlat * shapeStd + shapeMean
         let (shapeOut, subs) = shapeDec.decodeCapturingSubs(SparseTensor(feats: shapeSlatDenorm, coords: hrCoords))
         MLX.eval(shapeOut.feats, shapeOut.coords)
-        log("  [3] shape decoded: \(shapeOut.count) voxels (\(String(format: "%.1f", -t.timeIntervalSinceNow))s)")
+        metrics.shapeDecodeS = -t.timeIntervalSinceNow
+        metrics.decodedVoxels = shapeOut.count
+        log("  [3] shape decoded: \(shapeOut.count) voxels (\(String(format: "%.1f", metrics.shapeDecodeS))s)")
 
         // 4-5) texture: tex SLat sampler (concat_cond=shape_slat, no CFG) → tex decode → base
         //      color. `texture=false` skips both stages for a flat-gray geometry-only mesh.
@@ -207,26 +237,33 @@ public final class Trellis2Pipeline {
                 cond: tier.isCascade ? cond1024 : cond, negCond: tier.isCascade ? negCond1024 : negCond,
                 concatCond: shapeSlat, guidanceStrength: 1.0, guidanceRescale: 0.0, guidanceInterval: (0.6, 0.9), rescaleT: 3.0)
             MLX.eval(texSlat)
-            log("  [4] tex SLat sampled (\(String(format: "%.1f", -t.timeIntervalSinceNow))s)")
+            metrics.texSlatS = -t.timeIntervalSinceNow
+            log("  [4] tex SLat sampled (\(String(format: "%.1f", metrics.texSlatS ?? 0))s)")
             t = Date()
             let texSlatDenorm = texSlat * texStd + texMean
             let texOut = texDec(SparseTensor(feats: texSlatDenorm, coords: hrCoords), guidedMasks: subs)
             baseColor = MLX.clip(texOut.feats[0..., 0..<3] * 0.5 + 0.5, min: 0, max: 1)
             MLX.eval(baseColor)
-            log("  [5] tex decoded: \(texOut.count) voxels (\(String(format: "%.1f", -t.timeIntervalSinceNow))s)")
+            metrics.texDecodeS = -t.timeIntervalSinceNow
+            log("  [5] tex decoded: \(texOut.count) voxels (\(String(format: "%.1f", metrics.texDecodeS ?? 0))s)")
         } else {
             baseColor = MLXArray.zeros([shapeOut.count, 3]) + 0.5   // flat gray, geometry-only
             log("  [4-5] texture off — geometry-only (flat gray)")
         }
 
         // 6) mesh + texture bake → clean mesh, at the tier's (possibly backed-off) resolution.
+        t = Date()
         let remesh = remeshRes ?? (hrResolution >= 1536 ? 384 : 256)
-        var baked = try MeshBake.run(shapeFeats: shapeOut.feats, coords: shapeOut.coords, texBaseColor: baseColor,
+        let (bakedInit, bakeMetrics) = try MeshBake.run(shapeFeats: shapeOut.feats, coords: shapeOut.coords, texBaseColor: baseColor,
                                      fineRes: Float(hrResolution), remeshRes: remesh,
                                      targetFaces: targetFaces, atlasSize: 1024,
                                      backend: unwrapBackend, log: log)
+        metrics.meshbakeS = -t.timeIntervalSinceNow
+        metrics.bake = bakeMetrics
+        var baked = bakedInit
 
         // 7) optional Y-up reorientation (x,y,z)→(x,z,−y): a proper rotation, winding preserved.
+        t = Date()
         if yUp {
             func toYUp(_ a: MLXArray) -> MLXArray {
                 MLX.stacked([a[0..., 0], a[0..., 2], -a[0..., 1]], axis: 1)
@@ -237,6 +274,8 @@ public final class Trellis2Pipeline {
                               filledBeforeInpaint: baked.filledBeforeInpaint, wallFlipped: baked.wallFlipped)
             log("  [7] reoriented Y-up")
         }
-        return (baked, hrResolution)
+        metrics.yupS = -t.timeIntervalSinceNow
+        metrics.hrResolution = hrResolution
+        return (baked, hrResolution, metrics)
     }
 }

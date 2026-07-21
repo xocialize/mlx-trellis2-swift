@@ -21,7 +21,7 @@ let texFeats = try golden(texN)                                // [N,6]
 let baseColor = MLX.clip(texFeats[0..., 0..<3] * 0.5 + 0.5, min: 0, max: 1)   // [N,3] in [0,1]
 print("[meshbake] loaded fixtures: \(coords.dim(0)) voxels (\(full ? "FULL object" : "octant"))")
 
-let baked = try MeshBake.run(
+let (baked, _) = try MeshBake.run(
     shapeFeats: shapeFeats, coords: coords, texBaseColor: baseColor,
     fineRes: 1024, remeshRes: 256, targetFaces: 120_000, atlasSize: 1024)
 

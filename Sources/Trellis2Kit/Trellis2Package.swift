@@ -381,12 +381,14 @@ public final class Trellis2Package: ModelPackage {
         // sizes and its tokens concatenated per size. res512 skips the 1024² pass entirely
         // (upstream cond_1024=None for the '512' pipeline type).
         var views = [req.image] + (req.additionalViews ?? [])
+        let tMat = Date()
         if let matting = configuration.matting {
             for i in views.indices {
                 views[i] = try await ImagePreprocess.mattedIfNeeded(views[i], using: matting)
                 try Task.checkCancellation()   // the matter may itself be a model run
             }
         }
+        let mattingS = configuration.matting != nil ? -tMat.timeIntervalSinceNow : 0
         // Profiling bookends (metricsPath set): preprocessing (CPU) is timed separately from the
         // DINOv3 encode (GPU) — each encode is eval-barriered so the delta is real wall-clock.
         let tPre = Date()
@@ -446,6 +448,8 @@ public final class Trellis2Package: ModelPackage {
         // bookends this method owns. One flat JSON line (sortedKeys) — unwrapbench/bakeab convention.
         if let path = configuration.metricsPath {
             var rec = stageMetrics.flatRecord()
+            rec["matting_hook"] = configuration.matting != nil
+            rec["matting_s"] = mattingS
             rec["preprocess_s"] = preprocessS
             rec["dino_encode_512_s"] = dinoEncode512S
             rec["dino_encode_1024_s"] = dinoEncode1024S
@@ -460,7 +464,7 @@ public final class Trellis2Package: ModelPackage {
             // the NAX kernel with TF32 (10-bit-mantissa) matmuls on gen>=17 GPUs unless
             // explicitly disabled. State the lane with every timing.
             rec["mlx_tf32_env"] = ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"] ?? "unset(=on)"
-            rec["e2e_total_s"] = preprocessS + dinoEncode512S + dinoEncode1024S
+            rec["e2e_total_s"] = mattingS + preprocessS + dinoEncode512S + dinoEncode1024S
                 + stageMetrics.generateTotalS + glbExportS
             if let data = try? JSONSerialization.data(withJSONObject: rec, options: [.sortedKeys]),
                let str = String(data: data, encoding: .utf8) {

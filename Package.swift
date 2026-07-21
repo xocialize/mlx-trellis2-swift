@@ -30,6 +30,10 @@ let package = Package(
         .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.31.0"),
         // First-run auto-materialization (MAT): HubClient snapshot download into the ModelStore layout.
         .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
+        // Foreground matting for the run-engine harness driver ONLY (raw white-bg corpus inputs
+        // otherwise leak background slabs/color shifts into the mesh — BENCHMARKS.md). The library
+        // targets stay dependency-free (C13); only trellis2-run-engine links MLXBiRefNet.
+        .package(url: "https://github.com/xocialize/mlx-birefnet-swift.git", from: "0.2.0"),
     ],
     targets: [
         .target(
@@ -128,6 +132,7 @@ let package = Package(
             .product(name: "MLXServeCore", package: "mlx-engine-swift"),
             .product(name: "MLXToolKit", package: "mlx-engine-swift"),
             .product(name: "MLX", package: "mlx-swift"),
+            .product(name: "MLXBiRefNet", package: "mlx-birefnet-swift"),
         ], swiftSettings: [.interoperabilityMode(.Cxx)]),
         // --- VENDORED mesh + xatlas (were ../mlx-swift-mesh + ../SwiftXatlas path deps; folded
         //     in-tree so the package is self-contained and we own maintenance). ---

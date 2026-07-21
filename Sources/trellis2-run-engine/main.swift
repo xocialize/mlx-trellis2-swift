@@ -2,6 +2,7 @@ import Foundation
 import MLX
 import MLXToolKit
 import MLXServeCore
+import MLXBiRefNet
 import Trellis2Kit
 
 // Engine-driven GPU end-to-end driver (mlx-swift-integration Stage-2 step 7).
@@ -69,6 +70,33 @@ do {
     if let v = env["TEX_SDPA"] { print("[engine] tex SDPA: \(v)") }
     let steps = env["STEPS"].flatMap { Int($0) } ?? 12
     if steps != 12 { print("[engine] sampler steps: \(steps)") }
+
+    // Foreground matting hook (T0.4), composed the way the app does it: BiRefNet registered as a
+    // second package, prepared, and injected as the Trellis2Matting closure. Default ON — raw
+    // (no-usable-alpha) inputs otherwise leak background slabs/color shifts into the mesh
+    // (BENCHMARKS.md corpus validation). MATTING=off restores the old raw-input behavior.
+    // Pre-matted RGBA inputs skip the hook per upstream has_alpha, so leaving it on is free there.
+    var matting: Trellis2Matting? = nil
+    var mattePkgID: PackageID? = nil
+    if env["MATTING"]?.lowercased() != "off" {
+        let modelsRoot = env["MODELS_ROOT"].map { URL(fileURLWithPath: $0) }
+            ?? FileManager.default.homeDirectoryForCurrentUser.appending(path: "Development/MLXModelStore")
+        let matteID = try await engine.register(BiRefNetPackage.registration,
+                                                configuration: BiRefNetConfiguration(modelsRootDirectory: modelsRoot))
+        mattePkgID = matteID
+        let tMat = Date()
+        _ = try await engine.prepare(.matting, package: matteID)
+        print(String(format: "[engine] matting: BiRefNet prepared in %.1fs (MATTING=off to disable)",
+                     -tMat.timeIntervalSinceNow))
+        matting = { image in
+            let resp = try await engine.run(MattingRequest(image: image), package: matteID)
+            guard let m = resp as? MattingResponse else { fatalError("unexpected matting response \(type(of: resp))") }
+            return m.matte
+        }
+    } else {
+        print("[engine] matting: OFF (raw inputs — background may leak into the mesh)")
+    }
+
     let pkgID = try await engine.register(Trellis2Package.registration,
                                           configuration: Trellis2Configuration(
                                               weightsRootOverride: weightsOverride,
@@ -76,7 +104,8 @@ do {
                                               unwrapBackend: env["UNWRAP_BACKEND"],
                                               metricsPath: metricsPath,
                                               slatCfgAttention: env["HR_SDPA"],
-                                              texAttention: env["TEX_SDPA"]))
+                                              texAttention: env["TEX_SDPA"],
+                                              matting: matting))
     print("[engine] registered packageID=\(pkgID) | backers(imageTo3D)=\(await engine.packages(for: .imageTo3D))")
 
     let tLoad = Date()
@@ -122,6 +151,7 @@ do {
     }
 
     await engine.evict(.imageTo3D, package: pkgID)
+    if let m = mattePkgID { await engine.evict(.matting, package: m) }
     print("[engine] evicted. resident now \(gb(await engine.memory.residentBytes))")
     print("================ DONE — engine path validated ================")
 } catch {

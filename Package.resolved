@@ -1,5 +1,5 @@
 {
-  "originHash" : "9049edc912ed561b59af63d71fc9b3cd793ed64b8d06be52abf33e2bf4236e3f",
+  "originHash" : "f03fc47f55895d03551eda32f20ab151f3e4768560d84556d95ee1d4233c4b07",
   "pins" : [
     {
       "identity" : "eventsource",
@@ -11,12 +11,30 @@
       }
     },
     {
+      "identity" : "mlx-birefnet-swift",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/xocialize/mlx-birefnet-swift.git",
+      "state" : {
+        "revision" : "6554b5c50d78451bcff393fd1d760fa6207ca94a",
+        "version" : "0.2.0"
+      }
+    },
+    {
       "identity" : "mlx-engine-swift",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/xocialize/mlx-engine-swift",
       "state" : {
         "revision" : "7e1a2f02a0b4107d483f32955c43b2c767de8f76",
         "version" : "0.31.0"
+      }
+    },
+    {
+      "identity" : "mlx-profiling",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/xocialize/mlx-profiling.git",
+      "state" : {
+        "revision" : "a1cee71340e28253b1796c655ac861756c87452d",
+        "version" : "0.1.0"
       }
     },
     {
@@ -83,6 +101,15 @@
       }
     },
     {
+      "identity" : "swift-jinja",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/huggingface/swift-jinja.git",
+      "state" : {
+        "revision" : "7d0b8880ef8e567dd4e0089f8b99fb354129017c",
+        "version" : "2.4.2"
+      }
+    },
+    {
       "identity" : "swift-nio",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-nio.git",
@@ -107,6 +134,24 @@
       "state" : {
         "revision" : "b5544ba79a70a0cb3563e75bf26dc198d6b40ed3",
         "version" : "1.7.4"
+      }
+    },
+    {
+      "identity" : "swift-transformers",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/huggingface/swift-transformers",
+      "state" : {
+        "revision" : "2fa33e1f5e7131a7fc64c28e6d161dcec0d24820",
+        "version" : "1.3.3"
+      }
+    },
+    {
+      "identity" : "yyjson",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/ibireme/yyjson.git",
+      "state" : {
+        "revision" : "8b4a38dc994a110abaec8a400615567bd996105f",
+        "version" : "0.12.0"
       }
     }
   ],

@@ -50,9 +50,15 @@ path has NO matting hook → background leak on raw white-bg inputs: a photograp
 slab fused to the mesh (shoes, skirt — visually obvious), a color shift on the
 asset (skirt teal-tinted vs true navy), and a SILENT token inflation even on
 visually-clean outputs (dress carried ~1.8k background tokens with no visible
-slab). MATTED baseline (border-connected flood-fill matte — `matte.py` in
-mlxengine-3d/DEV/Trellis2Metrics; global threshold would hole out white-interior
-assets like top/shoes):
+slab). As of v0.9.2 `trellis2-run-engine` composes BiRefNet matting BUILT-IN (default
+ON; `MATTING=off` to disable, `MODELS_ROOT` for the store) — registered as a
+second engine package and injected as the `Trellis2Matting` hook, exactly the
+app's composition. Measured strictly better than the threshold workaround: also
+removes soft ground shadows (threshold kept them → gray-tinted color
+conditioning + extra tokens; BiRefNet shoes 8,849 tok vs 11,053 threshold vs
+12,314 raw), `matting_s` ≈ 6 s/view, recorded in the metrics JSON. The
+`matte.py` flood-fill script (mlxengine-3d/DEV/Trellis2Metrics) remains as an
+offline fallback. MATTED baseline (threshold-matte era):
   top 10,928 tok / 222 s · shoes 11,053 / 309 · skirt 20,990 / 763 ·
   dress 21,932 / 789 · hair 23,247 / 864   (sequential batch, thermally soaked —
   first-run-of-batch clean numbers are ~15-25 % lower).

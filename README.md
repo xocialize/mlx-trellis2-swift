@@ -84,7 +84,7 @@ the TRELLIS author).
 
 ## Build & run
 
-Requires Xcode-beta / Swift 6.4 / macOS 26+ SDK and three sibling packages checked out
+Requires Xcode 27 (release since 2026-09-17; Swift 6.4, macOS 26+ SDK) and three sibling packages checked out
 next to this one:
 
 ```

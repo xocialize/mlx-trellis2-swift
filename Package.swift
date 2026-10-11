@@ -26,8 +26,9 @@ let package = Package(
         //  below — self-contained, no external path deps; see THIRD_PARTY_LICENSES.md.)
         // MLXEngine contract + coordinator + conformance harness (URL-consumed like the sibling
         // -swift wrappers). imageTo3D stable since 1.12.0; 0.30.0 carries the split QuantFootprint,
-        // MAT gate (MaterializationConformance) and CAN gate (CancellationConformance).
-        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.31.0"),
+        // MAT gate (MaterializationConformance) and CAN gate (CancellationConformance). 0.67.0: contract 1.52.0 added
+        // `Image.Format.rawRGBA16`, which the exhaustive switch in ImagePreprocess.decodeCGImage names (AB-A-0158).
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.67.0"),
         // First-run auto-materialization (MAT): HubClient snapshot download into the ModelStore layout.
         .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
         // Foreground matting for the run-engine harness driver ONLY (raw white-bg corpus inputs

@@ -145,6 +145,22 @@ enum ImagePreprocess {
                 throw Trellis2Error.imageDecodeFailed
             }
             return (cg, true)   // rawBGRA8 (premultipliedFirst) carries alpha by construction
+        case .rawRGBA16:
+            // MLXToolKit contract 1.52.0 (AB-A-0158): RGBA, 16 bits per component, little-endian, sRGB, premultiplied.
+            // This surface does not declare it (the engine refuses it before the run); decoded here for direct callers,
+            // and so this switch stays exhaustive.
+            guard let w = image.width, let h = image.height else { throw Trellis2Error.imageDecodeFailed }
+            let info = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue
+                | CGBitmapInfo.byteOrder16Little.rawValue)
+            guard let provider = CGDataProvider(data: image.data as CFData),
+                  let cs = CGColorSpace(name: CGColorSpace.sRGB),
+                  let cg = CGImage(width: w, height: h, bitsPerComponent: 16, bitsPerPixel: 64,
+                                   bytesPerRow: image.bytesPerRow ?? w * 8, space: cs, bitmapInfo: info,
+                                   provider: provider, decode: nil, shouldInterpolate: false,
+                                   intent: .defaultIntent) else {
+                throw Trellis2Error.imageDecodeFailed
+            }
+            return (cg, true)   // rawRGBA16 (premultipliedLast) carries alpha by construction
         }
     }
 

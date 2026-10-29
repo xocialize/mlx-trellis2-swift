@@ -139,7 +139,9 @@ gate("DEC  tex decode", decCos >= 0.99,
      String(format: "pbr voxels=%d (oracle %d) cosine=%.6f (%.1fs)", nPbr, refPbrC.dim(0), decCos, -t0.timeIntervalSinceNow))
 
 // ---- 4) bake onto ORIGINAL UVs ----
-let uvs = (try golden("in_uvs")).asType(.float32)
+// the oracle's UVs came through trimesh (OpenGL, v up); bakeWithUVs takes glTF (v down)
+let inUVs = (try golden("in_uvs")).asType(.float32)
+let uvs = MLX.concatenated([inUVs[0..., 0..<1], 1 - inUVs[0..., 1..<2]], axis: 1)
 let vertsA = (try golden("in_vertices")).asType(.float32)
 let facesA = (try golden("in_faces")).asType(.int32)
 t0 = Date()

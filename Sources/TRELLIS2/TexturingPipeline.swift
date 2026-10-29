@@ -25,7 +25,7 @@ public struct TexturingPipeline {
         public let name: String
         public let vertices: MLXArray   // [V,3] normalized model space
         public let faces: MLXArray      // [F,3] int32
-        public let uvs: MLXArray        // [V,2] glTF convention
+        public let uvs: MLXArray        // [V,2] glTF convention (v down); export them unchanged
         public init(name: String, vertices: MLXArray, faces: MLXArray, uvs: MLXArray) {
             self.name = name; self.vertices = vertices; self.faces = faces; self.uvs = uvs
         }

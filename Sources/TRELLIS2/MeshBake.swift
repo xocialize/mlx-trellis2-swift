@@ -332,15 +332,18 @@ public enum MeshBake {
     /// the voxels were generated from this exact geometry, so texel positions lie on the
     /// shell already (mirrors trellis2_texturing.postprocess_mesh's keep-existing-UVs branch).
     ///
-    /// `uvs` are glTF-convention [V,2] (v down); the atlas is written so that a glTF sampler
-    /// reading these UVs sees the right texel (row = (1-v)·S). `texFeats` [N,C>=3] in [0,1]
-    /// (decoder output already mapped via ·0.5+0.5); channel 0..3 baked as RGB.
+    /// `uvs` are glTF-convention [V,2] (origin top-left, v down), as in `run`: texel row = v·S,
+    /// so exporting the same UVs with `GLTFExport` samples the right texel. UVs read through
+    /// trimesh (OpenGL convention, v up — the Python oracle's fixtures) must be flipped to
+    /// 1 − v first. (Before AB-A-0223 this wrote row (1−v)·S, which scrambled re-exported GLBs.)
+    /// `texFeats` [N,C>=3] in [0,1] (decoder output already mapped via ·0.5+0.5); channel 0..3
+    /// baked as RGB.
     public static func bakeWithUVs(
         vertices: MLXArray, faces: MLXArray, uvs: MLXArray,
         texFeats: MLXArray, texCoords: MLXArray, fineRes: Float, atlasSize: Int,
         log: (String) -> Void = { print($0) }
     ) -> (rgba: [UInt8], filled: [Bool], coverage: Float) {
-        let uvPix = MLX.concatenated([uvs[0..., 0..<1], 1 - uvs[0..., 1..<2]], axis: 1) * Float(atlasSize)
+        let uvPix = uvs * Float(atlasSize)
         let (pix, fid, bary) = UVRasterize.rasterize(uvsPix: uvPix, faces: faces, textureSize: atlasSize)
         MLX.eval(pix, fid, bary)
         let K = fid.dim(0)

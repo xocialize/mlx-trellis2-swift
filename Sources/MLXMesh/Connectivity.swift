@@ -129,63 +129,119 @@ extension Mesh {
         return Int((labels.max() ?? -1) + 1)
     }
 
-    /// Trace boundary edges into oriented vertex cycles.
+    /// Trace boundary edges into vertex cycles.
     ///
-    /// A directed edge `(a → b)` from some face is a boundary edge iff the
-    /// reverse `(b → a)` doesn't appear in any other face. Loops are oriented
-    /// consistently with face winding.
+    /// A boundary edge is an undirected edge used by exactly one face (the
+    /// `EdgeTable` definition), so two neighbours with opposite winding don't
+    /// open a false boundary. Each loop runs the way most of its edges run in
+    /// their faces, which on a consistently wound mesh is the face winding.
     ///
-    /// Non-manifold boundary vertices (multiple outgoing boundary edges) are
-    /// handled by taking an arbitrary outgoing edge; the partition into loops
-    /// is still well-defined but may not match what the user expects.
+    /// Where several boundary edges meet at one vertex (two holes sharing a
+    /// vertex, or a non-manifold vertex) the walk splits off a simple cycle
+    /// whenever it comes back to a vertex already on its path, so every loop
+    /// is closed and visits each vertex once. Boundary edges that close no
+    /// cycle (odd boundary degree at non-manifold vertices) form no loop.
     public func boundaryLoops() -> BoundaryLoops {
+        let c = boundaryCycles()
+        let vertsArray = c.vertices.isEmpty
+            ? MLXArray([] as [Int32], [0])
+            : MLXArray(c.vertices, [c.vertices.count])
+        return BoundaryLoops(
+            vertices: vertsArray,
+            offsets: MLXArray(c.offsets, [c.offsets.count])
+        )
+    }
+
+    /// `boundaryLoops()` on the CPU, plus, for loop edge `i` (from
+    /// `vertices[i]` to the next vertex of its loop), whether its face runs it
+    /// the same way. `fillHoles` winds each new triangle by that.
+    func boundaryCycles() -> (vertices: [Int32], offsets: [Int32], faceForward: [Bool]) {
         let f = faces.asArray(Int32.self)
         let stride = UInt64(vertexCount) + 1
 
-        var directed: Set<UInt64> = []
-        directed.reserveCapacity(faceCount * 3)
+        // Undirected key -> faces using it, and whether the last one ran it lo→hi.
+        var use: [UInt64: (count: Int32, forward: Bool)] = [:]
+        use.reserveCapacity(faceCount * 3 / 2)
         for fi in 0..<faceCount {
-            let i0 = UInt64(UInt32(bitPattern: f[fi * 3 + 0]))
-            let i1 = UInt64(UInt32(bitPattern: f[fi * 3 + 1]))
-            let i2 = UInt64(UInt32(bitPattern: f[fi * 3 + 2]))
-            directed.insert(i0 * stride + i1)
-            directed.insert(i1 * stride + i2)
-            directed.insert(i2 * stride + i0)
-        }
-
-        // next[a] = b for each boundary directed edge a→b.
-        var next: [Int32: Int32] = [:]
-        for key in directed {
-            let a = key / stride, b = key % stride
-            let rev = b * stride + a
-            if !directed.contains(rev) {
-                next[Int32(a)] = Int32(b)
+            for k in 0..<3 {
+                let a = UInt64(UInt32(bitPattern: f[fi * 3 + k]))
+                let b = UInt64(UInt32(bitPattern: f[fi * 3 + (k + 1) % 3]))
+                if a == b { continue }  // degenerate face
+                let key = min(a, b) * stride + max(a, b)
+                let n = use[key]?.count ?? 0
+                use[key] = (n + 1, a < b)
             }
         }
 
-        var visited: Set<Int32> = []
-        var loopVerts: [Int32] = []
-        var offsets: [Int32] = [0]
-
-        // Iterate sorted starts for deterministic output.
-        for start in next.keys.sorted() where !visited.contains(start) {
-            var v = start
-            while !visited.contains(v) {
-                visited.insert(v)
-                loopVerts.append(v)
-                guard let nv = next[v] else { break }
-                v = nv
-            }
-            offsets.append(Int32(loopVerts.count))
+        // Boundary edges in key order (deterministic), and per-vertex incidence.
+        var lo: [Int32] = [], hi: [Int32] = [], forward: [Bool] = []
+        for (key, u) in use where u.count == 1 {
+            lo.append(Int32(key / stride)); hi.append(Int32(key % stride)); forward.append(u.forward)
+        }
+        let order = lo.indices.sorted { (lo[$0], hi[$0]) < (lo[$1], hi[$1]) }
+        lo = order.map { lo[$0] }; hi = order.map { hi[$0] }; forward = order.map { forward[$0] }
+        var incident: [Int32: [Int]] = [:]
+        for e in lo.indices {
+            incident[lo[e], default: []].append(e)
+            incident[hi[e], default: []].append(e)
         }
 
-        let vertsArray = loopVerts.isEmpty
-            ? MLXArray([] as [Int32], [0])
-            : MLXArray(loopVerts, [loopVerts.count])
-        return BoundaryLoops(
-            vertices: vertsArray,
-            offsets: MLXArray(offsets, [offsets.count])
-        )
+        var used = [Bool](repeating: false, count: lo.count)
+        var cursor: [Int32: Int] = [:]
+        func nextEdge(_ v: Int32) -> Int? {
+            guard let edges = incident[v] else { return nil }
+            var i = cursor[v] ?? 0
+            while i < edges.count && used[edges[i]] { i += 1 }
+            cursor[v] = i
+            return i < edges.count ? edges[i] : nil
+        }
+        // Does a face run a→b along boundary edge e?
+        func runs(_ e: Int, from a: Int32) -> Bool { forward[e] == (a == lo[e]) }
+
+        var loopVerts: [Int32] = [], faceForward: [Bool] = [], offsets: [Int32] = [0]
+        for e0 in lo.indices where !used[e0] {
+            // Walk unused boundary edges from lo[e0]; path holds the open walk and
+            // pathEdges the edge leaving each of its vertices.
+            var path: [Int32] = [lo[e0]], pathEdges: [Int] = []
+            var position: [Int32: Int] = [lo[e0]: 0]
+            var u = lo[e0]
+            while true {
+                guard let e = nextEdge(u) else {
+                    // Dead end (an open chain): back up one edge and try again from there.
+                    guard path.count > 1 else { break }
+                    position[path.removeLast()] = nil
+                    pathEdges.removeLast()
+                    u = path[path.count - 1]
+                    continue
+                }
+                used[e] = true
+                let w = lo[e] == u ? hi[e] : lo[e]
+                pathEdges.append(e)
+                guard let p = position[w] else {
+                    position[w] = path.count
+                    path.append(w)
+                    u = w
+                    continue
+                }
+                // Back at w: path[p...] is a simple cycle. Emit it, keep walking from w.
+                var cycle = Array(path[p...])
+                var dirs = (p..<path.count).map { runs(pathEdges[$0], from: path[$0]) }
+                if dirs.filter({ $0 }).count * 2 < dirs.count {
+                    // Most edges run the other way: reverse so the loop follows the faces.
+                    let edgesBack = Array(pathEdges[p...].reversed())
+                    cycle = [cycle[0]] + cycle[1...].reversed()
+                    dirs = cycle.indices.map { runs(edgesBack[$0], from: cycle[$0]) }
+                }
+                loopVerts += cycle
+                faceForward += dirs
+                offsets.append(Int32(loopVerts.count))
+                for x in path[(p + 1)...] { position[x] = nil }
+                path.removeSubrange((p + 1)...)
+                pathEdges.removeSubrange(p...)
+                u = w
+            }
+        }
+        return (loopVerts, offsets, faceForward)
     }
 }
 

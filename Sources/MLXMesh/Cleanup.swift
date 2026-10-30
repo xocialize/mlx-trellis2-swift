@@ -210,27 +210,27 @@ extension Mesh {
     /// Fill boundary loops whose perimeter is below `maxHolePerimeter` by
     /// triangulating them as a fan from a newly-inserted centroid vertex.
     ///
-    /// The new triangles' winding matches the existing face winding around
-    /// the hole (boundary loops are already oriented consistently with faces).
+    /// Each new triangle is wound against the face on its boundary edge, so
+    /// the patch matches the faces around the hole even where they disagree.
     /// Fan from centroid is the simplest correct triangulation; CuMesh's
     /// version may produce different geometry but the topology — i.e. "the
     /// loop is now closed" — matches.
     ///
     /// Pass `.infinity` to fill all holes regardless of size.
     public func fillHoles(maxHolePerimeter: Float) -> Mesh {
-        let loops = boundaryLoops()
-        if loops.count == 0 { return self }
+        let loops = boundaryCycles()
+        let offs = loops.offsets
+        if offs.count < 2 { return self }
+        let loopVerts = loops.vertices
 
         let v = vertices.asArray(Float.self)
         let f = faces.asArray(Int32.self)
-        let offs = loops.offsets.asArray(Int32.self)
-        let loopVerts = loops.vertices.asArray(Int32.self)
 
         var newVerts = v
         var newFaces = f
         var nextVertIdx = Int32(vertexCount)
 
-        for li in 0..<loops.count {
+        for li in 0..<(offs.count - 1) {
             let start = Int(offs[li]), end = Int(offs[li + 1])
             let n = end - start
             if n < 3 { continue }
@@ -258,14 +258,14 @@ extension Mesh {
             let center = nextVertIdx
             nextVertIdx += 1
 
-            // Boundary loop walks a→b in the same direction faces traverse
-            // their boundary edge; the hole sits to the right. The new
-            // triangle filling the hole reverses that: (b, a, center).
+            // Where the face runs a→b along the boundary edge, the new
+            // triangle runs it b→a: (b, a, center). Otherwise (a, b, center).
             for i in 0..<n {
                 let a = loopVerts[start + i]
                 let b = loopVerts[start + (i + 1) % n]
-                newFaces.append(b)
-                newFaces.append(a)
+                let (p, q) = loops.faceForward[start + i] ? (b, a) : (a, b)
+                newFaces.append(p)
+                newFaces.append(q)
                 newFaces.append(center)
             }
         }

@@ -75,6 +75,22 @@ The mesh cleanup / remesh / UV unwrap / BVH stages come from
 [`mlx-swift-mesh`](https://github.com/mnmly/mlx-swift-mesh) (a Swift/Metal port of CuMesh by
 the TRELLIS author).
 
+## Multi-view conditioning
+
+`ImageTo3DRequest.additionalViews` takes more views of the same subject (a side or back, say)
+next to the primary `image`. Each view is matted, preprocessed and DINOv3-encoded at every
+resolution its tier needs. The tokens are concatenated to `[1, K·N, D]`, as in the oracle's
+multi-image `get_cond`. The views carry no camera: order and pose are free.
+
+The engine driver passes them through `EXTRA_VIEWS` (comma-separated PNG/JPEG paths):
+
+```
+IMG=front.png EXTRA_VIEWS=side.png,back.png HR_RES=1024 WEIGHTS_DIR=<consolidated weights> \
+  swift run -c release trellis2-run-engine
+```
+
+The metrics record's `views` field reports how many views conditioned the run.
+
 ## Layout
 
 - `Sources/TRELLIS2/` — the library (all ported components).

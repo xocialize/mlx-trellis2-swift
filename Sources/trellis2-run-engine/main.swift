@@ -20,6 +20,7 @@ import Trellis2Kit
 //   WEIGHTS_DIR  consolidated weights root (the trellis2-consolidate OUT dir) for pre-publish validation
 //   OUT_GLB      output GLB path (default ./out_mesh_engine.glb)
 //   HR_RES       512 (default) / 1024 / 1536
+//   EXTRA_VIEWS  comma-separated PNG/JPEG paths passed as `additionalViews` (multi-view conditioning)
 
 setvbuf(stdout, nil, _IONBF, 0)
 func gb(_ bytes: UInt64) -> String { String(format: "%.2f GB", Double(bytes) / 1e9) }
@@ -47,12 +48,19 @@ guard let imgPath = env["IMG"], let pngData = FileManager.default.contents(atPat
     fatalError("set IMG=<png/jpeg> to a readable input image")
 }
 let outGLB = env["OUT_GLB"] ?? "\(here)/out_mesh_engine.glb"
-let fmt: Image.Format = imgPath.lowercased().hasSuffix(".jpg") || imgPath.lowercased().hasSuffix(".jpeg") ? .jpeg : .png
-let image = Image(format: fmt, data: pngData)
+func imageFormat(_ path: String) -> Image.Format {
+    path.lowercased().hasSuffix(".jpg") || path.lowercased().hasSuffix(".jpeg") ? .jpeg : .png
+}
+let image = Image(format: imageFormat(imgPath), data: pngData)
+let extraViews: [Image] = (env["EXTRA_VIEWS"] ?? "").split(separator: ",").map { String($0) }.map { path in
+    guard let data = FileManager.default.contents(atPath: path) else { fatalError("EXTRA_VIEWS: cannot read \(path)") }
+    return Image(format: imageFormat(path), data: data)
+}
 
 print("================ TRELLIS.2 image→3D · ENGINE-DRIVEN e2e ================")
 print("Built with DINOv3.")   // C7 attribution obligation (DINOv3 conditioner)
 print("[engine] input image: \(imgPath)")
+if !extraViews.isEmpty { print("[engine] additional views: \(env["EXTRA_VIEWS"]!)") }
 
 let engine = MLXServeEngine()   // .permissiveOnly runs the two-layer license gate at register
 print("[engine] device budget: \(gb(await engine.memory.budgetBytes)) | available \(gb(await engine.memory.availableBytes))")
@@ -128,7 +136,7 @@ do {
     print("[engine] tier: \(mode.rawValue)")
 
     let tRun = Date()
-    let response = try await engine.run(ImageTo3DRequest(image: image, mode: mode), package: pkgID)
+    let response = try await engine.run(ImageTo3DRequest(image: image, additionalViews: extraViews.isEmpty ? nil : extraViews, mode: mode), package: pkgID)
     guard let resp = response as? ImageTo3DResponse else { fatalError("unexpected response \(type(of: response))") }
     try resp.mesh.data.write(to: URL(fileURLWithPath: outGLB))
 

@@ -361,9 +361,13 @@ public enum MeshBake {
         let col = MLX.clip(sampled, min: 0, max: 1).asArray(Float.self)
         var rgb = [Float](repeating: 0, count: atlasSize * atlasSize * 3)
         var filled = [Bool](repeating: false, count: atlasSize * atlasSize)
+        // First write wins: a texel covered by several faces (shared seam edges, overlapping or
+        // mirrored islands in imported UVs) keeps the lowest face index, as `run`'s bake does and as
+        // nvdiffrast's keep-first equal-z test resolves a flat UV-space raster.
         for k in 0..<K {
             let x = Int(px[k*2]), y = Int(px[k*2+1])
             let p = y * atlasSize + x
+            if filled[p] { continue }
             rgb[p*3] = col[k*3]; rgb[p*3+1] = col[k*3+1]; rgb[p*3+2] = col[k*3+2]
             filled[p] = true
         }

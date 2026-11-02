@@ -131,6 +131,11 @@ let package = Package(
         .executableTarget(name: "meshholes", dependencies: [
             "MLXMesh", .product(name: "MLX", package: "mlx-swift"),
         ], swiftSettings: [.interoperabilityMode(.Cxx)]),
+        // bakeWithUVs overlap gate: a texel two faces cover keeps the first face (keep-first,
+        // like `run`'s bake and nvdiffrast). Synthetic, no weights or goldens.
+        .executableTarget(name: "bakeoverlap", dependencies: [
+            "TRELLIS2", .product(name: "MLX", package: "mlx-swift"),
+        ], swiftSettings: [.interoperabilityMode(.Cxx)]),
         // Engine-driven GPU e2e CLI (Stage-2 step 7): drives the package THROUGH MLXServeEngine
         // (register → prepare → run → decode Mesh → GLB) on a real image. Real weights, GPU stream.
         .executableTarget(name: "trellis2-run-engine", dependencies: [

@@ -75,6 +75,13 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
     /// ~2.5× on the stage (−27% res1024 e2e). Set "fp32" to restore the old behavior.
     public var texAttention: String?
 
+    /// Which stages `additionalViews` condition: "all" (nil, default — SS, shape and tex, the
+    /// oracle's multi-image get_cond) or "texture" (SS and shape see the primary image only; the
+    /// tex flow sees every view). The views carry no pose, so under "all" a feature from one view
+    /// can land on another side of the object (skirt closure copied front and back, AB-R-0722);
+    /// "texture" keeps their colour evidence without letting them steer geometry.
+    public var additionalViewsScope: String?
+
     /// Emit the GLB Y-up (glTF/VRM convention) instead of TRELLIS's native Z-up: bakes the
     /// (x,y,z)→(x,z,−y) rotation into the vertices/normals before encode. REQUIRED for the
     /// rig→USDZ→RealityKit path (a post-rig reorientation mis-composes with clip playback).
@@ -97,6 +104,7 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
         case quant, defaultMode, modelsRootDirectory, weightsRootOverride
         case steps, seed, texture, decimateFaces, yUpOutput, unwrapBackend, metricsPath
         case slatCfgAttention, texAttention, slatCfgInterval, slatCfgNegEvery, maxHRTokens
+        case additionalViewsScope
     }
 
     public init(quant: Quant = .bf16,
@@ -115,6 +123,7 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
                 slatCfgInterval: String? = nil,
                 slatCfgNegEvery: Int? = nil,
                 maxHRTokens: Int? = nil,
+                additionalViewsScope: String? = nil,
                 matting: Trellis2Matting? = nil) {
         self.quant = quant
         self.defaultMode = defaultMode
@@ -132,6 +141,7 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
         self.slatCfgInterval = slatCfgInterval
         self.slatCfgNegEvery = slatCfgNegEvery
         self.maxHRTokens = maxHRTokens
+        self.additionalViewsScope = additionalViewsScope
         self.matting = matting
     }
 }
@@ -419,19 +429,33 @@ public final class Trellis2Package: ModelPackage {
         let preprocessS = -tPre.timeIntervalSinceNow
         try Task.checkCancellation()
 
+        // additionalViewsScope "texture": SS + shape condition on the primary view alone, and the
+        // tex flow on every view (its tier's resolution: 1024 for the cascade, else 512).
+        let textureOnlyViews = configuration.additionalViewsScope == "texture" && views.count > 1
+        let shapeViews = textureOnlyViews ? 1 : views.count
+
         let tDino512 = Date()
-        let (cond, negCond) = pipeline.encodeImages(px512)
+        let (cond, negCond) = pipeline.encodeImages(Array(px512.prefix(shapeViews)))
         MLX.eval(cond, negCond)
         let dinoEncode512S = -tDino512.timeIntervalSinceNow
         let (cond1024, negCond1024): (MLXArray, MLXArray)
         var dinoEncode1024S = 0.0
         if let px1024 {
             let tDino1024 = Date()
-            (cond1024, negCond1024) = pipeline.encodeImages(px1024)
+            (cond1024, negCond1024) = pipeline.encodeImages(Array(px1024.prefix(shapeViews)))
             MLX.eval(cond1024, negCond1024)
             dinoEncode1024S = -tDino1024.timeIntervalSinceNow
         } else {
             (cond1024, negCond1024) = (cond, negCond)
+        }
+        var texConds: (cond: MLXArray, negCond: MLXArray)? = nil
+        var dinoEncodeTexS = 0.0
+        if textureOnlyViews {
+            let tDinoTex = Date()
+            let tc = pipeline.encodeImages(px1024 ?? px512)
+            MLX.eval(tc.cond, tc.negCond)
+            texConds = tc
+            dinoEncodeTexS = -tDinoTex.timeIntervalSinceNow
         }
         try Task.checkCancellation()
 
@@ -444,6 +468,7 @@ public final class Trellis2Package: ModelPackage {
         let (baked, _, stageMetrics) = try pipeline.generate(
             tier: tier,
             cond: cond, negCond: negCond, cond1024: cond1024, negCond1024: negCond1024,
+            texCond: texConds?.cond, texNegCond: texConds?.negCond,
             ssNoise: ssNoise, ssPhases: ssPhases,
             shapeMean: MLXArray(shapeMean), shapeStd: MLXArray(shapeStd),
             texMean: MLXArray(texMean), texStd: MLXArray(texStd),
@@ -483,6 +508,8 @@ public final class Trellis2Package: ModelPackage {
             rec["dino_encode_1024_s"] = dinoEncode1024S
             rec["glb_export_s"] = glbExportS
             rec["views"] = views.count
+            rec["views_scope"] = textureOnlyViews ? "texture" : "all"
+            rec["dino_encode_tex_s"] = dinoEncodeTexS
             rec["mesh_verts"] = baked.vertices.dim(0)
             rec["mesh_faces"] = baked.faces.dim(0)
             rec["atlas_size"] = baked.atlasSize
@@ -492,7 +519,7 @@ public final class Trellis2Package: ModelPackage {
             // the NAX kernel with TF32 (10-bit-mantissa) matmuls on gen>=17 GPUs unless
             // explicitly disabled. State the lane with every timing.
             rec["mlx_tf32_env"] = ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"] ?? "unset(=on)"
-            rec["e2e_total_s"] = mattingS + preprocessS + dinoEncode512S + dinoEncode1024S
+            rec["e2e_total_s"] = mattingS + preprocessS + dinoEncode512S + dinoEncode1024S + dinoEncodeTexS
                 + stageMetrics.generateTotalS + glbExportS
             if let data = try? JSONSerialization.data(withJSONObject: rec, options: [.sortedKeys]),
                let str = String(data: data, encoding: .utf8) {

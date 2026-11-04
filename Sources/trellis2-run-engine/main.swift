@@ -21,6 +21,7 @@ import Trellis2Kit
 //   OUT_GLB      output GLB path (default ./out_mesh_engine.glb)
 //   HR_RES       512 (default) / 1024 / 1536
 //   EXTRA_VIEWS  comma-separated PNG/JPEG paths passed as `additionalViews` (multi-view conditioning)
+//   EXTRA_VIEWS_SCOPE  all (default) / texture — `additionalViewsScope`: which stages the views condition
 
 setvbuf(stdout, nil, _IONBF, 0)
 func gb(_ bytes: UInt64) -> String { String(format: "%.2f GB", Double(bytes) / 1e9) }
@@ -60,7 +61,9 @@ let extraViews: [Image] = (env["EXTRA_VIEWS"] ?? "").split(separator: ",").map {
 print("================ TRELLIS.2 image→3D · ENGINE-DRIVEN e2e ================")
 print("Built with DINOv3.")   // C7 attribution obligation (DINOv3 conditioner)
 print("[engine] input image: \(imgPath)")
-if !extraViews.isEmpty { print("[engine] additional views: \(env["EXTRA_VIEWS"]!)") }
+if !extraViews.isEmpty {
+    print("[engine] additional views (scope \(env["EXTRA_VIEWS_SCOPE"] ?? "all")): \(env["EXTRA_VIEWS"]!)")
+}
 
 let engine = MLXServeEngine()   // .permissiveOnly runs the two-layer license gate at register
 print("[engine] device budget: \(gb(await engine.memory.budgetBytes)) | available \(gb(await engine.memory.availableBytes))")
@@ -120,6 +123,7 @@ do {
                                               slatCfgInterval: env["SLAT_CFG_INTERVAL"],
                                               slatCfgNegEvery: env["SLAT_NEG_EVERY"].flatMap { Int($0) },
                                               maxHRTokens: env["MAX_HR_TOKENS"].flatMap { Int($0) },
+                                              additionalViewsScope: env["EXTRA_VIEWS_SCOPE"],
                                               matting: matting))
     print("[engine] registered packageID=\(pkgID) | backers(imageTo3D)=\(await engine.packages(for: .imageTo3D))")
 

@@ -110,6 +110,9 @@ public final class Trellis2Pipeline {
     /// cond/negCond = SS + res512 conditioning (DINOv3 at image_size 512, the oracle's cond_512 —
     /// SS always uses the 512 tokens). `cond1024`/`negCond1024` = the cascade tiers' shape+tex
     /// conditioning (DINOv3 at image_size 1024); unused by `.res512`, so pass the 512 pair there.
+    /// `texCond`/`texNegCond` (optional) condition the tex flow alone; nil = the tier's shape pair.
+    /// This lets extra views inform texture without steering geometry (pose-free multi-view
+    /// conditioning can move a feature seen in one view onto another side).
     /// ssNoise = [1,8,16,16,16]; ssPhases = SS-DiT rope phases for the 16³ grid.
     /// `shapeMean/Std`, `texMean/Std` = the pipeline's per-channel SLat normalization [32].
     /// The sampler emits a NORMALIZED latent (std≈1); the decoder needs it DENORMALIZED
@@ -123,7 +126,9 @@ public final class Trellis2Pipeline {
     /// cascade token back-off reduced it).
     public func generate(tier: Trellis2Tier = .res1024,
                          cond: MLXArray, negCond: MLXArray,
-                         cond1024: MLXArray, negCond1024: MLXArray, ssNoise: MLXArray, ssPhases: MLXArray,
+                         cond1024: MLXArray, negCond1024: MLXArray,
+                         texCond: MLXArray? = nil, texNegCond: MLXArray? = nil,
+                         ssNoise: MLXArray, ssPhases: MLXArray,
                          shapeMean: MLXArray, shapeStd: MLXArray, texMean: MLXArray, texStd: MLXArray,
                          texture: Bool = true, targetFaces: Int = 120_000, yUp: Bool = false,
                          unwrapBackend: UnwrapBackend = .xatlas,
@@ -267,7 +272,8 @@ public final class Trellis2Pipeline {
             let texSlat = FlowEulerSampler.sampleSLat(
                 model: try flow(tier.isCascade ? .tex1024 : .tex512),
                 noiseFeats: MLXRandom.normal([hrCoords.dim(0), 32]), coords: hrCoords,
-                cond: tier.isCascade ? cond1024 : cond, negCond: tier.isCascade ? negCond1024 : negCond,
+                cond: texCond ?? (tier.isCascade ? cond1024 : cond),
+                negCond: texNegCond ?? (tier.isCascade ? negCond1024 : negCond),
                 concatCond: shapeSlat, steps: steps, guidanceStrength: 1.0, guidanceRescale: 0.0, guidanceInterval: (0.6, 0.9), rescaleT: 3.0)
             MLX.eval(texSlat)
             metrics.texSlatS = -t.timeIntervalSinceNow

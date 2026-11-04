@@ -91,6 +91,12 @@ IMG=front.png EXTRA_VIEWS=side.png,back.png HR_RES=1024 WEIGHTS_DIR=<consolidate
 
 The metrics record's `views` field reports how many views conditioned the run.
 
+Because the views carry no pose, a feature seen in one view can land on any side of the object.
+`Trellis2Configuration.additionalViewsScope = "texture"` (driver: `EXTRA_VIEWS_SCOPE=texture`)
+conditions the sparse-structure and shape flows on the primary image alone and gives every view
+only to the texture flow, so extra views can add colour evidence without steering geometry.
+`views_scope` in the metrics record says which scope ran.
+
 ## Layout
 
 - `Sources/TRELLIS2/` — the library (all ported components).

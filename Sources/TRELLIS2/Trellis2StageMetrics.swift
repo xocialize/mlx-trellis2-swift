@@ -25,6 +25,9 @@ public struct BakeStageMetrics: Codable, Sendable {
     public var rawFaces = 0
     public var remeshFaces = 0
     public var simplifyFaces = 0       // == remeshFaces when no simplify ran
+    public var simplifyStage = "none"  // simplify(hardCeiling:) stage that met the target (AB-A-0265)
+    public var simplifyDroppedComponents = 0
+    public var simplifyDroppedFaces = 0
     public var finalFaces = 0
     public var charts = 0
     public var coveredTexelWrites = 0  // K (5-pass conservative)
@@ -98,7 +101,9 @@ public struct Trellis2StageMetrics: Codable, Sendable {
             "bake_rasterize_s": bake.rasterizeS, "bake_sample_s": bake.bakeSampleS,
             "bake_write_downsample_s": bake.writeDownsampleS, "bake_inpaint_s": bake.inpaintS,
             "bake_raw_faces": bake.rawFaces, "bake_remesh_faces": bake.remeshFaces,
-            "bake_simplify_faces": bake.simplifyFaces, "bake_final_faces": bake.finalFaces,
+            "bake_simplify_faces": bake.simplifyFaces, "bake_simplify_stage": bake.simplifyStage,
+            "bake_simplify_dropped_components": bake.simplifyDroppedComponents,
+            "bake_simplify_dropped_faces": bake.simplifyDroppedFaces, "bake_final_faces": bake.finalFaces,
             "bake_charts": bake.charts, "bake_covered_texel_writes": bake.coveredTexelWrites,
             "bake_coverage": bake.coverage,
         ]

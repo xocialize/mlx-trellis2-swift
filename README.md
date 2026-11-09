@@ -145,7 +145,7 @@ to the configuration, so a request with no keys runs exactly the configured job.
 | `seed` | non-negative integer, or its decimal string for values past 2^53 | `seed` |
 | `steps` | 1…50 | `steps` |
 | `texture` | bool | `texture` |
-| `decimateFaces` | 1,000…2,000,000 | `decimateFaces` (else 120,000) |
+| `decimateFaces` | 1,000…2,000,000; a hard ceiling | `decimateFaces` (else 120,000) |
 | `atlasSize` | 512, 1024, 2048, 4096 | 1024 |
 | `yUp` | bool | `yUpOutput` |
 | `pbrMaps` | bool: also write the metallic-roughness map (G = roughness, B = metallic) | false |
@@ -153,6 +153,25 @@ to the configuration, so a request with no keys runs exactly the configured job.
 A malformed value is refused (`PackageError.unsupportedRequestFeature`) before weights are touched.
 Nothing is clamped silently. `pbrMaps` needs `texture`, because there is no tex decode to read the
 map from otherwise.
+
+**`decimateFaces` is a ceiling (v0.12.1).** The result never has more faces than asked for, for any
+target in 1,000…2,000,000 (`Mesh.simplify(hardCeiling:)`, AB-A-0265). The first pass is the plain
+QEM simplify, so a mesh that lands under its target there is byte-identical to v0.12.0. Only if the
+simplify stalls above the target does it continue, relaxing one guard per stage, in this order:
+1. more rounds;
+2. boundary edges become collapsible;
+3. no normal-flip guard;
+4. no link condition;
+5. then it drops the smallest connected components;
+6. as a last resort, it drops the smallest-area faces.
+
+The metrics record names the stage that met the target (`bake_simplify_stage`).
+
+**Weights load at prepare (v0.12.1).** Each safetensors file is materialized when it is loaded, and a
+lane (`tierCeiling`) loads its tier's flows in `load()`. That keeps disk reads out of the GPU command
+buffers. A lazy load read inside the first job's `eval`, behind another reader of the same disk, ran
+past Metal's command-buffer watchdog in the Gaea worker ("Caused GPU Timeout Error"). The weight
+prewarm now pages only the charged tier's files, not the whole 35 GB snapshot.
 
 **Orientation.** With `yUp`, the mesh is +Y up, and the object's front faces +Z. The shoe's toe
 points +Z, and +Y is up for every asset checked. TRELLIS.2 builds the object in its own canonical

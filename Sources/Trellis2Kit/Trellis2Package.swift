@@ -357,11 +357,20 @@ extension Trellis2Configuration: WeightSourcing {
 // MARK: - Cold-start prewarm
 
 extension Trellis2Configuration: WeightPrewarming {
+    /// The files the charged tier loads, not the whole snapshot (AB-A-0263 follow-up). The folder is
+    /// ~35 GB — encoders and the other tier's flows included — and paging all of it competed for the
+    /// volume with the first job's own weight reads. res512: ~the 512 set; cascade: the 1024 set.
     public var prewarmPaths: [URL] {
-        let dir = weightsRootOverride
+        let root = weightsRootOverride
             ?? ModelStore(root: modelsRootDirectory).directory(for: Self.consolidatedRepo)
-        guard let dir else { return [] }
-        return [dir.appending(path: "normalization.json"), dir]
+        guard let root else { return [] }
+        // An override may hold the snapshot flat or under <org>/<name>, as load() resolves it.
+        let dir = Self.snapshotPresent(at: root) ? root : root.appending(path: Self.consolidatedRepo)
+        let flows = chargedTier.isCascade ? ["shape_flow_512", "shape_flow_1024", "tex_flow_1024"]
+                                          : ["shape_flow_512", "tex_flow_512"]
+        let files = ["normalization.json"]
+            + (["struct_flow", "struct_dec", "shape_dec", "tex_dec", "dino"] + flows).map { "\($0).safetensors" }
+        return files.map { dir.appending(path: $0) }
     }
 }
 
@@ -467,6 +476,11 @@ public final class Trellis2Package: ModelPackage {
         // struct_dec / shape_flow_512 / tex_flow_512 / etc. map onto the pipeline's expected files.
         let ckptDir = dir.path
         pipeline = try Trellis2Pipeline(consolidatedDir: ckptDir)
+        // A lane knows its tier: load its flows now (prepare), so a job reads nothing from disk and its
+        // resident set is the declared one from the start. Without a tierCeiling they stay lazy.
+        if configuration.tierCeiling != nil {
+            try pipeline?.preloadFlows(for: configuration.chargedTier)
+        }
 
         let norm = try Self.loadNormalization(dir)
         shapeMean = norm.shapeMean; shapeStd = norm.shapeStd

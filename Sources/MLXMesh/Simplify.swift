@@ -19,10 +19,84 @@ extension Mesh {
     /// surgery is small (proportional to IS size, not F). v0.3.1 will move
     /// the surgery to Metal as needed.
     public func simplify(targetNumFaces: Int, maxIterations: Int = 64) -> Mesh {
+        simplifyRounds(targetNumFaces: targetNumFaces, iterations: 0 ..< maxIterations, constraints: .strict)
+    }
+
+    /// The guards a simplification round applies. `.strict` is `simplify`'s: boundary edges locked,
+    /// the link condition, the normal-flip guard. The ceiling pass relaxes them one at a time.
+    public struct SimplifyConstraints: Sendable, Equatable {
+        public var protectBoundary = true
+        public var linkCondition = true
+        public var normalFlipGuard = true
+        public static let strict = SimplifyConstraints()
+    }
+
+    /// How `simplify(hardCeiling:)` got under its target.
+    public struct SimplifyCeilingReport: Sendable, Equatable {
+        /// "strict" (plain simplify sufficed), "more-rounds", "boundary", "no-flip-guard",
+        /// "no-link-condition", "drop-components" or "drop-faces".
+        public var stage = "strict"
+        public var droppedComponents = 0
+        public var droppedFaces = 0
+    }
+
+    /// Simplify to AT MOST `targetNumFaces` faces — a ceiling, not a goal (AB-A-0265; MES Mesh §1.9
+    /// requires faces ≤ max_faces). The first pass is exactly `simplify(targetNumFaces:)`, so a mesh
+    /// that lands under its target there is unchanged byte for byte. Only if it stalls above the target
+    /// (the 64-round cap, locked boundary edges, the link condition, the flip guard) does it go on, each
+    /// stage relaxing one more guard: more strict rounds; boundary edges collapsible; no flip guard; no
+    /// link condition. If even that stalls, the smallest connected components go (fewest faces first),
+    /// then the smallest-area faces of what remains. Every step is deterministic.
+    public func simplify(hardCeiling targetNumFaces: Int) -> (mesh: Mesh, report: SimplifyCeilingReport) {
+        var report = SimplifyCeilingReport()
+        var current = simplify(targetNumFaces: targetNumFaces)
+        if current.faceCount <= targetNumFaces { return (current, report) }
+        var relaxed = SimplifyConstraints.strict
+        let stages: [(String, (inout SimplifyConstraints) -> Void)] = [
+            ("more-rounds", { _ in }),
+            ("boundary", { $0.protectBoundary = false }),
+            ("no-flip-guard", { $0.normalFlipGuard = false }),
+            ("no-link-condition", { $0.linkCondition = false }),
+        ]
+        var iterBase = 64
+        for (name, relax) in stages {
+            relax(&relaxed)
+            report.stage = name
+            current = current.simplifyRounds(targetNumFaces: targetNumFaces, iterations: iterBase ..< iterBase + 256,
+                                             constraints: relaxed)
+            iterBase += 256
+            if current.faceCount <= targetNumFaces { return (current, report) }
+        }
+        // Components, fewest faces first (ties: the one whose first face comes first).
+        report.stage = "drop-components"
+        let label = current.connectedComponents().asArray(Int32.self)
+        let f = current.faces.asArray(Int32.self)
+        let faceComp = (0 ..< current.faceCount).map { Int(label[Int(f[$0 * 3])]) }
+        var size = [Int: Int](), first = [Int: Int]()
+        for (fi, c) in faceComp.enumerated() { size[c, default: 0] += 1; if first[c] == nil { first[c] = fi } }
+        var keep = Set(size.keys)
+        var faces = current.faceCount
+        for c in size.keys.sorted(by: { (size[$0]!, first[$0]!) < (size[$1]!, first[$1]!) }) where faces > targetNumFaces && keep.count > 1 {
+            keep.remove(c); faces -= size[c]!; report.droppedComponents += 1
+        }
+        current = current.selectingFaces(MLXArray(faceComp.map { keep.contains($0) }, [current.faceCount]))
+        if current.faceCount <= targetNumFaces { return (current, report) }
+        // Last resort: keep the largest-area faces (ties by index) — the count is guaranteed.
+        report.stage = "drop-faces"
+        let area = current.faceAreas().asArray(Float.self)
+        let order = (0 ..< current.faceCount).sorted { area[$0] != area[$1] ? area[$0] > area[$1] : $0 < $1 }
+        var mask = [Bool](repeating: false, count: current.faceCount)
+        for fi in order.prefix(targetNumFaces) { mask[fi] = true }
+        report.droppedFaces = current.faceCount - targetNumFaces
+        return (current.selectingFaces(MLXArray(mask, [current.faceCount])), report)
+    }
+
+    /// Rounds of `simplifyOneIteration` until ≤ target, no progress, or the iterations run out.
+    func simplifyRounds(targetNumFaces: Int, iterations: Range<Int>, constraints: SimplifyConstraints) -> Mesh {
         var current = self
-        for iter in 0..<maxIterations {
+        for iter in iterations {
             if current.faceCount <= targetNumFaces { return current }
-            let next = current.simplifyOneIteration(iter: iter)
+            let next = current.simplifyOneIteration(iter: iter, constraints: constraints)
             if next.faceCount == current.faceCount { return current }  // no progress
             if next.faceCount == 0 { return next }
             current = next
@@ -31,12 +105,30 @@ extension Mesh {
     }
 
     /// One simplification round. Public for testing / step-by-step usage.
-    public func simplifyOneIteration(iter: Int) -> Mesh {
+    public func simplifyOneIteration(iter: Int, constraints: SimplifyConstraints = .strict) -> Mesh {
         let table = edgeTable()
         if table.count == 0 { return self }
 
         let Q = vertexQuadrics()
-        let (rawCost, targetPos) = edgeCollapseCosts(quadrics: Q, edgeTable: table)
+        var (rawCost, targetPos) = edgeCollapseCosts(quadrics: Q, edgeTable: table)
+        if !constraints.protectBoundary {
+            // Give the locked (non-2-face) edges a finite cost above every interior one, collapsing to
+            // their midpoint, so they go last but can go.
+            var c = rawCost.asArray(Float.self), tgtArr = targetPos.asArray(Float.self)
+            let cnt = table.edgeFaceCount.asArray(Int32.self), ed = table.edges.asArray(Int32.self)
+            let v = vertices.asArray(Float.self)
+            let maxFinite = c.filter(\.isFinite).max() ?? 0
+            for e in 0 ..< table.count where cnt[e] != 2 && !c[e].isFinite {
+                let a = Int(ed[e*2]), b = Int(ed[e*2 + 1])
+                var len2: Float = 0
+                for k in 0 ..< 3 {
+                    let d = v[a*3 + k] - v[b*3 + k]; len2 += d * d
+                    tgtArr[e*3 + k] = (v[a*3 + k] + v[b*3 + k]) / 2
+                }
+                c[e] = maxFinite + 1 + len2
+            }
+            rawCost = MLXArray(c, [table.count]); targetPos = MLXArray(tgtArr, [table.count, 3])
+        }
         let vea = vertexEdgeAdjacency(edgeTable: table)
         let edges = table.edges.asArray(Int32.self)
 
@@ -52,7 +144,7 @@ extension Mesh {
         let vAdj = vertexAdjacency(edgeTable: table)
         let nbr = vAdj.neighbors.asArray(Int32.self)
         let off = vAdj.offsets.asArray(Int32.self)
-        for e in 0..<table.count where costArr[e].isFinite {
+        for e in 0..<table.count where constraints.linkCondition && costArr[e].isFinite {
             let a = Int(edges[e*2 + 0])
             let b = Int(edges[e*2 + 1])
             var common = 0
@@ -158,7 +250,7 @@ extension Mesh {
                 }
             }
             if blocked { continue }
-            if normalFlips(a, b, tgt[e*3], tgt[e*3 + 1], tgt[e*3 + 2]) { continue }
+            if constraints.normalFlipGuard && normalFlips(a, b, tgt[e*3], tgt[e*3 + 1], tgt[e*3 + 2]) { continue }
             acceptedEndpoint[a] = true
             acceptedEndpoint[b] = true
             verts[a*3 + 0] = tgt[e*3 + 0]

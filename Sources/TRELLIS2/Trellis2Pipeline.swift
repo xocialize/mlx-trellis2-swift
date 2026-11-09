@@ -26,17 +26,29 @@ public final class Trellis2Pipeline {
     private let flowURL: (FlowKind) -> URL
     private var flows: [FlowKind: SLatFlowModel] = [:]
 
+    /// Load a safetensors file and MATERIALIZE it now, on the calling thread (AB-A-0263 follow-up).
+    /// `loadArrays` alone is lazy: the file is read inside the first `eval` that needs it, so the
+    /// first job's GPU command buffers wait on disk reads — and behind another reader of the same
+    /// volume (the engine's weight prewarm, ~35 GB of this snapshot) that wait ran past Metal's
+    /// command-buffer watchdog ("Caused GPU Timeout Error") in the Gaea worker's BiRefNet. Evaluating
+    /// the loads here keeps disk I/O out of every GPU command buffer.
+    static func loadMaterialized(_ url: URL) throws -> [String: MLXArray] {
+        let w = try loadArrays(url: url)
+        MLX.eval(Array(w.values))
+        return w
+    }
+
     /// `ckptDir` = the TRELLIS.2-4B ckpts dir; `ssDecPath` = the TRELLIS-image-large SS
     /// decoder; `dinoPath` = the facebook DINOv3 ViT-L/16 model.safetensors.
     public init(ckptDir: String, ssDecPath: String, dinoPath: String) throws {
         func load(_ f: String) throws -> [String: MLXArray] {
-            try loadArrays(url: URL(fileURLWithPath: "\(ckptDir)/\(f).safetensors"))
+            try Self.loadMaterialized(URL(fileURLWithPath: "\(ckptDir)/\(f).safetensors"))
         }
         ssDit = SparseStructureFlowModel(weights: try load("ss_flow_img_dit_1_3B_64_bf16"))
-        ssDec = SparseStructureDecoder(weights: try loadArrays(url: URL(fileURLWithPath: ssDecPath)))
+        ssDec = SparseStructureDecoder(weights: try Self.loadMaterialized(URL(fileURLWithPath: ssDecPath)))
         shapeDec = ShapeSlatDecoder(weights: try load("shape_dec_next_dc_f16c32_fp16"))
         texDec = ShapeSlatDecoder(weights: try load("tex_dec_next_dc_f16c32_fp16"))
-        dino = DINOv3(weights: try loadArrays(url: URL(fileURLWithPath: dinoPath)))
+        dino = DINOv3(weights: try Self.loadMaterialized(URL(fileURLWithPath: dinoPath)))
         flowURL = { kind in
             let f: String
             switch kind {
@@ -56,7 +68,7 @@ public final class Trellis2Pipeline {
     /// keys ARE the Swift module keys (each component self-verifies via its parity gate).
     public init(consolidatedDir dir: String) throws {
         func load(_ f: String) throws -> [String: MLXArray] {
-            try loadArrays(url: URL(fileURLWithPath: "\(dir)/\(f).safetensors"))
+            try Self.loadMaterialized(URL(fileURLWithPath: "\(dir)/\(f).safetensors"))
         }
         ssDit = SparseStructureFlowModel(weights: try load("struct_flow"))
         ssDec = SparseStructureDecoder(weights: try load("struct_dec"))
@@ -78,9 +90,20 @@ public final class Trellis2Pipeline {
     /// Lazily load + cache a SLat flow DiT (fp32-cast, ~5.2 GB resident each).
     public func flow(_ kind: FlowKind) throws -> SLatFlowModel {
         if let m = flows[kind] { return m }
-        let m = SLatFlowModel(weights: try loadArrays(url: flowURL(kind)))
+        let m = SLatFlowModel(weights: try Self.loadMaterialized(flowURL(kind)))
         flows[kind] = m
         return m
+    }
+
+    /// The flow DiTs a tier runs (what `generate` keeps cached).
+    public static func flowKinds(for tier: Trellis2Tier) -> Set<FlowKind> {
+        tier.isCascade ? [.shape512, .shape1024, .tex1024] : [.shape512, .tex512]
+    }
+
+    /// Load a tier's flows now (a host's prepare), so the first job reads nothing from disk.
+    public func preloadFlows(for tier: Trellis2Tier) throws {
+        releaseFlows(keeping: Self.flowKinds(for: tier))
+        for kind in Self.flowKinds(for: tier).sorted(by: { $0.rawValue < $1.rawValue }) { _ = try flow(kind) }
     }
 
     /// Drop cached flow DiTs (all, or all but `keeping`) so their buffers can be reclaimed.
@@ -141,7 +164,7 @@ public final class Trellis2Pipeline {
                          remeshRes: Int? = nil, seed: UInt64 = 0,
                          log: (String) -> Void = { print($0) }) throws -> (mesh: BakedMesh, hrResolution: Int, metrics: Trellis2StageMetrics) {
         // Bound flow residency to this tier's working set.
-        releaseFlows(keeping: tier.isCascade ? [.shape512, .shape1024, .tex1024] : [.shape512, .tex512])
+        releaseFlows(keeping: Self.flowKinds(for: tier))
 
         // Per-stage timing (BENCHMARKS.md full-workflow harness). Each `-t.timeIntervalSinceNow`
         // read below follows the stage's MLX.eval barrier, so deltas are real wall-clock.

@@ -88,10 +88,15 @@ public enum MeshBake {
             log("  remeshed: \(mesh.vertexCount) verts, \(mesh.faceCount) faces, \(mesh.numConnectedComponents) components, \(mesh.numBoundaryEdges) boundary edges")
             if mesh.faceCount > targetFaces {
                 t = Date()
-                mesh = mesh.simplify(targetNumFaces: targetFaces)
+                // A hard ceiling (AB-A-0265): the result never has more faces than asked for.
+                let (simplified, report) = mesh.simplify(hardCeiling: targetFaces)
+                mesh = simplified
                 MLX.eval(mesh.vertices, mesh.faces)
                 m.simplifyS = -t.timeIntervalSinceNow; m.simplifyFaces = mesh.faceCount
-                log("  simplified: \(mesh.vertexCount) verts, \(mesh.faceCount) faces")
+                m.simplifyStage = report.stage
+                m.simplifyDroppedComponents = report.droppedComponents
+                m.simplifyDroppedFaces = report.droppedFaces
+                log("  simplified: \(mesh.vertexCount) verts, \(mesh.faceCount) faces (stage \(report.stage))")
             }
             // Parallel partitioned xatlas (measured 64.8–510.6× over the single
             // instance at identical chart quality within ~5%); falls back to the
@@ -126,7 +131,11 @@ public enum MeshBake {
             m.remeshS = -t.timeIntervalSinceNow; m.remeshFaces = provMesh.faceCount; m.simplifyFaces = provMesh.faceCount
             if provMesh.faceCount > targetFaces {
                 t = Date()
-                provMesh = provMesh.simplify(targetNumFaces: targetFaces)
+                let (simplified, report) = provMesh.simplify(hardCeiling: targetFaces)   // AB-A-0265
+                provMesh = simplified
+                m.simplifyStage = report.stage
+                m.simplifyDroppedComponents = report.droppedComponents
+                m.simplifyDroppedFaces = report.droppedFaces
                 MLX.eval(provMesh.vertices, provMesh.faces)
                 // nil tags → axis from each simplified face's own normal;
                 // measured better than BVH tag transfer (mis-tagged large

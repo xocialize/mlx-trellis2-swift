@@ -178,14 +178,64 @@ do {
 } catch {
     check("res1024 lane refuses a res1536 request", false, "threw \(error)")
 }
+let small = Trellis2Configuration.lane(ImageTo3DContract.res512)
+check("res512 lane at the default maxAtlasSize (1024) = 34 GB, v0.11.0's charge",
+      (small.residentBytesHint ?? 0) + (small.peakActivationBytesHint ?? 0) == 34_000_000_000)
+for (atlas, total) in [(2048, 38_000_000_000 as UInt64), (4096, 48_000_000_000)] {
+    let big = Trellis2Configuration.lane(ImageTo3DContract.res512, maxAtlasSize: atlas)
+    let fit = FootprintConformance.check(manifest: manifest, configuration: big)
+    check("res512 lane at maxAtlasSize \(atlas) = \(total / 1_000_000_000) GB", fit.passed
+          && (big.residentBytesHint ?? 0) + (big.peakActivationBytesHint ?? 0) == total)
+    let cascade = Trellis2Configuration.lane(ImageTo3DContract.res1536, maxAtlasSize: atlas)
+    check("res1536 lane charge does not move with maxAtlasSize \(atlas)",
+          cascade.peakActivationBytesHint == Trellis2Configuration.lane(ImageTo3DContract.res1536).peakActivationBytesHint)
+}
+do {
+    _ = try Trellis2RequestOptions(metaData: ["atlasSize": .int(2048)], configuration: small)
+    check("maxAtlasSize 1024 refuses atlasSize 2048", false, "accepted")
+} catch PackageError.unsupportedRequestFeature {
+    check("maxAtlasSize 1024 refuses atlasSize 2048", true)
+} catch { check("maxAtlasSize 1024 refuses atlasSize 2048", false, "\(error)") }
 let roaming = Trellis2Configuration(defaultMode: ImageTo3DContract.res512)
 check("no tierCeiling = the pre-0.11 behaviour (charged for defaultMode)",
       roaming.residentBytesHint == Trellis2Configuration.lane(ImageTo3DContract.res512).residentBytesHint)
 
 // ---------------------------------------------------------------------------------------------
+section("Per-request options from metaData (AB-A-0263)")
+
+let base = Trellis2Configuration(maxAtlasSize: 4096, seed: 3, texture: true, decimateFaces: 300_000, yUpOutput: false)
+do {
+    let none = try Trellis2RequestOptions(metaData: [:], configuration: base)
+    check("no keys = the configuration's job", none == Trellis2RequestOptions(configuration: base)
+          && none.seed == 3 && none.steps == 12 && none.texture && none.decimateFaces == 300_000
+          && none.atlasSize == 1024 && !none.yUp && !none.pbrMaps)
+    let nulls = try Trellis2RequestOptions(metaData: ["seed": .null, "yUp": .null], configuration: base)
+    check("null keys fall back", nulls == none)
+    let all = try Trellis2RequestOptions(metaData: [
+        "seed": .string("18446744073709551615"), "steps": .int(10), "texture": .bool(false),
+        "decimateFaces": .double(50_000), "atlasSize": .int(4096), "yUp": .bool(true), "pbrMaps": .bool(true),
+    ], configuration: base)
+    check("every key overrides", all.seed == UInt64.max && all.steps == 10 && !all.texture
+          && all.decimateFaces == 50_000 && all.atlasSize == 4096 && all.yUp && all.pbrMaps)
+} catch {
+    check("options parse", false, "\(error)")
+}
+for (key, bad) in [("atlasSize", MetaValue.int(3000)), ("seed", .int(-1)), ("steps", .int(0)),
+                   ("yUp", .string("true")), ("decimateFaces", .double(1.5)), ("texture", .int(1))] {
+    do {
+        _ = try Trellis2RequestOptions(metaData: [key: bad], configuration: base)
+        check("refuses \(key) = \(bad)", false, "accepted")
+    } catch PackageError.unsupportedRequestFeature {
+        check("refuses \(key) = \(bad)", true)
+    } catch {
+        check("refuses \(key) = \(bad)", false, "threw \(error)")
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 section("Result")
 if failures == 0 {
-    print("✅ ALL GATES PASSED (C0–C13 static + MAT-1..5 + CAN-1..3 + FIT lanes)")
+    print("✅ ALL GATES PASSED (C0–C13 static + MAT-1..5 + CAN-1..3 + FIT lanes + request options)")
 } else {
     print("❌ \(failures) gate check(s) FAILED")
     exit(1)

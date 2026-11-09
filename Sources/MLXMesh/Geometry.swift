@@ -25,15 +25,22 @@ extension Mesh {
     /// Area-weighted per-vertex normals, `[V, 3]`. Each face contributes its
     /// un-normalized cross product (magnitude = 2·area) to its three vertices;
     /// the result is then normalized.
+    ///
+    /// The per-vertex sum runs on the CPU in face order, so it is the same bits every run. A GPU
+    /// scatter-add (`at[].add`) sums duplicate indices in whatever order the threads land, and
+    /// float addition is not associative (AB-A-0263: byte-for-byte reproducible GLBs).
     public func vertexNormals() -> MLXArray {
-        let fn = faceNormals(normalize: false)              // [F, 3]
-        // Broadcast each face normal across its 3 vertices: [F, 3, 3].
-        let perCorner = MLX.repeated(
-            MLX.expandedDimensions(fn, axis: 1), count: 3, axis: 1
-        ).reshaped([faceCount * 3, 3])
-        let idx = faces.reshaped([faceCount * 3])
-        let zeros = MLXArray.zeros([vertexCount, 3], type: Float.self)
-        let summed = zeros.at[idx].add(perCorner)
+        let fn = faceNormals(normalize: false).asArray(Float.self)   // [F, 3], elementwise on GPU
+        let f = faces.asArray(Int32.self)
+        var acc = [Float](repeating: 0, count: vertexCount * 3)
+        for fi in 0 ..< faceCount {
+            let nx = fn[fi*3], ny = fn[fi*3 + 1], nz = fn[fi*3 + 2]
+            for c in 0 ..< 3 {
+                let v = Int(f[fi*3 + c]) * 3
+                acc[v] += nx; acc[v + 1] += ny; acc[v + 2] += nz
+            }
+        }
+        let summed = MLXArray(acc, [vertexCount, 3])
         let len = MLXLinalg.norm(summed, axis: -1, keepDims: true)
         return summed / MLX.maximum(len, MLXArray(1e-20 as Float))
     }

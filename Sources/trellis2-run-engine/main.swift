@@ -112,6 +112,12 @@ do {
         print("[engine] matting: OFF (raw inputs — background may leak into the mesh)")
     }
 
+    // Per-request overrides (AB-A-0263): META='{"seed":7,"yUp":true,"atlasSize":2048,"pbrMaps":true}'.
+    let metaData: MetaData = try env["META"].map { try JSONDecoder().decode(MetaData.self, from: Data($0.utf8)) } ?? [:]
+    if !metaData.isEmpty { print("[engine] request metaData: \(env["META"]!)") }
+    // The lane accepts the requested atlas (its charge follows maxAtlasSize on res512).
+    let maxAtlas: Int = { if case .int(let a)? = metaData["atlasSize"] { return max(1024, a) }; return 1024 }()
+
     // Registered as a LANE pinned to the requested tier (AB-A-0262) — the shape a per-lane host
     // (Gaea) uses — so prepare() is charged that tier's declared footprint.
     let hrRes = env["HR_RES"].flatMap { Int($0) } ?? 512
@@ -119,7 +125,7 @@ do {
                    : hrRes == 1536 ? ImageTo3DContract.res1536 : ImageTo3DContract.res512
     let pkgID = try await engine.register(Trellis2Package.registration,
                                           configuration: Trellis2Configuration(
-                                              defaultMode: mode, tierCeiling: mode,
+                                              defaultMode: mode, tierCeiling: mode, maxAtlasSize: maxAtlas,
                                               weightsRootOverride: weightsOverride,
                                               steps: steps,
                                               unwrapBackend: env["UNWRAP_BACKEND"],
@@ -132,7 +138,7 @@ do {
                                               additionalViewsScope: env["EXTRA_VIEWS_SCOPE"],
                                               matting: matting))
     print("[engine] registered packageID=\(pkgID) | backers(imageTo3D)=\(await engine.packages(for: .imageTo3D))")
-    let laneConfig = Trellis2Configuration(defaultMode: mode, tierCeiling: mode,
+    let laneConfig = Trellis2Configuration(defaultMode: mode, tierCeiling: mode, maxAtlasSize: maxAtlas,
                                            maxHRTokens: env["MAX_HR_TOKENS"].flatMap { Int($0) })
     print(String(format: "[engine] declared for the %@ lane: resident %.2f GB + activation %.2f GB (HR token bound %@)",
                  mode.rawValue, Double(laneConfig.residentBytesHint ?? 0) / 1e9,
@@ -148,10 +154,24 @@ do {
 
     print("[engine] tier: \(mode.rawValue)")
 
+    let request = ImageTo3DRequest(image: image, additionalViews: extraViews.isEmpty ? nil : extraViews,
+                                   mode: mode, metaData: metaData)
+
     let tRun = Date()
-    let response = try await engine.run(ImageTo3DRequest(image: image, additionalViews: extraViews.isEmpty ? nil : extraViews, mode: mode), package: pkgID)
+    let response = try await engine.run(request, package: pkgID)
     guard let resp = response as? ImageTo3DResponse else { fatalError("unexpected response \(type(of: response))") }
     try resp.mesh.data.write(to: URL(fileURLWithPath: outGLB))
+    // RUNS=N repeats the same request in this process (flows cached) and reports whether every GLB
+    // is byte-identical to the first — the in-process half of the determinism check.
+    let runs = env["RUNS"].flatMap { Int($0) } ?? 1
+    if runs > 1 {
+        for i in 2 ... runs {
+            let again = try await engine.run(request, package: pkgID)
+            guard let r = again as? ImageTo3DResponse else { fatalError("unexpected response") }
+            try r.mesh.data.write(to: URL(fileURLWithPath: outGLB + ".run\(i).glb"))
+            print("[engine] repeat \(i): \(r.mesh.data.count) bytes, identical to run 1: \(r.mesh.data == resp.mesh.data)")
+        }
+    }
 
     print(String(format: "[engine] run OK in %.0fs | GPU peak %.2f GB | peak phys %.2f GB",
                  -tRun.timeIntervalSinceNow, Double(Memory.peakMemory)/1e9, peakPhys))

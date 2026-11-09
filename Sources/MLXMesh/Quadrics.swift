@@ -9,73 +9,18 @@ import MLXFast
 /// to the quadric of each of its 3 vertices. Used as the foundation of
 /// edge-collapse simplification.
 
-private let accumulateQuadricsKernel: MLXFastKernel = MLXFast.metalKernel(
-    name: "accumulate_quadrics",
-    inputNames: ["vertices", "faces"],
-    outputNames: ["Q"],
-    source: """
-        uint f = thread_position_in_grid.x;
-        uint fcount = faces_shape[0];
-        if (f >= fcount) return;
-
-        int i0 = faces[f*3 + 0];
-        int i1 = faces[f*3 + 1];
-        int i2 = faces[f*3 + 2];
-        float3 v0 = float3(vertices[i0*3 + 0], vertices[i0*3 + 1], vertices[i0*3 + 2]);
-        float3 v1 = float3(vertices[i1*3 + 0], vertices[i1*3 + 1], vertices[i1*3 + 2]);
-        float3 v2 = float3(vertices[i2*3 + 0], vertices[i2*3 + 1], vertices[i2*3 + 2]);
-
-        float3 n = cross(v1 - v0, v2 - v0);
-        float ln = length(n);
-        if (ln < 1e-12f) return;
-        n /= ln;
-        float d = -dot(n, v0);
-
-        // K = p pᵀ packed into 10 floats.
-        float px = n.x, py = n.y, pz = n.z, pw = d;
-        float k0 = px*px, k1 = px*py, k2 = px*pz, k3 = px*pw;
-        float k4 = py*py, k5 = py*pz, k6 = py*pw;
-        float k7 = pz*pz, k8 = pz*pw;
-        float k9 = pw*pw;
-
-        int verts[3] = { i0, i1, i2 };
-        for (uint vi = 0; vi < 3; ++vi) {
-            int v = verts[vi];
-            atomic_fetch_add_explicit(&Q[v*10 + 0], k0, memory_order_relaxed);
-            atomic_fetch_add_explicit(&Q[v*10 + 1], k1, memory_order_relaxed);
-            atomic_fetch_add_explicit(&Q[v*10 + 2], k2, memory_order_relaxed);
-            atomic_fetch_add_explicit(&Q[v*10 + 3], k3, memory_order_relaxed);
-            atomic_fetch_add_explicit(&Q[v*10 + 4], k4, memory_order_relaxed);
-            atomic_fetch_add_explicit(&Q[v*10 + 5], k5, memory_order_relaxed);
-            atomic_fetch_add_explicit(&Q[v*10 + 6], k6, memory_order_relaxed);
-            atomic_fetch_add_explicit(&Q[v*10 + 7], k7, memory_order_relaxed);
-            atomic_fetch_add_explicit(&Q[v*10 + 8], k8, memory_order_relaxed);
-            atomic_fetch_add_explicit(&Q[v*10 + 9], k9, memory_order_relaxed);
-        }
-    """,
-    atomicOutputs: true
-)
-
 extension Mesh {
-    /// Per-vertex QEM matrices, `[V, 10]` float32. Computed via an atomic Metal
-    /// kernel scattering each face's plane contribution to its 3 vertices.
-    public func vertexQuadrics() -> MLXArray {
-        let v = vertexCount
-        let f = faceCount
-        let tg = min(max(f, 1), 256)
-        let outputs = accumulateQuadricsKernel(
-            [vertices, faces],
-            grid: (f, 1, 1),
-            threadGroup: (tg, 1, 1),
-            outputShapes: [[v, 10]],
-            outputDTypes: [.float32],
-            initValue: 0
-        )
-        return outputs[0]
-    }
+    /// Per-vertex QEM matrices, `[V, 10]` float32.
+    ///
+    /// Accumulated on the CPU in face order, so the same mesh gives the same bits every run. It was a
+    /// Metal kernel scattering with float `atomic_fetch_add`, whose order — and so whose rounding —
+    /// changed between runs; through simplify's edge costs that moved the final face count by up to
+    /// 0.07 %, and the GLB bytes with it (AB-A-0263: Gaea checks plugin output byte for byte).
+    /// Simplify is CPU-bound per iteration already (the link-condition pass), and this is one linear
+    /// sweep over the faces.
+    public func vertexQuadrics() -> MLXArray { vertexQuadricsCPU() }
 
-    /// CPU reference for `vertexQuadrics`. Used by tests to validate the GPU
-    /// kernel; production callers should use the GPU variant.
+    /// The deterministic face-order accumulation `vertexQuadrics` returns.
     func vertexQuadricsCPU() -> MLXArray {
         let v = vertices.asArray(Float.self)
         let f = faces.asArray(Int32.self)

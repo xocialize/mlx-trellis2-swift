@@ -131,6 +131,7 @@ public final class Trellis2Pipeline {
                          ssNoise: MLXArray, ssPhases: MLXArray,
                          shapeMean: MLXArray, shapeStd: MLXArray, texMean: MLXArray, texStd: MLXArray,
                          texture: Bool = true, targetFaces: Int = 120_000, yUp: Bool = false,
+                         atlasSize: Int = 1024, pbrMaps: Bool = false,
                          unwrapBackend: UnwrapBackend = .xatlas,
                          slatCfgSDPA: SDPAPrecision = .fp32, texSDPA: SDPAPrecision? = nil,
                          steps: Int = 12,
@@ -272,6 +273,7 @@ public final class Trellis2Pipeline {
         //      Cascade mirrors upstream: tex 1024 flow, HR shape slat concat, same HR coords,
         //      cond_1024; res512 keeps the 512 flow + cond_512.
         let baseColor: MLXArray
+        var metallicRoughness: MLXArray? = nil   // [N,2] metallic, roughness — only when pbrMaps
         if texture {
             t = Date(); MLXRandom.seed(seed &+ 1)
             let texSlat = FlowEulerSampler.sampleSLat(
@@ -288,6 +290,11 @@ public final class Trellis2Pipeline {
             let texOut = texDec(SparseTensor(feats: texSlatDenorm, coords: hrCoords), guidedMasks: subs)
             baseColor = MLX.clip(texOut.feats[0..., 0..<3] * 0.5 + 0.5, min: 0, max: 1)
             MLX.eval(baseColor)
+            if pbrMaps {   // upstream pbr_attr_layout: base_color 0..<3, metallic 3, roughness 4, alpha 5
+                let mr = MLX.clip(texOut.feats[0..., 3..<5] * 0.5 + 0.5, min: 0, max: 1)
+                MLX.eval(mr)
+                metallicRoughness = mr
+            }
             metrics.texDecodeS = -t.timeIntervalSinceNow
             log("  [5] tex decoded: \(texOut.count) voxels (\(String(format: "%.1f", metrics.texDecodeS ?? 0))s)")
         } else {
@@ -300,8 +307,8 @@ public final class Trellis2Pipeline {
         let remesh = remeshRes ?? (hrResolution >= 1536 ? 384 : 256)
         let (bakedInit, bakeMetrics) = try MeshBake.run(shapeFeats: shapeOut.feats, coords: shapeOut.coords, texBaseColor: baseColor,
                                      fineRes: Float(hrResolution), remeshRes: remesh,
-                                     targetFaces: targetFaces, atlasSize: 1024,
-                                     backend: unwrapBackend, log: log)
+                                     targetFaces: targetFaces, atlasSize: atlasSize,
+                                     backend: unwrapBackend, texMetallicRoughness: metallicRoughness, log: log)
         metrics.meshbakeS = -t.timeIntervalSinceNow
         metrics.bake = bakeMetrics
         var baked = bakedInit

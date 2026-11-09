@@ -200,66 +200,81 @@ public enum MeshBake {
         m.coveredTexelWrites = K
         log("  rasterized: \(K) covered texel-writes (5-pass conservative)")
 
-        // surface position per texel: Σ bary · verts[faces[fid]]
+        // surface position per texel: Σ bary · verts[faces[fid]] → closest point on the raw shell →
+        // trilinear sample, then the first-write-wins write at supersample resolution. CHUNKED over
+        // the K texel-writes (AB-A-0263): every op here is per texel, so a chunk computes exactly what
+        // the whole batch would, and chunks write in k order, so first-write-wins is unchanged. At a
+        // 1024 atlas K is ~12–13M — one chunk, the pre-chunking computation. At 4096 K is ~16× that,
+        // and the unchunked [K,3] intermediates took the run to ~100 GB.
         t = Date()
-        let faceVerts = finalMesh.faces.take(fid, axis: 0)                 // [K,3] vertex ids
-        let v0 = finalMesh.vertices.take(faceVerts[0..., 0], axis: 0)      // [K,3]
-        let v1 = finalMesh.vertices.take(faceVerts[0..., 1], axis: 0)
-        let v2 = finalMesh.vertices.take(faceVerts[0..., 2], axis: 0)
-        let posRaw = bary[0..., 0..<1] * v0 + bary[0..., 1..<2] * v1 + bary[0..., 2..<3] * v2   // [K,3]
-        // remap each texel position onto the original on-shell surface, so trilinear hits the thin PBR shell
-        let cp = origBVH.closestPoints(mesh: origMesh, queries: posRaw)
-        let pos = cp.points                                                                     // [K,3]
-        // diagnostic: does the remap land on a raw face whose normal opposes
-        // the texel's final-mesh face normal? (wrong-wall snap)
-        let fe1 = v1 - v0, fe2 = v2 - v0
-        let fnl = MLX.stacked([
-            fe1[0..., 1] * fe2[0..., 2] - fe1[0..., 2] * fe2[0..., 1],
-            fe1[0..., 2] * fe2[0..., 0] - fe1[0..., 0] * fe2[0..., 2],
-            fe1[0..., 0] * fe2[0..., 1] - fe1[0..., 1] * fe2[0..., 0],
-        ], axis: 1)
-        let rawFN = origMesh.faceNormals().take(cp.faceIndices, axis: 0)
-        let flipDot = (fnl * rawFN).sum(axis: 1)
-        MLX.eval(flipDot)
-        let flipArr = flipDot.asArray(Float.self)
-        MLX.eval(pos)
-        let query = ((pos + 0.5) * fineRes).reshaped([1, K, 3])
-        let sampled = GridSample3d.sample(feats: texBaseColor, coords: coords, grid: query, mode: "trilinear")[0]  // [K,3]
-        MLX.eval(sampled)
-        var mrSampled: [Float]? = nil
-        if let mr = texMetallicRoughness {
-            let mrS = GridSample3d.sample(feats: mr, coords: coords, grid: query, mode: "trilinear")[0]  // [K,2]
-            MLX.eval(mrS)
-            mrSampled = MLX.clip(mrS, min: 0, max: 1).asArray(Float.self)
-        }
-        m.bakeSampleS = -t.timeIntervalSinceNow   // BVH closest-point remap + GridSample3d trilinear
-        let qmin = query.min(), qmax = query.max()
-        let nonzero = (sampled.sum(axis: 1) .> 0).asType(.float32).mean().item(Float.self)
-        log("  bake diag: baseColor mean=\(texBaseColor.mean().item(Float.self))  query[\(qmin.item(Float.self))..\(qmax.item(Float.self))]  sampled mean=\(sampled.mean().item(Float.self))  hitFrac=\(nonzero)")
-
-        // 5) write texels + host-side dilation inpaint
-        t = Date()
-        let px = pix.asType(.int32).asArray(Int32.self)                   // [K*2]
-        let col = MLX.clip(sampled, min: 0, max: 1).asArray(Float.self)   // [K*3]
-        // --- write at supersample resolution, first-write-wins per sub-texel ---
+        let chunk = 16 * 1024 * 1024
         var ssRgb = [Float](repeating: 0, count: ssSize * ssSize * 3)
-        var ssMr = mrSampled != nil ? [Float](repeating: 0, count: ssSize * ssSize * 2) : []
+        var ssMr = texMetallicRoughness != nil ? [Float](repeating: 0, count: ssSize * ssSize * 2) : []
         var ssFilled = [Bool](repeating: false, count: ssSize * ssSize)
         var ssFlip = [Bool](repeating: false, count: ssSize * ssSize)
-        for k in 0..<K {
-            let x = Int(px[k*2]), y = Int(px[k*2+1])
-            if x < 0 || x >= ssSize || y < 0 || y >= ssSize { continue }  // jitter can push 1 texel out
-            let p = y * ssSize + x
-            if ssFilled[p] { continue }   // first write wins: center pass beats jitter passes
-            ssRgb[p*3] = col[k*3]; ssRgb[p*3+1] = col[k*3+1]; ssRgb[p*3+2] = col[k*3+2]
-            if let mrS = mrSampled { ssMr[p*2] = mrS[k*2]; ssMr[p*2+1] = mrS[k*2+1] }
-            ssFilled[p] = true
-            if flipArr[k] < 0 { ssFlip[p] = true }
+        let rawFaceNormals = origMesh.faceNormals()
+        var qmin = Float.infinity, qmax = -Float.infinity, hits = 0
+        var writeS = 0.0
+        for k0 in stride(from: 0, to: K, by: chunk) {
+            let k1 = min(K, k0 + chunk), n = k1 - k0
+            let fidC = fid[k0 ..< k1], baryC = bary[k0 ..< k1]
+            let faceVerts = finalMesh.faces.take(fidC, axis: 0)                // [n,3] vertex ids
+            let v0 = finalMesh.vertices.take(faceVerts[0..., 0], axis: 0)      // [n,3]
+            let v1 = finalMesh.vertices.take(faceVerts[0..., 1], axis: 0)
+            let v2 = finalMesh.vertices.take(faceVerts[0..., 2], axis: 0)
+            let posRaw = baryC[0..., 0..<1] * v0 + baryC[0..., 1..<2] * v1 + baryC[0..., 2..<3] * v2   // [n,3]
+            // remap each texel position onto the original on-shell surface, so trilinear hits the thin PBR shell
+            let cp = origBVH.closestPoints(mesh: origMesh, queries: posRaw)
+            let pos = cp.points                                                                     // [n,3]
+            // diagnostic: does the remap land on a raw face whose normal opposes
+            // the texel's final-mesh face normal? (wrong-wall snap)
+            let fe1 = v1 - v0, fe2 = v2 - v0
+            let fnl = MLX.stacked([
+                fe1[0..., 1] * fe2[0..., 2] - fe1[0..., 2] * fe2[0..., 1],
+                fe1[0..., 2] * fe2[0..., 0] - fe1[0..., 0] * fe2[0..., 2],
+                fe1[0..., 0] * fe2[0..., 1] - fe1[0..., 1] * fe2[0..., 0],
+            ], axis: 1)
+            let rawFN = rawFaceNormals.take(cp.faceIndices, axis: 0)
+            let flipDot = (fnl * rawFN).sum(axis: 1)
+            MLX.eval(flipDot)
+            let flipArr = flipDot.asArray(Float.self)
+            MLX.eval(pos)
+            let query = ((pos + 0.5) * fineRes).reshaped([1, n, 3])
+            let sampled = GridSample3d.sample(feats: texBaseColor, coords: coords, grid: query, mode: "trilinear")[0]  // [n,3]
+            MLX.eval(sampled)
+            var mrSampled: [Float]? = nil
+            if let mr = texMetallicRoughness {
+                let mrS = GridSample3d.sample(feats: mr, coords: coords, grid: query, mode: "trilinear")[0]  // [n,2]
+                MLX.eval(mrS)
+                mrSampled = MLX.clip(mrS, min: 0, max: 1).asArray(Float.self)
+            }
+            qmin = min(qmin, query.min().item(Float.self)); qmax = max(qmax, query.max().item(Float.self))
+            hits += (sampled.sum(axis: 1) .> 0).asType(.int32).sum().item(Int.self)
+
+            // 5) write texels (first-write-wins per sub-texel, in k order across chunks)
+            let tw = Date()
+            let px = pix[k0 ..< k1].asType(.int32).asArray(Int32.self)       // [n*2]
+            let col = MLX.clip(sampled, min: 0, max: 1).asArray(Float.self)   // [n*3]
+            for k in 0 ..< n {
+                let x = Int(px[k*2]), y = Int(px[k*2+1])
+                if x < 0 || x >= ssSize || y < 0 || y >= ssSize { continue }  // jitter can push 1 texel out
+                let p = y * ssSize + x
+                if ssFilled[p] { continue }   // first write wins: center pass beats jitter passes
+                ssRgb[p*3] = col[k*3]; ssRgb[p*3+1] = col[k*3+1]; ssRgb[p*3+2] = col[k*3+2]
+                if let mrS = mrSampled { ssMr[p*2] = mrS[k*2]; ssMr[p*2+1] = mrS[k*2+1] }
+                ssFilled[p] = true
+                if flipArr[k] < 0 { ssFlip[p] = true }
+            }
+            writeS += -tw.timeIntervalSinceNow
         }
+        let mrBaked = texMetallicRoughness != nil
+        m.bakeSampleS = -t.timeIntervalSinceNow - writeS   // BVH closest-point remap + GridSample3d trilinear
+        log("  bake diag: baseColor mean=\(texBaseColor.mean().item(Float.self))  query[\(qmin)..\(qmax)]  hitFrac=\(Float(hits) / Float(max(K, 1)))")
+        t = Date(timeIntervalSinceNow: -writeS)   // the write timer below picks up the per-chunk writes
 
         // --- box-average down to the final atlas ---
         var rgb = [Float](repeating: 0, count: atlasSize * atlasSize * 3)
-        var mrBuf = mrSampled != nil ? [Float](repeating: 0, count: atlasSize * atlasSize * 3) : []
+        var mrBuf = mrBaked ? [Float](repeating: 0, count: atlasSize * atlasSize * 3) : []
         var filled = [Bool](repeating: false, count: atlasSize * atlasSize)
         var wallFlipped = [Bool](repeating: false, count: atlasSize * atlasSize)
         for y in 0..<atlasSize {
@@ -272,7 +287,7 @@ public enum MeshBake {
                         let sp = (y * ss + sy) * ssSize + (x * ss + sx)
                         if ssFilled[sp] {
                             r += ssRgb[sp*3]; g += ssRgb[sp*3+1]; b += ssRgb[sp*3+2]
-                            if mrSampled != nil { m += ssMr[sp*2]; ro += ssMr[sp*2+1] }
+                            if mrBaked { m += ssMr[sp*2]; ro += ssMr[sp*2+1] }
                             if ssFlip[sp] { anyFlip = true }
                             cnt += 1
                         }
@@ -282,7 +297,7 @@ public enum MeshBake {
                 let p = y * atlasSize + x
                 let inv = 1 / Float(cnt)
                 rgb[p*3] = r * inv; rgb[p*3+1] = g * inv; rgb[p*3+2] = b * inv
-                if mrSampled != nil { mrBuf[p*3] = m * inv; mrBuf[p*3+1] = ro * inv }
+                if mrBaked { mrBuf[p*3] = m * inv; mrBuf[p*3+1] = ro * inv }
                 filled[p] = true
                 wallFlipped[p] = anyFlip
             }
@@ -300,7 +315,7 @@ public enum MeshBake {
         var mrFilled = filled   // copy BEFORE base-color inpaint mutates it
         dilateInpaint(&rgb, &filled, atlasSize, iterations: atlasSize)
         var mrRGBA: [UInt8]? = nil
-        if mrSampled != nil {
+        if mrBaked {
             dilateInpaint(&mrBuf, &mrFilled, atlasSize, iterations: atlasSize)
             var out = [UInt8](repeating: 255, count: atlasSize * atlasSize * 4)
             for p in 0..<(atlasSize * atlasSize) {

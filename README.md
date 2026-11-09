@@ -134,6 +134,58 @@ any request mode is accepted.
 `trellis2-gate`'s FIT section checks every lane, the manifest (which carries the res1536 lane, the
 largest) and the refusal.
 
+## Per-request options (v0.12.0)
+
+A host that keeps one package resident per lane sets each job's knobs through
+`ImageTo3DRequest.metaData` (`Trellis2RequestOptions`). Any key that is absent or `null` falls back
+to the configuration, so a request with no keys runs exactly the configured job.
+
+| Key | Values | Falls back to |
+|---|---|---|
+| `seed` | non-negative integer, or its decimal string for values past 2^53 | `seed` |
+| `steps` | 1…50 | `steps` |
+| `texture` | bool | `texture` |
+| `decimateFaces` | 1,000…2,000,000 | `decimateFaces` (else 120,000) |
+| `atlasSize` | 512, 1024, 2048, 4096 | 1024 |
+| `yUp` | bool | `yUpOutput` |
+| `pbrMaps` | bool: also write the metallic-roughness map (G = roughness, B = metallic) | false |
+
+A malformed value is refused (`PackageError.unsupportedRequestFeature`) before weights are touched.
+Nothing is clamped silently. `pbrMaps` needs `texture`, because there is no tex decode to read the
+map from otherwise.
+
+**Orientation.** With `yUp`, the mesh is +Y up, and the object's front faces +Z. The shoe's toe
+points +Z, and +Y is up for every asset checked. TRELLIS.2 builds the object in its own canonical
+frame, not in the input camera's frame. A frontal photo is therefore what a camera on +Z sees, but
+a 3/4 photo still comes out facing +Z. A silhouette sweep over the shoe put the photo's camera at
+60° yaw and 30° elevation.
+
+**Determinism.** The same image, options and lane give the same GLB bytes, within one process and
+across processes. That was checked at res512 and res1024. Two GPU scatter-adds used to sum in
+thread order, and float addition is not associative:
+- the simplifier's quadrics, in a Metal kernel with float atomics;
+- `vertexNormals`, via `at[].add`.
+
+They now sum on the CPU in face order. Before this change the final face count drifted by up to
+0.07 % between identical runs.
+
+**Atlas size and memory.** The bake supersamples 2×, so a 4096 atlas rasterizes an 8192² grid.
+Since v0.12.0 the per-texel stage runs in 16M-texel chunks. Before chunking, a 4096 atlas peaked at
+about 100 GB even at res512. At atlas 1024 the chunked stage is a single chunk, the same computation
+as before, with byte-identical output.
+
+`Trellis2Configuration.maxAtlasSize` (default 1024) caps what a request may ask for, and the res512
+lane's charge follows it. Measured peak phys for the dress with `pbrMaps` on:
+
+| res512 lane `maxAtlasSize` | Measured peak | Charged |
+|---|---|---|
+| 1024 | 30.54 GB | 34 GB |
+| 2048 | 34.73 GB | 38 GB |
+| 4096 | 43.59 GB | 48 GB |
+
+On the cascade lanes the HR stage stays the peak. res1536 with a 4096 atlas peaked at 65.23 GB,
+the same as with 1024, so their charges don't move.
+
 ## Engine and mlx-swift pins
 
 From v0.11.0 the package needs mlx-engine-swift `from: "0.74.1"` and the fleet's mlx-swift fork,

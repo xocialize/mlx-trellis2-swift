@@ -22,6 +22,13 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
     /// any request mode accepted — an app that roams tiers should then configure the highest one.
     /// A host that schedules against one memory budget (Gaea) registers one lane per tier.
     public var tierCeiling: Mode?
+
+    /// The largest `metaData["atlasSize"]` this registration accepts (AB-A-0263); a larger request is
+    /// refused. It is part of the footprint: the bake supersamples 2×, so a 4096 atlas rasterizes
+    /// 8192², and on res512 — where the bake, not the HR flow, is the peak — that moves the charge
+    /// (see `Trellis2Footprint.activationRes512(maxAtlasSize:)`). One of 512, 1024, 2048, 4096.
+    /// Default 1024 — v0.11.0's atlas and charges; a host offering larger textures raises it.
+    public var maxAtlasSize: Int
     public var modelsRootDirectory: URL?   // ModelStorable — the engine stamps the store root
 
     /// Explicit weights root (out-of-sandbox snapshot). When set, `load()` resolves the consolidated
@@ -108,7 +115,7 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
 
     /// Explicit Codable surface: everything except the `matting` closure (which decodes to nil).
     enum CodingKeys: String, CodingKey {
-        case quant, defaultMode, tierCeiling, modelsRootDirectory, weightsRootOverride
+        case quant, defaultMode, tierCeiling, maxAtlasSize, modelsRootDirectory, weightsRootOverride
         case steps, seed, texture, decimateFaces, yUpOutput, unwrapBackend, metricsPath
         case slatCfgAttention, texAttention, slatCfgInterval, slatCfgNegEvery, maxHRTokens
         case additionalViewsScope
@@ -117,6 +124,7 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
     public init(quant: Quant = .bf16,
                 defaultMode: Mode = ImageTo3DContract.res512,
                 tierCeiling: Mode? = nil,
+                maxAtlasSize: Int = 1024,
                 modelsRootDirectory: URL? = nil,
                 weightsRootOverride: URL? = nil,
                 steps: Int = 12,
@@ -136,6 +144,7 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
         self.quant = quant
         self.defaultMode = defaultMode
         self.tierCeiling = tierCeiling
+        self.maxAtlasSize = maxAtlasSize
         self.modelsRootDirectory = modelsRootDirectory
         self.weightsRootOverride = weightsRootOverride
         self.steps = steps
@@ -166,9 +175,11 @@ public typealias Trellis2Matting = @Sendable (Image) async throws -> Matte
 extension Trellis2Configuration {
     /// A lane pinned to `tier` (`defaultMode` and `tierCeiling` both set): the shape a host that
     /// charges per lane registers, one per tier. Every other knob keeps its default.
-    public static func lane(_ tier: Mode, modelsRootDirectory: URL? = nil,
+    /// `maxAtlasSize` bounds the per-request atlas; on res512 it sets the charge (34 / 38 / 48 GB at
+    /// 1024 / 2048 / 4096), on the cascade lanes it does not move it.
+    public static func lane(_ tier: Mode, maxAtlasSize: Int = 1024, modelsRootDirectory: URL? = nil,
                             weightsRootOverride: URL? = nil) -> Trellis2Configuration {
-        Trellis2Configuration(defaultMode: tier, tierCeiling: tier,
+        Trellis2Configuration(defaultMode: tier, tierCeiling: tier, maxAtlasSize: maxAtlasSize,
                               modelsRootDirectory: modelsRootDirectory, weightsRootOverride: weightsRootOverride)
     }
 
@@ -218,9 +229,22 @@ public enum Trellis2Footprint {
     /// Cascade resident (res1024 and res1536 alike): tex_512 swapped for shape_1024 + tex_1024 —
     /// generate() keeps only the tier's flows cached.
     public static let residentCascade: UInt64 = 31_000_000_000
-    /// res512 activation over resident: 30.54 − 24.78 = 5.8 GB measured on the largest shape SLat
-    /// in the corpus; declared 9 so the tier totals 34 GB.
+    /// res512 activation over resident at a 1024 atlas: 30.54 − 24.78 = 5.8 GB measured on the
+    /// largest shape SLat in the corpus; declared 9 so the tier totals 34 GB.
     public static let activationRes512: UInt64 = 9_000_000_000
+
+    /// res512 activation for a registration that accepts atlases up to `maxAtlasSize` (AB-A-0263).
+    /// On res512 the 2×-supersampled bake is the peak once the atlas grows (dress, pbrMaps on, peak
+    /// phys): 2048 → 34.73 GB, 4096 → 43.59 GB; declared 13 / 23 GB so the lane totals 38 / 48 GB.
+    /// The cascade lanes' HR stage stays above the bake (res1536 dress at 4096: 65.23 GB, the same
+    /// peak as at 1024), so their activation does not depend on the atlas.
+    public static func activationRes512(maxAtlasSize: Int) -> UInt64 {
+        switch maxAtlasSize {
+        case ...1024: activationRes512
+        case ...2048: 13_000_000_000
+        default: 23_000_000_000
+        }
+    }
     /// Cascade activation over resident, linear in HR tokens up to `measuredTokenCeiling`:
     /// 38 GB at 28,672 tokens (res1024's bound) and 41 GB at 32,768 (res1536's).
     public static let cascadeActivationBase: UInt64 = 17_000_000_000
@@ -247,7 +271,7 @@ extension Trellis2Configuration: FootprintConfigured {
         chargedTier.isCascade ? Trellis2Footprint.residentCascade : Trellis2Footprint.residentRes512
     }
     public var peakActivationBytesHint: UInt64? {
-        guard let tokens = hrTokenBound else { return Trellis2Footprint.activationRes512 }
+        guard let tokens = hrTokenBound else { return Trellis2Footprint.activationRes512(maxAtlasSize: maxAtlasSize) }
         return Trellis2Footprint.cascadeActivation(tokens: tokens)
     }
 }
@@ -475,6 +499,9 @@ public final class Trellis2Package: ModelPackage {
                     + "send it to the \(mode.rawValue) lane")
         }
 
+        // Per-request overrides (AB-A-0263): metaData keys over the configuration; malformed → refused here.
+        let options = try Trellis2RequestOptions(metaData: req.metaData, configuration: configuration)
+
         guard let pipeline else { throw PackageError.notLoaded }
 
         // Preprocess each input to DINOv3's NCHW [1,3,512,512]. RAW (no-usable-alpha) views are
@@ -539,7 +566,7 @@ public final class Trellis2Package: ModelPackage {
 
         // In-package SS constants (no goldens dir): the deterministic 16³ RoPE grid + seeded noise.
         let ssPhases = SSGrid.ropePhases(resolution: 16)
-        let ssNoise = SSGrid.noise(resolution: 16, seed: configuration.seed)
+        let ssNoise = SSGrid.noise(resolution: 16, seed: options.seed)
 
         // The pipeline's samplers/decoders honor cooperative cancellation at their step/layer seams
         // (they read the ambient Task); generate() is the long-running body.
@@ -550,26 +577,27 @@ public final class Trellis2Package: ModelPackage {
             ssNoise: ssNoise, ssPhases: ssPhases,
             shapeMean: MLXArray(shapeMean), shapeStd: MLXArray(shapeStd),
             texMean: MLXArray(texMean), texStd: MLXArray(texStd),
-            texture: configuration.texture, targetFaces: configuration.decimateFaces ?? 120_000,
-            yUp: configuration.yUpOutput,
+            texture: options.texture, targetFaces: options.decimateFaces,
+            yUp: options.yUp, atlasSize: options.atlasSize, pbrMaps: options.pbrMaps,
             unwrapBackend: configuration.unwrapBackend == "provenance" ? .provenance : .xatlas,
             slatCfgSDPA: configuration.slatCfgAttention.flatMap { SDPAPrecision(rawValue: $0) } ?? .fp32,
             texSDPA: configuration.texAttention.flatMap { SDPAPrecision(rawValue: $0) } ?? .bf16,
-            steps: configuration.steps,
+            steps: options.steps,
             slatCfgInterval: configuration.slatCfgInterval.flatMap { s -> (Float, Float)? in
                 let p = s.split(separator: ",").compactMap { Float($0.trimmingCharacters(in: .whitespaces)) }
                 return p.count == 2 && p[0] < p[1] ? (p[0], p[1]) : nil   // malformed -> upstream default
             },
             slatNegEvery: max(1, configuration.slatCfgNegEvery ?? 1),
             maxHRTokens: configuration.maxHRTokens,
-            seed: configuration.seed, log: { _ in })
+            seed: options.seed, log: { _ in })
         try Task.checkCancellation()
 
         let tGlb = Date()
         let glb = try GLTFExport.glbData(
             positions: baked.vertices, indices: baked.faces,
             normals: baked.normals, uvs: baked.uvs,
-            baseColorRGBA: (baked.texRGBA, baked.atlasSize, baked.atlasSize))
+            baseColorRGBA: (baked.texRGBA, baked.atlasSize, baked.atlasSize),
+            metallicRoughnessRGBA: options.pbrMaps ? baked.mrRGBA.map { ($0, baked.atlasSize, baked.atlasSize) } : nil)
         let glbExportS = -tGlb.timeIntervalSinceNow
         let mesh = Mesh(format: .glb, data: glb,
                         vertexCount: baked.vertices.dim(0), faceCount: baked.faces.dim(0),
@@ -591,6 +619,10 @@ public final class Trellis2Package: ModelPackage {
             rec["mesh_verts"] = baked.vertices.dim(0)
             rec["mesh_faces"] = baked.faces.dim(0)
             rec["atlas_size"] = baked.atlasSize
+            rec["pbr_maps"] = baked.mrRGBA != nil && options.pbrMaps
+            rec["y_up"] = options.yUp
+            rec["texture"] = options.texture
+            rec["target_faces"] = options.decimateFaces
             rec["glb_bytes"] = glb.count
             rec["gpu_peak_bytes"] = Int(Memory.peakMemory)
             // SDPA kernel lane (M5/NAX): MLX_ENABLE_TF32 defaults ON, so "fp32" SDPA runs

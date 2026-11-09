@@ -97,6 +97,52 @@ conditions the sparse-structure and shape flows on the primary image alone and g
 only to the texture flow, so extra views can add colour evidence without steering geometry.
 `views_scope` in the metrics record says which scope ran.
 
+## Footprint per tier (v0.11.0)
+
+Peak memory follows the number of HR tokens the cascade samples, not the tier's nominal
+resolution. Since v0.11.0 each cascade tier has a **hard HR token ceiling**
+(`Trellis2Tier.hrTokenCeiling`: res1024 28,672, res1536 32,768). An asset over the ceiling backs
+off in resolution, 128 at a time, below 1024 if it has to. That keeps each tier's declared
+footprint a bound rather than a typical case.
+
+| Lane | Resident | Activation | Charged | Worst measured peak (phys) |
+|---|---|---|---|---|
+| res512 | 25 GB | 9 GB | **34 GB** | 30.54 GB (dress, 4,856 tokens) |
+| res1024 | 31 GB | 38 GB | **69 GB** | 60.74 GB (hair, 25,977 tokens @1024) |
+| res1536 | 31 GB | 41 GB | **72 GB** | 65.23 GB (dress, 29,437 tokens, backed off to 1152) |
+
+Measurement setup:
+- Release build on an M5 Max with 128 GB, mlx-engine-swift 0.74.1 and xocialize/mlx-swift 0.32.4.
+- BiRefNet matting registered in the same process; inputs were the t31 corpus objects on white,
+  matted by it.
+- `phys_footprint` sampled every 200 ms by `trellis2-run-engine`, one fresh process per run.
+- Resident is phys after a run with MLX's cache cleared, BiRefNet included. The table is also in
+  `Trellis2Footprint`.
+
+**A host that schedules against one memory budget registers one lane per tier**,
+`Trellis2Configuration.lane(ImageTo3DContract.res1024)` and so on:
+- A lane sets `defaultMode` and `tierCeiling` to its tier.
+- `FootprintConfigured` reports that tier's resident and activation.
+- `run()` refuses a request above the lane's tier before touching weights
+  (`PackageError.unsupportedRequestFeature`); lower tiers fit inside its charge and run.
+- Setting `maxHRTokens` moves the bound, and the activation hint follows it. Past 32,768 tokens
+  it is charged at the older 1.55 MB/token slope.
+
+Without `tierCeiling` the configuration behaves as before: it is charged for `defaultMode`, and
+any request mode is accepted.
+
+`trellis2-gate`'s FIT section checks every lane, the manifest (which carries the res1536 lane, the
+largest) and the refusal.
+
+## Engine and mlx-swift pins
+
+From v0.11.0 the package needs mlx-engine-swift `from: "0.74.1"` and the fleet's mlx-swift fork,
+`xocialize/mlx-swift` `from: "0.32.4"`. The fork is upstream 0.32.3 plus ml-explore/mlx-swift#501,
+the quantized-load leak fix (AB-D-0208).
+
+v0.10.0 still named `ml-explore/mlx-swift`. That clashed with the engine's fork URL, and SwiftPM
+picked upstream, so apps lost the leak fix.
+
 ## Layout
 
 - `Sources/TRELLIS2/` — the library (all ported components).

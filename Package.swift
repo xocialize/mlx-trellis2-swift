@@ -21,14 +21,19 @@ let package = Package(
         // mlx-engine-swift declares `mlx-swift from: 0.31.5`, but a `path` dependency overrides the
         // version constraint (SPM uses the on-disk package for that identity), so the graph resolves
         // on 0.31.3. See the SW6 report for the exact conflict + resolution.
-        .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.31.5"),  // 0.31.6 de-risk-verified (M5 NAX/TF32 within cosine gates; no workaround needed)
+        // The fleet's mlx-swift fork (AB-D-0208): upstream 0.32.3 + ml-explore/mlx-swift#501, the
+        // quantized-load `_updateInternal` leak fix. mlx-engine-swift 0.74.1 declares this URL; keeping
+        // ml-explore's URL here fails resolution (same package identity, two URLs). Back to ml-explore
+        // `from: "0.33.0"` when the fleet retires the fork.
+        .package(url: "https://github.com/xocialize/mlx-swift", from: "0.32.4"),
         // (mlx-swift-mesh + SwiftXatlas are now VENDORED in-tree as the MLXMesh/Xatlas/Cxatlas targets
         //  below — self-contained, no external path deps; see THIRD_PARTY_LICENSES.md.)
         // MLXEngine contract + coordinator + conformance harness (URL-consumed like the sibling
         // -swift wrappers). imageTo3D stable since 1.12.0; 0.30.0 carries the split QuantFootprint,
         // MAT gate (MaterializationConformance) and CAN gate (CancellationConformance). 0.67.0: contract 1.52.0 added
         // `Image.Format.rawRGBA16`, which the exhaustive switch in ImagePreprocess.decodeCGImage names (AB-A-0158).
-        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.67.0"),
+        // 0.74.1: the mlx-swift leak-fix fork above, and GaeaPluginKit 0.11.1's floor (AB-A-0262).
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.74.1"),
         // First-run auto-materialization (MAT): HubClient snapshot download into the ModelStore layout.
         .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
         // Foreground matting for the run-engine harness driver ONLY (raw white-bg corpus inputs

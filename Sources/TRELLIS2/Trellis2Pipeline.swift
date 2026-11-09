@@ -225,11 +225,16 @@ public final class Trellis2Pipeline {
             let metalBudget = MTLCreateSystemDefaultDevice().map { Double($0.recommendedMaxWorkingSetSize) }
             let budgetBytes = min(metalBudget ?? physBudget, physBudget)
             let derivedCap = Int((budgetBytes - 5e9 - 28e9) / 1.55e6)
-            let tokenCap = min(49_152, maxHRTokens ?? max(12_000, derivedCap))
+            // AB-A-0262: the tier's token ceiling (`Trellis2Tier.hrTokenCeiling`) bounds the cap too, and
+            // is HARD — a grid still over it at 1024 keeps backing off — so the tier's declared
+            // footprint is a bound, not a typical case. An explicit `maxHRTokens` replaces the
+            // ceiling (and is hard the same way); the package's footprint hint follows it.
+            let ceiling = maxHRTokens.map { min(49_152, $0) } ?? tier.hrTokenCeiling ?? 49_152
+            let tokenCap = maxHRTokens != nil ? ceiling : min(ceiling, max(12_000, derivedCap))
             metrics.hrTokenCap = tokenCap
             (hrCoords, hrResolution) = CascadeQuantize.requantize(
                 upCoords: upCoords, lrResolution: 512, targetResolution: tier.targetResolution,
-                maxNumTokens: tokenCap)
+                maxNumTokens: tokenCap, hardMaxTokens: ceiling)
             MLX.eval(hrCoords)
             metrics.upsampleRequantizeS = -t.timeIntervalSinceNow
             metrics.hrTokens = hrCoords.dim(0)

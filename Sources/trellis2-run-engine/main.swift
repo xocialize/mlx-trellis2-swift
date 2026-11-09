@@ -101,8 +101,8 @@ do {
         mattePkgID = matteID
         let tMat = Date()
         _ = try await engine.prepare(.matting, package: matteID)
-        print(String(format: "[engine] matting: BiRefNet prepared in %.1fs (MATTING=off to disable)",
-                     -tMat.timeIntervalSinceNow))
+        print(String(format: "[engine] matting: BiRefNet prepared in %.1fs (MATTING=off to disable) | phys %.2f GB",
+                     -tMat.timeIntervalSinceNow, physFootprintGB()))
         matting = { image in
             let resp = try await engine.run(MattingRequest(image: image), package: matteID)
             guard let m = resp as? MattingResponse else { fatalError("unexpected matting response \(type(of: resp))") }
@@ -112,8 +112,14 @@ do {
         print("[engine] matting: OFF (raw inputs — background may leak into the mesh)")
     }
 
+    // Registered as a LANE pinned to the requested tier (AB-A-0262) — the shape a per-lane host
+    // (Gaea) uses — so prepare() is charged that tier's declared footprint.
+    let hrRes = env["HR_RES"].flatMap { Int($0) } ?? 512
+    let mode: Mode = hrRes == 1024 ? ImageTo3DContract.res1024
+                   : hrRes == 1536 ? ImageTo3DContract.res1536 : ImageTo3DContract.res512
     let pkgID = try await engine.register(Trellis2Package.registration,
                                           configuration: Trellis2Configuration(
+                                              defaultMode: mode, tierCeiling: mode,
                                               weightsRootOverride: weightsOverride,
                                               steps: steps,
                                               unwrapBackend: env["UNWRAP_BACKEND"],
@@ -126,17 +132,20 @@ do {
                                               additionalViewsScope: env["EXTRA_VIEWS_SCOPE"],
                                               matting: matting))
     print("[engine] registered packageID=\(pkgID) | backers(imageTo3D)=\(await engine.packages(for: .imageTo3D))")
+    let laneConfig = Trellis2Configuration(defaultMode: mode, tierCeiling: mode,
+                                           maxHRTokens: env["MAX_HR_TOKENS"].flatMap { Int($0) })
+    print(String(format: "[engine] declared for the %@ lane: resident %.2f GB + activation %.2f GB (HR token bound %@)",
+                 mode.rawValue, Double(laneConfig.residentBytesHint ?? 0) / 1e9,
+                 Double(laneConfig.peakActivationBytesHint ?? 0) / 1e9,
+                 laneConfig.hrTokenBound.map(String.init) ?? "n/a"))
 
     let tLoad = Date()
     _ = try await engine.prepare(.imageTo3D, package: pkgID)
     let afterLoad = await engine.memory
-    print(String(format: "[engine] prepare OK in %.1fs | charged %@ | resident %@ / budget %@",
+    print(String(format: "[engine] prepare OK in %.1fs | charged %@ | resident %@ / budget %@ | phys %.2f GB",
                  -tLoad.timeIntervalSinceNow, gb(afterLoad.residents[.imageTo3D] ?? 0),
-                 gb(afterLoad.residentBytes), gb(afterLoad.budgetBytes)))
+                 gb(afterLoad.residentBytes), gb(afterLoad.budgetBytes), physFootprintGB()))
 
-    let hrRes = env["HR_RES"].flatMap { Int($0) } ?? 512
-    let mode: Mode = hrRes == 1024 ? ImageTo3DContract.res1024
-                   : hrRes == 1536 ? ImageTo3DContract.res1536 : ImageTo3DContract.res512
     print("[engine] tier: \(mode.rawValue)")
 
     let tRun = Date()
@@ -145,7 +154,11 @@ do {
     try resp.mesh.data.write(to: URL(fileURLWithPath: outGLB))
 
     print(String(format: "[engine] run OK in %.0fs | GPU peak %.2f GB | peak phys %.2f GB",
-                 -tRun.timeIntervalSinceNow, Double(GPU.peakMemory)/1e9, peakPhys))
+                 -tRun.timeIntervalSinceNow, Double(Memory.peakMemory)/1e9, peakPhys))
+    // Post-run resident: the tier's lazily loaded flow DiTs are cached now; drop MLX's buffer pool
+    // so phys shows what stays resident between jobs (BiRefNet included).
+    MLX.Memory.clearCache()
+    print(String(format: "[engine] post-run resident phys (cache cleared) %.2f GB", physFootprintGB()))
     print("[engine] mesh: verts=\(resp.mesh.vertexCount ?? -1) faces=\(resp.mesh.faceCount ?? -1) "
         + "vertexColors=\(resp.mesh.hasVertexColors) bytes=\(resp.mesh.data.count)")
     print("[engine] engine-charged footprint(imageTo3D)=\(gb((await engine.memory).residents[.imageTo3D] ?? 0))")

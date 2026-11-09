@@ -146,9 +146,46 @@ print(cadence.summary)
 check("CAN-3 checkpoint cadence", cadence.passed)
 
 // ---------------------------------------------------------------------------------------------
+section("FIT (FootprintConformance) — manifest + one lane per tier (AB-A-0262)")
+
+let fitManifest = FootprintConformance.check(manifest: manifest)
+print(fitManifest.summary)
+check("FIT manifest", fitManifest.passed)
+var laneTotals: [UInt64] = []
+for tier in [ImageTo3DContract.res512, ImageTo3DContract.res1024, ImageTo3DContract.res1536] {
+    let lane = Trellis2Configuration.lane(tier)
+    let fit = FootprintConformance.check(manifest: manifest, configuration: lane)
+    print(fit.summary)
+    let total = (lane.residentBytesHint ?? 0) + (lane.peakActivationBytesHint ?? 0)
+    laneTotals.append(total)
+    check("FIT lane \(tier.rawValue)", fit.passed,
+          String(format: "resident %.0f + activation %.0f = %.0f GB, HR token bound %@",
+                 Double(lane.residentBytesHint ?? 0) / 1e9, Double(lane.peakActivationBytesHint ?? 0) / 1e9,
+                 Double(total) / 1e9, lane.hrTokenBound.map(String.init) ?? "n/a"))
+}
+check("lane footprints rise with the tier", laneTotals == laneTotals.sorted() && Set(laneTotals).count == 3)
+let worst = manifest.requirements.footprints.map { $0.residentBytes + $0.peakActivationBytes }.max() ?? 0
+check("manifest footprint = the res1536 lane (largest-footprint fallback never under-reserves)",
+      worst == laneTotals.last)
+// A lane refuses a request above its tier before weights (run() checks it ahead of notLoaded).
+do {
+    let lanePkg = Trellis2Package(configuration: .lane(ImageTo3DContract.res1024))
+    _ = try await lanePkg.run(ImageTo3DRequest(image: Image(format: .png, data: Data()),
+                                               mode: ImageTo3DContract.res1536))
+    check("res1024 lane refuses a res1536 request", false, "run() did not throw")
+} catch let PackageError.unsupportedRequestFeature(msg) {
+    check("res1024 lane refuses a res1536 request", true, msg)
+} catch {
+    check("res1024 lane refuses a res1536 request", false, "threw \(error)")
+}
+let roaming = Trellis2Configuration(defaultMode: ImageTo3DContract.res512)
+check("no tierCeiling = the pre-0.11 behaviour (charged for defaultMode)",
+      roaming.residentBytesHint == Trellis2Configuration.lane(ImageTo3DContract.res512).residentBytesHint)
+
+// ---------------------------------------------------------------------------------------------
 section("Result")
 if failures == 0 {
-    print("✅ ALL GATES PASSED (C0–C13 static + MAT-1..5 + CAN-1..3)")
+    print("✅ ALL GATES PASSED (C0–C13 static + MAT-1..5 + CAN-1..3 + FIT lanes)")
 } else {
     print("❌ \(failures) gate check(s) FAILED")
     exit(1)

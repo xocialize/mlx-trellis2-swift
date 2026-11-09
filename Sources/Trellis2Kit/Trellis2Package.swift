@@ -15,6 +15,13 @@ import TRELLIS2
 public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantConfigured {
     public var quant: Quant
     public var defaultMode: Mode
+
+    /// Pin this registration to one tier: a lane (AB-A-0262). When set, the footprint hints are this
+    /// tier's and `run()` refuses a request whose `mode` is ABOVE it (a lower tier fits inside the
+    /// lane's charge and runs). nil (default) = the pre-0.11 behaviour: charged for `defaultMode`,
+    /// any request mode accepted — an app that roams tiers should then configure the highest one.
+    /// A host that schedules against one memory budget (Gaea) registers one lane per tier.
+    public var tierCeiling: Mode?
     public var modelsRootDirectory: URL?   // ModelStorable — the engine stamps the store root
 
     /// Explicit weights root (out-of-sandbox snapshot). When set, `load()` resolves the consolidated
@@ -101,7 +108,7 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
 
     /// Explicit Codable surface: everything except the `matting` closure (which decodes to nil).
     enum CodingKeys: String, CodingKey {
-        case quant, defaultMode, modelsRootDirectory, weightsRootOverride
+        case quant, defaultMode, tierCeiling, modelsRootDirectory, weightsRootOverride
         case steps, seed, texture, decimateFaces, yUpOutput, unwrapBackend, metricsPath
         case slatCfgAttention, texAttention, slatCfgInterval, slatCfgNegEvery, maxHRTokens
         case additionalViewsScope
@@ -109,6 +116,7 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
 
     public init(quant: Quant = .bf16,
                 defaultMode: Mode = ImageTo3DContract.res512,
+                tierCeiling: Mode? = nil,
                 modelsRootDirectory: URL? = nil,
                 weightsRootOverride: URL? = nil,
                 steps: Int = 12,
@@ -127,6 +135,7 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
                 matting: Trellis2Matting? = nil) {
         self.quant = quant
         self.defaultMode = defaultMode
+        self.tierCeiling = tierCeiling
         self.modelsRootDirectory = modelsRootDirectory
         self.weightsRootOverride = weightsRootOverride
         self.steps = steps
@@ -152,31 +161,94 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
 /// is a failed generation, not a silent full-frame fallback).
 public typealias Trellis2Matting = @Sendable (Image) async throws -> Matte
 
-// MARK: - Per-tier footprint hints (contract 1.13/1.14 FootprintConfigured)
+// MARK: - Per-tier footprints (contract 1.13/1.14 FootprintConfigured; AB-A-0262)
 
-extension Trellis2Configuration: FootprintConfigured {
-    /// Per-tier charging (same quant, very different working sets — the BiRefNet pattern).
-    /// Keyed on the CONFIGURED defaultMode: an app that pins a tier is charged that tier.
-    /// A per-request mode override above the configured tier is not re-charged (same gap as
-    /// BiRefNet); apps that roam tiers should configure the highest one they use.
-    ///   res512  — resident 18 GB (SS + shape_512 + tex_512 fp32 + DINOv3 + decoders ≈ 17.3),
-    ///             activation 18 GB (conservative carry-over of the pre-T0.3 measured transient;
-    ///             true res512 decodes at 512, well under it).
-    ///   res1024 — resident 23 GB (cascade set), activation 26 GB (measured peak phys 46.76 GB).
-    ///   res1536 — nil ⇒ falls through to the manifest QuantFootprint (23 + 56, measured 76.97).
-    public var residentBytesHint: UInt64? {
-        switch defaultMode {
-        case ImageTo3DContract.res512: 18_000_000_000
-        case ImageTo3DContract.res1024: 23_000_000_000
-        default: nil
+extension Trellis2Configuration {
+    /// A lane pinned to `tier` (`defaultMode` and `tierCeiling` both set): the shape a host that
+    /// charges per lane registers, one per tier. Every other knob keeps its default.
+    public static func lane(_ tier: Mode, modelsRootDirectory: URL? = nil,
+                            weightsRootOverride: URL? = nil) -> Trellis2Configuration {
+        Trellis2Configuration(defaultMode: tier, tierCeiling: tier,
+                              modelsRootDirectory: modelsRootDirectory, weightsRootOverride: weightsRootOverride)
+    }
+
+    /// The tier the footprint is declared for: the lane's ceiling, else the default mode.
+    public var chargedTier: Trellis2Tier { Trellis2Tier(mode: tierCeiling ?? defaultMode) }
+
+    /// The HR token bound the charged tier runs under: an explicit `maxHRTokens`, else the tier's
+    /// `hrTokenCeiling` (nil for res512, which has no HR pass). The pipeline enforces it as a hard
+    /// cap, so the footprint below is a bound.
+    public var hrTokenBound: Int? {
+        guard chargedTier.isCascade else { return nil }
+        return maxHRTokens.map { min(49_152, $0) } ?? chargedTier.hrTokenCeiling
+    }
+}
+
+extension Trellis2Tier {
+    /// The tier a request or configuration `Mode` names (anything unrecognised is res512, as in run()).
+    public init(mode: Mode) {
+        switch mode {
+        case ImageTo3DContract.res1536: self = .res1536
+        case ImageTo3DContract.res1024: self = .res1024
+        default: self = .res512
         }
     }
+    /// Order for the lane check: res512 < res1024 < res1536.
+    var rank: Int { switch self { case .res512: 0; case .res1024: 1; case .res1536: 2 } }
+}
+
+/// Measured per-tier footprints (AB-A-0262): Release, M5 Max 128 GB, mlx-engine-swift 0.74.1 +
+/// xocialize/mlx-swift 0.32.4, BiRefNet matting registered in the same process, phys_footprint
+/// sampled every 200 ms through `trellis2-run-engine` (one fresh process per run). README
+/// "Footprint per tier" has the table and the receipt.
+///
+///   tier     asset   HR tokens (res)    peak phys   post-run resident phys
+///   res512   dress    4,856 (512)        30.54 GB    24.78 GB
+///   res1024  dress   22,644 (1024)       57.50 GB    30.83 GB
+///   res1024  hair    25,977 (1024)       60.74 GB    30.85 GB
+///   res1536  shoes   21,189 (1536)       59.62 GB    30.77 GB
+///   res1536  dress   29,437 (1152)       65.23 GB    30.73 GB
+///
+/// Resident is phys after a run with MLX's cache cleared (the tier's flows cached, BiRefNet's
+/// ~1 GB included, which keeps it on the safe side). The cascade activation is a line in HR tokens
+/// through the measured cascade peaks plus ~7 % headroom, charged at the tier's token bound.
+public enum Trellis2Footprint {
+    /// res512 resident: SS DiT + SS decoder + shape/tex decoders + DINOv3 + shape_512 + tex_512.
+    public static let residentRes512: UInt64 = 25_000_000_000
+    /// Cascade resident (res1024 and res1536 alike): tex_512 swapped for shape_1024 + tex_1024 —
+    /// generate() keeps only the tier's flows cached.
+    public static let residentCascade: UInt64 = 31_000_000_000
+    /// res512 activation over resident: 30.54 − 24.78 = 5.8 GB measured on the largest shape SLat
+    /// in the corpus; declared 9 so the tier totals 34 GB.
+    public static let activationRes512: UInt64 = 9_000_000_000
+    /// Cascade activation over resident, linear in HR tokens up to `measuredTokenCeiling`:
+    /// 38 GB at 28,672 tokens (res1024's bound) and 41 GB at 32,768 (res1536's).
+    public static let cascadeActivationBase: UInt64 = 17_000_000_000
+    public static let activationPerHRToken: Double = 3_000_000_000 / 4_096
+    /// Past the largest token bound that was measured toward, an explicit `maxHRTokens` is charged
+    /// the pre-0.73-engine slope (1.55 MB/token, BENCHMARKS.md) — the conservative one.
+    public static let measuredTokenCeiling = 32_768
+    public static let activationPerHRTokenBeyond: Double = 1_550_000
+
+    /// Activation for a cascade run of at most `tokens` HR tokens.
+    public static func cascadeActivation(tokens: Int) -> UInt64 {
+        let inRange = min(tokens, measuredTokenCeiling), beyond = max(0, tokens - measuredTokenCeiling)
+        let bytes = Double(cascadeActivationBase) + activationPerHRToken * Double(inRange)
+            + activationPerHRTokenBeyond * Double(beyond)
+        return UInt64(bytes.rounded(.up))
+    }
+}
+
+extension Trellis2Configuration: FootprintConfigured {
+    /// Per-tier charging, keyed on `chargedTier` (the lane's `tierCeiling`, else `defaultMode`).
+    /// Without a `tierCeiling` a request above the configured tier is not re-charged; with one it is
+    /// refused, so a lane's charge holds. Numbers: `Trellis2Footprint`.
+    public var residentBytesHint: UInt64? {
+        chargedTier.isCascade ? Trellis2Footprint.residentCascade : Trellis2Footprint.residentRes512
+    }
     public var peakActivationBytesHint: UInt64? {
-        switch defaultMode {
-        case ImageTo3DContract.res512: 18_000_000_000
-        case ImageTo3DContract.res1024: 26_000_000_000
-        default: nil
-        }
+        guard let tokens = hrTokenBound else { return Trellis2Footprint.activationRes512 }
+        return Trellis2Footprint.cascadeActivation(tokens: tokens)
     }
 }
 
@@ -314,9 +386,13 @@ public final class Trellis2Package: ModelPackage {
                 //     + the LR full-decode upsample (1.7M voxels) + O(T²) SLat self-attention (≤49,152
                 //     HR tokens). Bare-CLI (ungoverned buffer pool) ratchets to ~112 GB — the engine's
                 //     bounded pool is the admission-basis environment.
+                // AB-A-0262 (v0.11.0): the res1536 numbers are now its lane's — resident cascade + the
+                // activation at the tier's hard HR token ceiling (32,768) — from `Trellis2Footprint`.
+                // A host's largest-footprint fallback is therefore still the worst tier.
                 footprints: [QuantFootprint(quant: .bf16,
-                                            residentBytes: 23_000_000_000,
-                                            peakActivationBytes: 56_000_000_000)],
+                                            residentBytes: Trellis2Footprint.residentCascade,
+                                            peakActivationBytes: Trellis2Footprint.cascadeActivation(
+                                                tokens: Trellis2Tier.res1536.hrTokenCeiling ?? 49_152))],
                 requiredBackends: [.metalGPU],
                 os: OSRequirement(minMacOS: SemanticVersion(major: 26, minor: 0, patch: 0)),
                 chipFloor: .pro),
@@ -387,17 +463,19 @@ public final class Trellis2Package: ModelPackage {
         guard request.capability == .imageTo3D, let req = request as? ImageTo3DRequest else {
             throw PackageError.unsupportedCapability(request.capability)
         }
-        guard let pipeline else { throw PackageError.notLoaded }
-
         // Resolution tier (voxel grid): res512 = direct 512 flows; res1024/res1536 = the T0.3
         // cascade (LR 512 pass → decoder-upsample re-quantization → HR 1024 flows, token
         // back-off floor 1024).
         let mode = req.mode ?? configuration.defaultMode
-        let tier: Trellis2Tier = switch mode {
-        case ImageTo3DContract.res1536: .res1536
-        case ImageTo3DContract.res1024: .res1024
-        default: .res512
+        let tier = Trellis2Tier(mode: mode)
+        // A lane (`tierCeiling`) is charged for its own tier; a higher one would out-spend that charge.
+        if let ceiling = configuration.tierCeiling, tier.rank > Trellis2Tier(mode: ceiling).rank {
+            throw PackageError.unsupportedRequestFeature(
+                "mode \(mode.rawValue) is above this registration's tier \(ceiling.rawValue) (tierCeiling); "
+                    + "send it to the \(mode.rawValue) lane")
         }
+
+        guard let pipeline else { throw PackageError.notLoaded }
 
         // Preprocess each input to DINOv3's NCHW [1,3,512,512]. RAW (no-usable-alpha) views are
         // matted first through the app-injected `configuration.matting` hook (T0.4 — e.g. the shipped
@@ -514,7 +592,7 @@ public final class Trellis2Package: ModelPackage {
             rec["mesh_faces"] = baked.faces.dim(0)
             rec["atlas_size"] = baked.atlasSize
             rec["glb_bytes"] = glb.count
-            rec["gpu_peak_bytes"] = Int(GPU.peakMemory)
+            rec["gpu_peak_bytes"] = Int(Memory.peakMemory)
             // SDPA kernel lane (M5/NAX): MLX_ENABLE_TF32 defaults ON, so "fp32" SDPA runs
             // the NAX kernel with TF32 (10-bit-mantissa) matmuls on gen>=17 GPUs unless
             // explicitly disabled. State the lane with every timing.

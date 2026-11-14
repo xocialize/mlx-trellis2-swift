@@ -29,6 +29,8 @@ let isMV = env["PIXAL3D_MV"] == "1" || run.contains("_mv")
 let allSections = ["camera", "dino", "proj", "naf", "cond", "blocks", "vel", "sample", "hr", "mesh", "e2e"]
 let sections = Set((env["PIXAL3D_SECTIONS"] ?? allSections.joined(separator: ",")).split(separator: ",").map(String.init))
 let gdir = "\(goldRoot)/\(run)/golden"
+// PIXAL3D_STAGES limits the flow sections (blocks/vel/sample) to some stages: ss,shape512,shape1024,tex1024
+let stageFilter = env["PIXAL3D_STAGES"].map { Set($0.split(separator: ",").map(String.init)) }
 
 func G(_ f: String) -> [String: MLXArray] {
     do { return try loadArrays(url: URL(fileURLWithPath: "\(gdir)/\(f).safetensors")) }
@@ -188,8 +190,13 @@ if sections.contains("naf") {
             let R = st == .shape512 ? 32 : Int(scalar(G("\(stageNames[st]!).cond")["grid_resolution"]!))
             let n = Pixal3DProjection.normalizedCoords(coords: pt["coords"]!, grid: R, calcMat: calc[0], fovX: cams[0].fovX,
                                                        meshScale: cams[0].meshScale, imageSize: st.imageSize)
-            cosGate("PROJ    \(stageNames[st]!) at tokens HR half (our NAF)",
-                    Pixal3DProjection.sampleBilinear(map, n), pt["feats"]![0..., 1024...], 0.999)
+            let full = Pixal3DProjection.sampleBilinear(map, n)
+            cosGate("PROJ    \(stageNames[st]!) at tokens HR half (our NAF)", full, pt["feats"]![0..., 1024...], 0.999)
+            let q = cond.naf.queries(guide: g["guide"]!, target: st.nafTarget!)
+            let banded = cond.naf.sample(queries: q, features: g["lr_features"]!, at: n)
+            let mx = maxAbs(banded, full)
+            gate("NAF     \(stageNames[st]!) banded corner sampling == full map", mx < 1e-4,
+                 String(format: "max|Δ|=%.2e over %d tokens", mx, n.dim(0)))
         }
         MLX.Memory.clearCache()
     }
@@ -253,7 +260,7 @@ var ourSamples: [Pixal3DStage: MLXArray] = [:]
 
 let flowSections = sections.intersection(["blocks", "vel", "sample"])
 if !flowSections.isEmpty {
-    for st in Pixal3DStage.allCases {
+    for st in Pixal3DStage.allCases where stageFilter?.contains(st.rawValue) ?? true {
         let sn = stageNames[st]!
         let gc = goldCond(st)
         let concat: MLXArray? = st == .tex1024 ? G("tex1024.concat_cond")["feats"]! : nil
@@ -416,57 +423,107 @@ if sections.contains("mesh") {
 }
 
 // ===== full Swift chain with golden noise (conditioning from the golden images) =====
+// Two chains. ANCHORED (the gate): everything is ours — conditioning, every sampler, the decoders —
+// except the two topology decisions (SS occupancy coords, HR requantized coords), which take the
+// oracle's; that is this repo's parity methodology for topology-adaptive stages (README "Parity
+// methodology": inject the oracle's topology, free-run divergence is fp tie-nondeterminism).
+// FREE (measured, not gated): no injection at all; diagnostics below show where it parts ways.
 if sections.contains("e2e") {
     let ssN = G("ss.noise")["value"]!
     // per-token noise follows the coords: golden rows where our coords match the oracle's, seeded otherwise
     func noiseFor(_ st: String) -> (MLXArray) -> MLXArray {
         let g = G("\(st).noise")
-        let keys = packedKeys(g["coords"]!)
-        var idx = [Int64: Int](); for (i, k) in keys.enumerated() { idx[k] = i }
+        var idx = [Int64: Int32](); for (i, k) in packedKeys(g["coords"]!).enumerated() { idx[k] = Int32(i) }
         let feats = g["feats"]!
         return { coords in
             let ks = packedKeys(coords)
+            MLXRandom.seed(12345)
             let fill = MLXRandom.normal([ks.count, 32])
-            let rows = ks.enumerated().map { (i, k) -> MLXArray in idx[k].map { feats[$0 ..< ($0 + 1)] } ?? fill[i ..< (i + 1)] }
-            return MLX.concatenated(rows, axis: 0)
+            let both = MLX.concatenated([feats, fill], axis: 0)
+            let rows = ks.enumerated().map { (i, k) in idx[k] ?? Int32(feats.dim(0) + i) }
+            return both.take(MLXArray(rows), axis: 0)
         }
     }
-    var cap: [String: [String: MLXArray]] = [:]
-    let t = Date()
-    let out = try pipe.generatePixal3D(
-        tier: .res1024, views: views, multiViewWeights: isMV, ssPhases: ssPhases,
-        shapeMean: sMean, shapeStd: sStd, texMean: tMean, texStd: tStd,
-        noise: Pixal3DNoise(ss: ssN), noiseFn: ["shape512": noiseFor("shape512"), "shape1024": noiseFor("shape1024"),
-                                                 "tex": noiseFor("tex1024")],
-        bake: false, capture: { cap[$0] = $1 }, log: { print($0) })
-    let genS = -t.timeIntervalSinceNow
-    print(String(format: "PX3D e2e generate (no bake): %.1fs, hr=%d", genS, out.hrResolution))
-    // coords
-    let ssGold = Set(packedKeys(G("ss.coords")["value"]!)), ssOurs = Set(packedKeys(cap["ss"]!["coords"]!))
-    let ssIoU = Float(ssGold.intersection(ssOurs).count) / Float(ssGold.union(ssOurs).count)
-    gate("E2E     ss coords", ssIoU >= 0.99, String(format: "ours=%d oracle=%d IoU=%.5f", ssOurs.count, ssGold.count, ssIoU), Double(ssIoU))
-    let hrGold = Set(packedKeys(G("shape1024.noise")["coords"]!)), hrOurs = Set(packedKeys(cap["hr"]!["coords"]!))
-    let hrIoU = Float(hrGold.intersection(hrOurs).count) / Float(hrGold.union(hrOurs).count)
-    gate("E2E     HR tokens", hrIoU >= 0.98, String(format: "ours=%d oracle=%d IoU=%.5f", hrOurs.count, hrGold.count, hrIoU), Double(hrIoU))
-    // latents on the shared coords
     func onShared(_ ours: MLXArray, _ oursCoords: MLXArray, _ gold: MLXArray, _ goldCoords: MLXArray) -> (MLXArray, MLXArray) {
         var gi = [Int64: Int](); for (i, k) in packedKeys(goldCoords).enumerated() { gi[k] = i }
         var a = [Int32](), b = [Int32]()
         for (i, k) in packedKeys(oursCoords).enumerated() { if let j = gi[k] { a.append(Int32(i)); b.append(Int32(j)) } }
         return (ours.take(MLXArray(a), axis: 0), gold.take(MLXArray(b), axis: 0))
     }
-    for (st, key) in [("shape512", "shape512"), ("shape1024", "shape1024"), ("tex1024", "tex1024")] {
-        let g = G("\(st).samples")
-        let (o, gg) = onShared(cap[key]!["samples"]!, cap[key]!["coords"]!, g["feats"]!, g["coords"]!)
-        cosGate("E2E     \(st) latent (shared coords)", o, gg, 0.99, extra: " [\(o.dim(0)) shared]")
+    let goldSS = G("ss.coords")["value"]!, goldHR = G("shape1024.noise")["coords"]!
+    for anchored in [true, false] {
+        let tag = anchored ? "E2E     " : "E2EFREE "
+        var cap: [String: [String: MLXArray]] = [:]
+        let t = Date()
+        let out = try pipe.generatePixal3D(
+            tier: .res1024, views: views, multiViewWeights: isMV, ssPhases: ssPhases,
+            shapeMean: sMean, shapeStd: sStd, texMean: tMean, texStd: tStd,
+            noise: Pixal3DNoise(ss: ssN), noiseFn: ["shape512": noiseFor("shape512"), "shape1024": noiseFor("shape1024"),
+                                                     "tex": noiseFor("tex1024")],
+            topology: anchored ? (goldSS, goldHR) : nil,
+            bake: false, capture: { cap[$0] = $1 }, log: { print($0) })
+        print(String(format: "PX3D %@chain (%@): generate %.1fs (no bake), hr=%d", tag, anchored ? "oracle topology" : "free-running",
+                     -t.timeIntervalSinceNow, out.hrResolution))
+        func report(_ name: String, _ ok: Bool, _ detail: String, _ v: Double? = nil) {
+            if anchored { gate(name, ok, detail, v) } else { print("PX3D \(name): \(detail)  [measured]"); results.append(["gate": name, "measured": true, "detail": detail, "value": v ?? 0]) }
+        }
+        let ssGold = Set(packedKeys(goldSS)), ssOurs = Set(packedKeys(cap["ss"]!["coords"]!))
+        let ssIoU = Float(ssGold.intersection(ssOurs).count) / Float(ssGold.union(ssOurs).count)
+        let hrGold = Set(packedKeys(goldHR)), hrOurs = Set(packedKeys(cap["hr"]!["coords"]!))
+        let hrIoU = Float(hrGold.intersection(hrOurs).count) / Float(hrGold.union(hrOurs).count)
+        if !anchored {
+            report(tag + "ss coords", ssIoU >= 0.99, String(format: "ours=%d oracle=%d IoU=%.5f", ssOurs.count, ssGold.count, ssIoU), Double(ssIoU))
+            report(tag + "HR tokens", hrIoU >= 0.98, String(format: "ours=%d oracle=%d IoU=%.5f", hrOurs.count, hrGold.count, hrIoU), Double(hrIoU))
+        } else {
+            // our requantize of our own (anchored-chain) LR latent, for the record
+            let (q, _) = Pixal3DProjection.requantize(upCoords: cap["hr"]!["up_coords"]!, lrResolution: 512, targetResolution: 1024)
+            let qs = Set(packedKeys(q))
+            print(String(format: "PX3D %@note: requantize of this chain's own LR latent → %d tokens, IoU %.5f vs the oracle's",
+                         tag, qs.count, Float(qs.intersection(hrGold).count) / Float(qs.union(hrGold).count)))
+        }
+        for st in ["shape512", "shape1024", "tex1024"] {
+            let g = G("\(st).samples")
+            let (o, gg) = onShared(cap[st]!["samples"]!, cap[st]!["coords"]!, g["feats"]!, g["coords"]!)
+            let c = cosine(o, gg)
+            report(tag + "\(st) latent", c >= 0.99, String(format: "cosine=%.6f on %d shared tokens (≥ 0.990)", c, o.dim(0)), Double(c))
+        }
+        let dec = cap["shape_decoded"]!
+        let rawV = pipe.pixal3dRawMeshFromDecoded(feats: dec["feats"]!, coords: dec["coords"]!, resolution: out.hrResolution)
+        let ch = chamfer(rawV.asType(.float32).asArray(Float.self), goldMesh, res: Float(out.hrResolution))
+        report(tag + "mesh vs oracle raw mesh", ch.f1 >= 0.90 && ch.meanAB <= 1 && ch.meanBA <= 1,
+               String(format: "verts ours=%d oracle=%d chamfer ours→oracle=%.3f oracle→ours=%.3f vox, p99=%.3f, F@0.5=%.4f F@1=%.4f (gate F@1 ≥ 0.90, chamfer ≤ 1)",
+                      rawV.dim(0), goldMesh.count / 3, ch.meanAB, ch.meanBA, ch.p99, ch.f05, ch.f1), Double(ch.f1))
+        if !anchored {
+            // DIAG 1 — the SS flips sit on the occupancy knife-edge: max child logit (64³ → 32³) of each
+            // flipped voxel, from the oracle's own SS latent decoded by our (exact) decoder.
+            let logits = pipe.pixal3dSSLogits(G("ss.samples")["value"]!)       // [32,32,32] max child logit
+            let flips = ssGold.symmetricDifference(ssOurs)
+            let L = logits.asArray(Float.self)
+            func lg(_ k: Int64) -> Float { L[Int((k >> 32) & 0xFFFF) * 1024 + Int((k >> 16) & 0xFFFF) * 32 + Int(k & 0xFFFF)] }
+            let flipL = flips.map { abs(lg($0)) }.sorted()
+            let occL = ssGold.map { abs(lg($0)) }.sorted()
+            print(String(format: "PX3D DIAG    ss flips: %d voxels; |max child logit| at flips: max %.3f median %.3f — occupied voxels' median %.3f",
+                         flips.count, flipL.last ?? 0, flipL.isEmpty ? 0 : flipL[flipL.count / 2], occL[occL.count / 2]))
+            // DIAG 2 — token-set sensitivity of the CFG sampler, inside our own port: the shape-512 sampler
+            // with the oracle's conditioning and noise rows, on the oracle's coords vs this chain's coords.
+            let gc = goldCond(.shape512)
+            let f512 = try pipe.pixal3dFlow(.shape512(multiView: isMV))
+            let ourCoords = cap["ss"]!["coords"]!
+            let cOurs = cond.condition(views, stage: .shape512, coords: ourCoords, grid: 32)
+            let p = samplerParams[.shape512]!
+            let a = FlowEulerSampler.sampleSLat(model: f512, noiseFeats: noiseFor("shape512")(goldSS), coords: goldSS,
+                                                cond: gc.global, negCond: zeros5, proj: goldCond(.shape512).proj,
+                                                guidanceStrength: p.g, guidanceRescale: p.r, guidanceInterval: p.iv, rescaleT: p.rt)
+            let b = FlowEulerSampler.sampleSLat(model: f512, noiseFeats: noiseFor("shape512")(ourCoords), coords: ourCoords,
+                                                cond: gc.global, negCond: zeros5, proj: cOurs.proj,
+                                                guidanceStrength: p.g, guidanceRescale: p.r, guidanceInterval: p.iv, rescaleT: p.rt)
+            let (bb, aa) = onShared(b, ourCoords, a, goldSS)
+            print(String(format: "PX3D DIAG    shape512 sampler, ours vs ours: oracle coords vs this chain's coords (%d vs %d tokens) → cosine %.6f on %d shared",
+                         goldSS.dim(0), ourCoords.dim(0), cosine(bb, aa), bb.dim(0)))
+            pipe.releasePixal3D(); MLX.Memory.clearCache()
+        }
+        pipe.releasePixal3D(); MLX.Memory.clearCache()
     }
-    // mesh
-    let dec = cap["shape_decoded"]!
-    let rawV = pipe.pixal3dRawMeshFromDecoded(feats: dec["feats"]!, coords: dec["coords"]!, resolution: out.hrResolution)
-    let ch = chamfer(rawV.asType(.float32).asArray(Float.self), goldMesh, res: Float(out.hrResolution))
-    gate("E2E     mesh (full chain) vs oracle raw mesh", ch.f1 >= 0.90 && ch.meanAB <= 1 && ch.meanBA <= 1,
-         String(format: "verts ours=%d oracle=%d chamfer ours→oracle=%.3f oracle→ours=%.3f vox, p99=%.3f, F@0.5=%.4f F@1=%.4f",
-                rawV.dim(0), goldMesh.count / 3, ch.meanAB, ch.meanBA, ch.p99, ch.f05, ch.f1), Double(ch.f1))
 }
 
 print(String(format: "PX3D total %.1fs", -t0All.timeIntervalSinceNow))

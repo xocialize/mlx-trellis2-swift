@@ -4,7 +4,11 @@ import TRELLIS2
 
 // SW1 smoke gate: prove the package builds, MLXMesh links, and the .npy golden
 // fixtures load into MLXArrays (the parity-gate substrate for SW2+).
-let goldens = "/Volumes/Satechi/TrellisRedux/trellis2-port/goldens"
+// Paths (2026-11-14): TrellisRedux moved to DEV_VOL1 and the upstream ckpts are gone; the consolidated
+// snapshot carries the same tensors under the module keys. Override with TRELLIS2_GOLDENS / TRELLIS2_WEIGHTS.
+let env = ProcessInfo.processInfo.environment
+let goldens = env["TRELLIS2_GOLDENS"] ?? "/Volumes/DEV_VOL1/TrellisRedux/trellis2-port/goldens"
+let weights = env["TRELLIS2_WEIGHTS"] ?? "/Volumes/DEV_VOL1/Models/models--xocialize--trellis2-mlx"
 
 func golden(_ name: String) throws -> MLXArray {
     try loadArray(url: URL(fileURLWithPath: "\(goldens)/\(name).npy"))
@@ -111,7 +115,7 @@ print("[SW3] transformer block cosine = \(blkCos)  maxAbs = \(MLX.abs(blkOut - b
 print(blkCos >= 0.999 ? "SW3 BLOCK GATE PASS" : "SW3 BLOCK GATE FAIL")
 
 // --- SW3: FULL SS-DiT forward parity (the whole-model gate) ---
-let ssPath = "/Volumes/Satechi/TrellisRedux/models/models--microsoft--TRELLIS.2-4B/snapshots/af44b45f2e35a493886929c6d786e563ec68364d/ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors"
+let ssPath = "\(weights)/struct_flow.safetensors"
 let ssW = try loadArrays(url: URL(fileURLWithPath: ssPath))
 print("[SW3] loaded SS-DiT weights: \(ssW.count) tensors")
 let ssdit = SparseStructureFlowModel(weights: ssW)
@@ -122,7 +126,7 @@ print("[SW3] FULL SS-DiT cosine = \(ssCos)  maxAbs = \(MLX.abs(ssOut - ssGold).m
 print(ssCos >= 0.99 ? "SW3 SSDIT GATE PASS" : "SW3 SSDIT GATE FAIL")
 
 // --- SW3: FULL shape-SLat DiT (sparse) parity ---
-let slatPath = "/Volumes/Satechi/TrellisRedux/models/models--microsoft--TRELLIS.2-4B/snapshots/af44b45f2e35a493886929c6d786e563ec68364d/ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.safetensors"
+let slatPath = "\(weights)/shape_flow_512.safetensors"
 let slatW = try loadArrays(url: URL(fileURLWithPath: slatPath))
 print("[SW3] loaded SLat weights: \(slatW.count) tensors")
 let slat = SLatFlowModel(weights: slatW)
@@ -142,7 +146,7 @@ print("[SW3] FULL SS sampler cosine = \(zsCos)  maxAbs = \(MLX.abs(zs - zsGold).
 print(zsCos >= 0.99 ? "SW3 SAMPLER GATE PASS" : "SW3 SAMPLER GATE FAIL")
 
 // --- SW4: SS decoder (z_s -> occupancy -> coords) parity ---
-let ssDecPath = "/Volumes/Satechi/TrellisRedux/models/models--microsoft--TRELLIS-image-large/snapshots/25e0d31ffbebe4b5a97464dd851910efc3002d96/ckpts/ss_dec_conv3d_16l8_fp16.safetensors"
+let ssDecPath = "\(weights)/struct_dec.safetensors"
 let ssDecW = try loadArrays(url: URL(fileURLWithPath: ssDecPath))
 print("[SW4] loaded SS decoder weights: \(ssDecW.count) tensors")
 let ssDec = SparseStructureDecoder(weights: ssDecW)
@@ -160,7 +164,7 @@ print("[SW4] occupancy agreement = \(agree)  voxels swift=\(nSwift) gold=\(nGold
 print((logCos >= 0.99 && agree >= 0.999) ? "SW4 SSDEC GATE PASS" : "SW4 SSDEC GATE FAIL")
 
 // --- SW4: shape SLat decoder (SparseUnetVaeDecoder, small coherent fixture) ---
-let shapeDecPath = "/Volumes/Satechi/TrellisRedux/models/models--microsoft--TRELLIS.2-4B/snapshots/af44b45f2e35a493886929c6d786e563ec68364d/ckpts/shape_dec_next_dc_f16c32_fp16.safetensors"
+let shapeDecPath = "\(weights)/shape_dec.safetensors"
 let shapeDecW = try loadArrays(url: URL(fileURLWithPath: shapeDecPath))
 print("[SW4] loaded shape decoder weights: \(shapeDecW.count) tensors")
 let shapeDec = ShapeSlatDecoder(weights: shapeDecW)
@@ -219,7 +223,7 @@ do {
 // --- SW4: tex SLat decoder (SparseUnetVaeDecoder, out=6 PBR, guided by shape subs) ---
 // Same arch as shape decoder with out_channels=6 and pred_subdiv=false -> reuse
 // ShapeSlatDecoder with tex weights + the same guided subdivision masks.
-let texDecPath = "/Volumes/Satechi/TrellisRedux/models/models--microsoft--TRELLIS.2-4B/snapshots/af44b45f2e35a493886929c6d786e563ec68364d/ckpts/tex_dec_next_dc_f16c32_fp16.safetensors"
+let texDecPath = "\(weights)/tex_dec.safetensors"
 let texDecW = try loadArrays(url: URL(fileURLWithPath: texDecPath))
 print("[SW4] loaded tex decoder weights: \(texDecW.count) tensors")
 let texDec = ShapeSlatDecoder(weights: texDecW)
@@ -233,7 +237,7 @@ print("[SW4] TEX decode (guided): out=\(texOut.count)ch\(texOut.channels)  coord
 print((texCoordsExact && texCos >= 0.999) ? "SW4 TEXDEC GATE PASS" : "SW4 TEXDEC GATE FAIL")
 
 // --- SW4: shape encoder (FlexiDualGridVaeEncoder, S2C downsample) ---
-let shapeEncPath = "/Volumes/Satechi/TrellisRedux/models/models--microsoft--TRELLIS.2-4B/snapshots/af44b45f2e35a493886929c6d786e563ec68364d/ckpts/shape_enc_next_dc_f16c32_fp16.safetensors"
+let shapeEncPath = "\(weights)/shape_enc.safetensors"
 let shapeEncW = try loadArrays(url: URL(fileURLWithPath: shapeEncPath))
 print("[SW4] loaded shape encoder weights: \(shapeEncW.count) tensors")
 let shapeEnc = ShapeSlatEncoder(weights: shapeEncW)
@@ -273,7 +277,7 @@ let shapeCFG = FlowEulerSampler.sampleSLat(
 print("[SW3] shape sampler g=7.5 CFG cosine = \(cosine(shapeCFG, try golden("slsamp_shape_out")))  (informational: fp32 CFG amplification)")
 
 // TEX SLat sampler: img+shape->tex DiT, concat_cond=shape_slat, g1.0 (no CFG)/r0.0/int[.6,.9]/rt3
-let texSlatPath = "/Volumes/Satechi/TrellisRedux/models/models--microsoft--TRELLIS.2-4B/snapshots/af44b45f2e35a493886929c6d786e563ec68364d/ckpts/slat_flow_imgshape2tex_dit_1_3B_512_bf16.safetensors"
+let texSlatPath = "\(weights)/tex_flow_512.safetensors"
 let texSlatW = try loadArrays(url: URL(fileURLWithPath: texSlatPath))
 print("[SW5] loaded tex SLat DiT weights: \(texSlatW.count) tensors")
 let texFlow = SLatFlowModel(weights: texSlatW)
@@ -325,7 +329,7 @@ do {
     let cubeF = MLXArray([Int32(0),2,1, 0,3,2, 4,5,6, 4,6,7, 0,1,5, 0,5,4, 2,3,7, 2,7,6, 1,2,6, 1,6,5, 0,4,7, 0,7,3]).reshaped([12,3])
     let cubeUV = MLXArray([Float(0),0, 1,0, 1,1, 0,1, 0,0, 1,0, 1,1, 0,1]).reshaped([8,2])
     var px = [UInt8](); for i in 0..<16*16 { px += [UInt8((i*7)%256), UInt8((i*13)%256), UInt8((i*29)%256), 255] }
-    let url = URL(fileURLWithPath: "/private/tmp/claude-501/-Volumes-Satechi-TrellisRedux/7650dae1-8f9c-4462-a6f9-f2974ee27db5/scratchpad/_smoke_cube.glb")
+    let url = URL(fileURLWithPath: NSTemporaryDirectory() + "/_trellis2_smoke_cube.glb")
     try GLTFExport.writeGLB(to: url, positions: cubeV, indices: cubeF, uvs: cubeUV, baseColorRGBA: (px, 16, 16))
     let data = try Data(contentsOf: url)
     let magic = data.prefix(4)

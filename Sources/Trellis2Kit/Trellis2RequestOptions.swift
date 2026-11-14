@@ -15,6 +15,16 @@ import MLXToolKit
 /// | `atlasSize`     | 512, 1024, 2048 or 4096, ≤ `maxAtlasSize` | 1024                      |
 /// | `yUp`           | bool                         | `yUpOutput`                            |
 /// | `pbrMaps`       | bool                         | false                                  |
+/// | `pixal3d`       | bool                         | false (stock TRELLIS.2)                |
+/// | `pixal3dFovDegrees` | number, (0, 120)         | 20 (Pixal3DCamera.defaultFovDegrees)   |
+/// | `pixal3dFrame`  | "front" or "world"           | "front"                                |
+/// | `pixal3dCameras`| array of 16-number arrays (row-major camera-to-world, one per view: image first, then `additionalViews`) | nil |
+///
+/// Pixal3D mode (AB-T-0485): projection-conditioned flows on the cascade tiers. Single view takes a
+/// horizontal FOV (distance follows from it). Posed multi-view takes one camera-to-world matrix per
+/// view (Z-up world, camera looks down −Z with +Y up; view 0 is the canonical front); without
+/// cameras, `additionalViews` are refused in Pixal3D mode. The mesh comes back in Pixal3D's world
+/// frame (Z-up, front camera at −Y); `"world"` maps it into the cameras' frame (multi-view only).
 ///
 /// A present but malformed value throws `PackageError.unsupportedRequestFeature` before any weights
 /// are touched; nothing is silently clamped.
@@ -28,6 +38,14 @@ public struct Trellis2RequestOptions: Sendable, Equatable {
     /// Also bake the metallic-roughness atlas (glTF: G = roughness, B = metallic) into the GLB.
     /// Ignored when `texture` is false (there is no tex decode to read it from).
     public var pbrMaps: Bool
+    /// Pixal3D projection-conditioned generation instead of stock TRELLIS.2.
+    public var pixal3d: Bool
+    /// Pixal3D single-view horizontal field of view, degrees.
+    public var pixal3dFovDegrees: Double
+    /// Pixal3D output frame: "front" (canonical front camera frame) or "world" (multi-view: the c2w frame).
+    public var pixal3dFrame: String
+    /// Pixal3D posed multi-view cameras: one row-major 4×4 camera-to-world per view.
+    public var pixal3dCameras: [[Double]]?
 
     public enum Key {
         public static let seed = "seed"
@@ -37,6 +55,10 @@ public struct Trellis2RequestOptions: Sendable, Equatable {
         public static let atlasSize = "atlasSize"
         public static let yUp = "yUp"
         public static let pbrMaps = "pbrMaps"
+        public static let pixal3d = "pixal3d"
+        public static let pixal3dFovDegrees = "pixal3dFovDegrees"
+        public static let pixal3dFrame = "pixal3dFrame"
+        public static let pixal3dCameras = "pixal3dCameras"
     }
 
     public static let atlasSizes = [512, 1024, 2048, 4096]
@@ -54,6 +76,10 @@ public struct Trellis2RequestOptions: Sendable, Equatable {
         atlasSize = 1024
         yUp = c.yUpOutput
         pbrMaps = false
+        pixal3d = c.pixal3dOnly ?? false
+        pixal3dFovDegrees = 20
+        pixal3dFrame = "front"
+        pixal3dCameras = nil
     }
 
     /// The configuration's job with `metaData`'s keys applied.
@@ -76,6 +102,36 @@ public struct Trellis2RequestOptions: Sendable, Equatable {
         }
         if let v = try Self.bool(metaData, Key.yUp) { yUp = v }
         if let v = try Self.bool(metaData, Key.pbrMaps) { pbrMaps = v }
+        if let v = try Self.bool(metaData, Key.pixal3d) { pixal3d = v }
+        if let v = try Self.number(metaData, Key.pixal3dFovDegrees) {
+            guard v > 0, v < 120 else {
+                throw PackageError.unsupportedRequestFeature("metaData[\"pixal3dFovDegrees\"] = \(v): must be in (0, 120)")
+            }
+            pixal3dFovDegrees = v
+        }
+        if let v = Self.value(metaData, Key.pixal3dFrame) {
+            guard case .string(let f) = v, f == "front" || f == "world" else {
+                throw Self.refuse(Key.pixal3dFrame, "\"front\" or \"world\"", v)
+            }
+            pixal3dFrame = f
+        }
+        if let v = Self.value(metaData, Key.pixal3dCameras) {
+            guard case .array(let views) = v, !views.isEmpty else {
+                throw Self.refuse(Key.pixal3dCameras, "a non-empty array of 16-number arrays", v)
+            }
+            pixal3dCameras = try views.map { m -> [Double] in
+                guard case .array(let xs) = m, xs.count == 16 else {
+                    throw Self.refuse(Key.pixal3dCameras, "16-number row-major 4×4 matrices", m)
+                }
+                return try xs.map { x -> Double in
+                    switch x {
+                    case .int(let i): return Double(i)
+                    case .double(let d) where d.isFinite: return d
+                    default: throw Self.refuse(Key.pixal3dCameras, "finite numbers", x)
+                    }
+                }
+            }
+        }
     }
 
     // MARK: parsing
@@ -89,6 +145,15 @@ public struct Trellis2RequestOptions: Sendable, Equatable {
 
     private static func refuse(_ key: String, _ want: String, _ got: MetaValue) -> PackageError {
         .unsupportedRequestFeature("metaData[\"\(key)\"] must be \(want) (got \(got))")
+    }
+
+    private static func number(_ m: MetaData, _ key: String) throws -> Double? {
+        guard let v = value(m, key) else { return nil }
+        switch v {
+        case .int(let i): return Double(i)
+        case .double(let d) where d.isFinite: return d
+        default: throw refuse(key, "a number", v)
+        }
     }
 
     private static func bool(_ m: MetaData, _ key: String) throws -> Bool? {

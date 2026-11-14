@@ -15,9 +15,14 @@ import TRELLIS2
 //   TEXSAMP  tex 1024 flow, concat_cond = normalized HR shape slat  cosine ≥ 0.99
 //   DINO1024 ported DINOv3 on 1024² pixels vs oracle cond_1024      cosine ≥ 0.99
 
-let goldens = "/Volumes/Satechi/TrellisRedux/trellis2-port/goldens"
-let ckpts = "/Volumes/Satechi/TrellisRedux/models/models--microsoft--TRELLIS.2-4B/snapshots/af44b45f2e35a493886929c6d786e563ec68364d/ckpts"
-let dinoPath = "/Volumes/Satechi/TrellisRedux/models/models--facebook--dinov3-vitl16-pretrain-lvd1689m/snapshots/ea8dc2863c51be0a264bab82070e3e8836b02d51/model.safetensors"
+// Paths (2026-11-14): the TrellisRedux tree moved to DEV_VOL1 and the upstream ckpts are gone; the
+// consolidated snapshot carries the same tensors under the module keys (no remap), so the gate reads
+// it. Override with TRELLIS2_GOLDENS / TRELLIS2_WEIGHTS.
+let env = ProcessInfo.processInfo.environment
+let goldens = env["TRELLIS2_GOLDENS"] ?? "/Volumes/DEV_VOL1/TrellisRedux/trellis2-port/goldens"
+let weights = env["TRELLIS2_WEIGHTS"] ?? "/Volumes/DEV_VOL1/Models/models--xocialize--trellis2-mlx"
+let ckpts = weights
+let dinoPath = "\(weights)/dino.safetensors"
 func golden(_ n: String) throws -> MLXArray { try loadArray(url: URL(fileURLWithPath: "\(goldens)/\(n).npy")) }
 func cosine(_ a: MLXArray, _ b: MLXArray) -> Float {
     let af = a.reshaped([-1]).asType(.float32), bf = b.reshaped([-1]).asType(.float32)
@@ -50,7 +55,7 @@ let tMean = try golden("tex_slat_mean"), tStd = try golden("tex_slat_std")
 
 // ---- 1) LR pass: 512 shape flow on the 32³ subset (oracle noise, cond_512) ----
 var t0 = Date()
-let flow512 = SLatFlowModel(weights: try loadArrays(url: URL(fileURLWithPath: "\(ckpts)/slat_flow_img2shape_dit_1_3B_512_bf16.safetensors")))
+let flow512 = SLatFlowModel(weights: try loadArrays(url: URL(fileURLWithPath: "\(ckpts)/shape_flow_512.safetensors")))
 let lrNorm = FlowEulerSampler.sampleSLat(
     model: flow512, noiseFeats: try golden("casc_noise_lr"), coords: coordsLR,
     cond: cond512, negCond: neg512,
@@ -64,7 +69,7 @@ gate("LRSAMP  512-flow LR slat", lrCos >= 0.99,
 
 // ---- 2) "upsample" = shape decoder forward-output coords on the ORACLE LR slat ----
 t0 = Date()
-let shapeDec = ShapeSlatDecoder(weights: try loadArrays(url: URL(fileURLWithPath: "\(ckpts)/shape_dec_next_dc_f16c32_fp16.safetensors")))
+let shapeDec = ShapeSlatDecoder(weights: try loadArrays(url: URL(fileURLWithPath: "\(ckpts)/shape_dec.safetensors")))
 let upOut = shapeDec(SparseTensor(feats: refSlatLR.asType(.float32), coords: coordsLR))
 MLX.eval(upOut.coords)
 let refUp = (try golden("casc_up_coords")).asType(.int32)
@@ -111,7 +116,7 @@ print("T03 QUANT   (\(String(format: "%.1f", -t0.timeIntervalSinceNow))s)")
 // ---- 4) HR pass: 1024 shape flow on the re-quantized coords, cond_1024 ----
 t0 = Date()
 let coordsHR = (try golden("casc_coords_hr1024")).asType(.int32)
-let flow1024 = SLatFlowModel(weights: try loadArrays(url: URL(fileURLWithPath: "\(ckpts)/slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors")))
+let flow1024 = SLatFlowModel(weights: try loadArrays(url: URL(fileURLWithPath: "\(ckpts)/shape_flow_1024.safetensors")))
 let hrNorm = FlowEulerSampler.sampleSLat(
     model: flow1024, noiseFeats: try golden("casc_noise_hr"), coords: coordsHR,
     cond: cond1024, negCond: neg1024,
@@ -125,7 +130,7 @@ gate("HRSAMP  1024-flow HR slat", hrCos >= 0.99,
 
 // ---- 5) tex cascade mirror: tex 1024 flow, concat_cond = NORMALIZED oracle HR slat ----
 t0 = Date()
-let tex1024 = SLatFlowModel(weights: try loadArrays(url: URL(fileURLWithPath: "\(ckpts)/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.safetensors")))
+let tex1024 = SLatFlowModel(weights: try loadArrays(url: URL(fileURLWithPath: "\(ckpts)/tex_flow_1024.safetensors")))
 let texNorm = FlowEulerSampler.sampleSLat(
     model: tex1024, noiseFeats: try golden("casc_noise_tex"), coords: coordsHR,
     cond: cond1024, negCond: neg1024, concatCond: (refSlatHR - sMean) / sStd,

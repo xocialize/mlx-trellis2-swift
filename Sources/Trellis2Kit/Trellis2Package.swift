@@ -113,12 +113,21 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
     /// NOT part of the Codable surface (in-process wiring, not persisted configuration).
     public var matting: Trellis2Matting? = nil
 
+    /// Pixal3D (AB-T-0485): where the converted `pixal3d_*.safetensors` + `naf.safetensors` live.
+    /// nil = the consolidated snapshot directory. Loaded lazily on the first Pixal3D request.
+    /// (Publishing the Pixal3D weights and their lanes is P3; until then this points at a local dir.)
+    public var pixal3dWeightsDir: URL?
+    /// Pixal3D-only registration (P2 measurement shape; the real lanes are P3): skip the stock SS
+    /// and SLat flows, preload the single-view Pixal3D set at prepare, and default every request to
+    /// `pixal3d: true`. nil/false = a stock registration (Pixal3D still available per request, lazily).
+    public var pixal3dOnly: Bool?
+
     /// Explicit Codable surface: everything except the `matting` closure (which decodes to nil).
     enum CodingKeys: String, CodingKey {
         case quant, defaultMode, tierCeiling, maxAtlasSize, modelsRootDirectory, weightsRootOverride
         case steps, seed, texture, decimateFaces, yUpOutput, unwrapBackend, metricsPath
         case slatCfgAttention, texAttention, slatCfgInterval, slatCfgNegEvery, maxHRTokens
-        case additionalViewsScope
+        case additionalViewsScope, pixal3dWeightsDir, pixal3dOnly
     }
 
     public init(quant: Quant = .bf16,
@@ -140,7 +149,9 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
                 slatCfgNegEvery: Int? = nil,
                 maxHRTokens: Int? = nil,
                 additionalViewsScope: String? = nil,
-                matting: Trellis2Matting? = nil) {
+                matting: Trellis2Matting? = nil,
+                pixal3dWeightsDir: URL? = nil,
+                pixal3dOnly: Bool? = nil) {
         self.quant = quant
         self.defaultMode = defaultMode
         self.tierCeiling = tierCeiling
@@ -161,6 +172,8 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
         self.maxHRTokens = maxHRTokens
         self.additionalViewsScope = additionalViewsScope
         self.matting = matting
+        self.pixal3dWeightsDir = pixal3dWeightsDir
+        self.pixal3dOnly = pixal3dOnly
     }
 }
 
@@ -475,10 +488,15 @@ public final class Trellis2Package: ModelPackage {
         // ckptDir loader expects `<name>.safetensors`, which the consolidated names satisfy directly.
         // struct_dec / shape_flow_512 / tex_flow_512 / etc. map onto the pipeline's expected files.
         let ckptDir = dir.path
-        pipeline = try Trellis2Pipeline(consolidatedDir: ckptDir)
+        let pixal3dOnly = configuration.pixal3dOnly ?? false
+        pipeline = try Trellis2Pipeline(consolidatedDir: ckptDir, loadStockStructFlow: !pixal3dOnly)
+        pipeline?.pixal3dDir = configuration.pixal3dWeightsDir?.path   // nil → the consolidated dir
+        if pixal3dOnly {
+            try pipeline?.preloadPixal3D(multiView: false)
+        }
         // A lane knows its tier: load its flows now (prepare), so a job reads nothing from disk and its
         // resident set is the declared one from the start. Without a tierCeiling they stay lazy.
-        if configuration.tierCeiling != nil {
+        if configuration.tierCeiling != nil && !pixal3dOnly {
             try pipeline?.preloadFlows(for: configuration.chargedTier)
         }
 
@@ -540,6 +558,9 @@ public final class Trellis2Package: ModelPackage {
             }
         }
         let mattingS = configuration.matting != nil ? -tMat.timeIntervalSinceNow : 0
+        if options.pixal3d {
+            return try runPixal3D(pipeline: pipeline, views: views, tier: tier, options: options, mattingS: mattingS)
+        }
         // Profiling bookends (metricsPath set): preprocessing (CPU) is timed separately from the
         // DINOv3 encode (GPU) — each encode is eval-barriered so the delta is real wall-clock.
         let tPre = Date()
@@ -645,6 +666,92 @@ public final class Trellis2Package: ModelPackage {
             rec["mlx_tf32_env"] = ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"] ?? "unset(=on)"
             rec["e2e_total_s"] = mattingS + preprocessS + dinoEncode512S + dinoEncode1024S + dinoEncodeTexS
                 + stageMetrics.generateTotalS + glbExportS
+            if let data = try? JSONSerialization.data(withJSONObject: rec, options: [.sortedKeys]),
+               let str = String(data: data, encoding: .utf8) {
+                print("JSON \(str)")
+                try? str.write(toFile: path, atomically: true, encoding: .utf8)
+            }
+        }
+        return ImageTo3DResponse(mesh: mesh)
+    }
+
+    // MARK: Pixal3D (AB-T-0485)
+
+    /// Pixal3D projection-conditioned generation. Single view: crop ×1.1 and a FOV; posed multi-view:
+    /// one camera-to-world per view, no crop, the `_mv` weights. Cascade tiers only.
+    private func runPixal3D(pipeline: Trellis2Pipeline, views: [Image], tier: Trellis2Tier,
+                            options: Trellis2RequestOptions, mattingS: Double) throws -> ImageTo3DResponse {
+        guard tier.isCascade else {
+            throw PackageError.unsupportedRequestFeature(
+                "pixal3d: mode \(tier.rawValue) has no Pixal3D flows (upstream ships no 512 mode); use res1024 or res1536")
+        }
+        let fov = options.pixal3dFovDegrees * .pi / 180
+        var cams: [Pixal3DCamera]
+        if let mats = options.pixal3dCameras {
+            guard mats.count == views.count else {
+                throw PackageError.unsupportedRequestFeature(
+                    "pixal3dCameras has \(mats.count) matrices for \(views.count) views (image + additionalViews)")
+            }
+            cams = mats.map { Pixal3DCamera(fovX: fov, meshScale: 1.0, c2w: Mat4(flat: $0)) }
+        } else {
+            guard views.count == 1 else {
+                throw PackageError.unsupportedRequestFeature(
+                    "pixal3d with additionalViews needs pixal3dCameras (posed multi-view); pose-free views are not supported")
+            }
+            cams = [Pixal3DCamera(fovX: fov, meshScale: 1.0)]
+        }
+        let posed = options.pixal3dCameras != nil
+        let tPre = Date()
+        let pviews: [Pixal3DView] = try views.enumerated().map { i, img in
+            let p512 = posed ? try ImagePreprocess.pixal3dViewPixels(from: img, size: 512)
+                             : try ImagePreprocess.pixal3dPixels(from: img, size: 512)
+            let p1024 = posed ? try ImagePreprocess.pixal3dViewPixels(from: img, size: 1024)
+                              : try ImagePreprocess.pixal3dPixels(from: img, size: 1024)
+            return Pixal3DView(normalized512: p512.normalized, guide512: p512.guide,
+                               normalized1024: p1024.normalized, guide1024: p1024.guide, camera: cams[i])
+        }
+        let preprocessS = -tPre.timeIntervalSinceNow
+        try Task.checkCancellation()
+        let (bakedOpt, _, stageMetrics, camera) = try pipeline.generatePixal3D(
+            tier: tier, views: pviews, multiViewWeights: posed && views.count > 1,
+            ssPhases: SSGrid.ropePhases(resolution: 16),
+            shapeMean: MLXArray(shapeMean), shapeStd: MLXArray(shapeStd),
+            texMean: MLXArray(texMean), texStd: MLXArray(texStd),
+            texture: options.texture, targetFaces: options.decimateFaces,
+            yUp: options.yUp, atlasSize: options.atlasSize, pbrMaps: options.pbrMaps,
+            unwrapBackend: configuration.unwrapBackend == "provenance" ? .provenance : .xatlas,
+            slatCfgSDPA: configuration.slatCfgAttention.flatMap { SDPAPrecision(rawValue: $0) } ?? .fp32,
+            texSDPA: configuration.texAttention.flatMap { SDPAPrecision(rawValue: $0) } ?? .bf16,
+            steps: options.steps, maxHRTokens: configuration.maxHRTokens, seed: options.seed,
+            frame: Pixal3DFrame(rawValue: options.pixal3dFrame) ?? .front, log: { _ in })
+        guard let baked = bakedOpt else { throw PackageError.notLoaded }
+        try Task.checkCancellation()
+        let tGlb = Date()
+        let glb = try GLTFExport.glbData(
+            positions: baked.vertices, indices: baked.faces,
+            normals: baked.normals, uvs: baked.uvs,
+            baseColorRGBA: (baked.texRGBA, baked.atlasSize, baked.atlasSize),
+            metallicRoughnessRGBA: options.pbrMaps ? baked.mrRGBA.map { ($0, baked.atlasSize, baked.atlasSize) } : nil)
+        let glbExportS = -tGlb.timeIntervalSinceNow
+        let mesh = Mesh(format: .glb, data: glb, vertexCount: baked.vertices.dim(0), faceCount: baked.faces.dim(0),
+                        hasVertexColors: false)
+        if let path = configuration.metricsPath {
+            var rec = stageMetrics.flatRecord()
+            rec["pixal3d"] = true
+            rec["pixal3d_views"] = camera.views
+            rec["pixal3d_fov_deg"] = camera.fovXRadians * 180 / .pi
+            rec["pixal3d_distance"] = camera.distance
+            rec["pixal3d_frame"] = camera.frame.rawValue
+            rec["pixal3d_camera0_to_mesh"] = camera.camera0ToMesh
+            rec["matting_s"] = mattingS
+            rec["preprocess_s"] = preprocessS
+            rec["glb_export_s"] = glbExportS
+            rec["mesh_verts"] = baked.vertices.dim(0)
+            rec["mesh_faces"] = baked.faces.dim(0)
+            rec["y_up"] = options.yUp
+            rec["glb_bytes"] = glb.count
+            rec["gpu_peak_bytes"] = Int(Memory.peakMemory)
+            rec["e2e_total_s"] = mattingS + preprocessS + stageMetrics.generateTotalS + glbExportS
             if let data = try? JSONSerialization.data(withJSONObject: rec, options: [.sortedKeys]),
                let str = String(data: data, encoding: .utf8) {
                 print("JSON \(str)")

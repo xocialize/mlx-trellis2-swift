@@ -5,8 +5,11 @@ import TRELLIS2
 // SW-DINO parity gate: verify the Swift DINOv3 ViT-L/16 port stage-by-stage
 // against the PyTorch oracle goldens, then end-to-end vs cond_512.
 // Run: swift run -c release dinoparity
-let goldens = "/Volumes/Satechi/TrellisRedux/trellis2-port/goldens"
-let dinoWeights = "/Volumes/Satechi/TrellisRedux/models/models--facebook--dinov3-vitl16-pretrain-lvd1689m/snapshots/ea8dc2863c51be0a264bab82070e3e8836b02d51/model.safetensors"
+// Paths (2026-11-14): TrellisRedux moved to DEV_VOL1; the consolidated snapshot's dino.safetensors is the
+// same DINOv3 under the module keys. Override with TRELLIS2_GOLDENS / TRELLIS2_WEIGHTS.
+let env = ProcessInfo.processInfo.environment
+let goldens = env["TRELLIS2_GOLDENS"] ?? "/Volumes/DEV_VOL1/TrellisRedux/trellis2-port/goldens"
+let dinoWeights = "\(env["TRELLIS2_WEIGHTS"] ?? "/Volumes/DEV_VOL1/Models/models--xocialize--trellis2-mlx")/dino.safetensors"
 
 func golden(_ name: String) throws -> MLXArray {
     try loadArray(url: URL(fileURLWithPath: "\(goldens)/\(name).npy"))

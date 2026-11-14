@@ -136,7 +136,9 @@ do {
                                               slatCfgNegEvery: env["SLAT_NEG_EVERY"].flatMap { Int($0) },
                                               maxHRTokens: env["MAX_HR_TOKENS"].flatMap { Int($0) },
                                               additionalViewsScope: env["EXTRA_VIEWS_SCOPE"],
-                                              matting: matting))
+                                              matting: matting,
+                                              pixal3dWeightsDir: env["PIXAL3D_WEIGHTS"].map { URL(fileURLWithPath: $0) },
+                                              pixal3dOnly: env["PIXAL3D_ONLY"] == "1" ? true : nil))
     print("[engine] registered packageID=\(pkgID) | backers(imageTo3D)=\(await engine.packages(for: .imageTo3D))")
     let laneConfig = Trellis2Configuration(defaultMode: mode, tierCeiling: mode, maxAtlasSize: maxAtlas,
                                            maxHRTokens: env["MAX_HR_TOKENS"].flatMap { Int($0) })

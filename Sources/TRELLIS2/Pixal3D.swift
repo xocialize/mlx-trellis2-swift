@@ -157,10 +157,10 @@ public enum Pixal3DProjection {
         return MLXArray(out).reshaped([R * R * R, 4])
     }
 
-    /// F.grid_sample(map, grid, bilinear, align_corners=False, padding_mode="border") at points
-    /// `norm` [K,2] (x, y) on a channel-last map [H, W, C]. Returns [K, C].
-    public static func sampleBilinear(_ map: MLXArray, _ norm: MLXArray) -> MLXArray {
-        let H = map.dim(0), W = map.dim(1), C = map.dim(2)
+    /// Corner pixels and weights of F.grid_sample(bilinear, align_corners=False, padding_mode="border")
+    /// at points `norm` [K,2] (x, y) on an H×W map.
+    public struct Corners { public let x0, x1, y0, y1, w00, w01, w10, w11: MLXArray }
+    public static func bilinearCorners(_ norm: MLXArray, H: Int, W: Int) -> Corners {
         // unnormalize (align_corners=False) then clip to the border
         let ix = MLX.clip(((norm[0..., 0] + 1) * Float(W) - 1) / 2, min: 0, max: Float(W - 1))
         let iy = MLX.clip(((norm[0..., 1] + 1) * Float(H) - 1) / 2, min: 0, max: Float(H - 1))
@@ -169,13 +169,19 @@ public enum Pixal3DProjection {
         let wx0 = 1 - wx1, wy0 = 1 - wy1
         let x0 = x0f.asType(.int32), y0 = y0f.asType(.int32)
         let x1 = MLX.minimum(x0 + 1, MLXArray(Int32(W - 1))), y1 = MLX.minimum(y0 + 1, MLXArray(Int32(H - 1)))
+        return Corners(x0: x0, x1: x1, y0: y0, y1: y1, w00: wx0 * wy0, w01: wx1 * wy0, w10: wx0 * wy1, w11: wx1 * wy1)
+    }
+
+    /// F.grid_sample(map, grid, bilinear, align_corners=False, padding_mode="border") at points
+    /// `norm` [K,2] (x, y) on a channel-last map [H, W, C]. Returns [K, C].
+    public static func sampleBilinear(_ map: MLXArray, _ norm: MLXArray) -> MLXArray {
+        let H = map.dim(0), W = map.dim(1), C = map.dim(2)
+        let c = bilinearCorners(norm, H: H, W: W)
         let flat = map.reshaped([H * W, C])
-        func at(_ y: MLXArray, _ x: MLXArray) -> MLXArray { flat.take(y * Int32(W) + x, axis: 0) }
-        let a = at(y0, x0) * (wx0 * wy0).reshaped([-1, 1])
-        let b = at(y0, x1) * (wx1 * wy0).reshaped([-1, 1])
-        let c = at(y1, x0) * (wx0 * wy1).reshaped([-1, 1])
-        let d = at(y1, x1) * (wx1 * wy1).reshaped([-1, 1])
-        return a + b + c + d
+        func at(_ y: MLXArray, _ x: MLXArray, _ w: MLXArray) -> MLXArray {
+            flat.take(y * Int32(W) + x, axis: 0) * w.reshaped([-1, 1])
+        }
+        return at(c.y0, c.x0, c.w00) + at(c.y0, c.x1, c.w01) + at(c.y1, c.x0, c.w10) + at(c.y1, c.x1, c.w11)
     }
 
     /// Pixal3D's HR re-quantization of the decoder's upsampled coords (`run()`,
@@ -277,9 +283,14 @@ public struct Pixal3DConditioner {
                                                       imageSize: res)
         let lr = Pixal3DProjection.sampleBilinear(Self.patchMap(tok), norm)
         guard let target = stage.nafTarget else { return lr }
-        let map = nafMap ?? naf(guide: view.guide(res), features: Self.patchMap(tok).transposed(2, 0, 1).expandedDimensions(axis: 0),
-                                target: target)
-        let hr = Pixal3DProjection.sampleBilinear(map, norm)
+        let hr: MLXArray
+        if let nafMap {
+            hr = Pixal3DProjection.sampleBilinear(nafMap, norm)
+        } else {
+            // banded: the HR map is never materialized (NAF.sample)
+            let q = naf.queries(guide: view.guide(res), target: target); MLX.eval(q)
+            hr = naf.sample(queries: q, features: Self.patchMap(tok).transposed(2, 0, 1).expandedDimensions(axis: 0), at: norm)
+        }
         return MLX.concatenated([lr, hr], axis: 1)
     }
 

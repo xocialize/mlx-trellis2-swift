@@ -51,6 +51,48 @@ enum ImagePreprocess {
         return MLXArray(chw, [1, 3, size, size])
     }
 
+    // MARK: Pixal3D (AB-T-0485)
+
+    /// Pixal3D single-view preprocessing (`Pixal3DImageTo3DPipeline.preprocess_image`): alpha bbox
+    /// (> 0.8), square crop of side `int(max_extent · 1.1)` about the bbox centre, composite on black,
+    /// resize to `size`. Returns (ImageNet-normalized DINOv3 input, raw [0,1] NAF guide), NCHW.
+    /// The 1.1 margin matters here: the camera model maps the unit cube to the crop's framing.
+    static func pixal3dPixels(from image: Image, size: Int) throws -> (normalized: MLXArray, guide: MLXArray) {
+        let (cg, hasAlpha) = try decodeCGImage(image)
+        let side0 = max(cg.width, cg.height)
+        let scale = side0 > maxSide ? Double(maxSide) / Double(side0) : 1.0
+        let W = max(1, Int((Double(cg.width) * scale).rounded()))
+        let H = max(1, Int((Double(cg.height) * scale).rounded()))
+        let pm = drawRGBA8(cg, width: W, height: H)
+        let rgb: [Float]
+        if hasAlpha, let bbox = foregroundBBox(pm, W: W, H: H, margin: 1.1) {
+            rgb = cropCompositeResize(pm, W: W, H: H, bbox: bbox, target: size)
+        } else {
+            rgb = drawRGB(cg, side: size)
+        }
+        return planes(rgb, size: size)
+    }
+
+    /// Pixal3D posed multi-view preprocessing (`inference_mv.py` `to_cond_tensor`): no crop — the
+    /// cameras fix the framing — full-frame resize to `size`, RGB premultiplied by alpha (black
+    /// background). Returns (normalized, guide), NCHW.
+    static func pixal3dViewPixels(from image: Image, size: Int) throws -> (normalized: MLXArray, guide: MLXArray) {
+        let (cg, _) = try decodeCGImage(image)
+        return planes(drawRGB(cg, side: size), size: size)      // premultipliedLast ⇒ RGB·alpha on black
+    }
+
+    private static func planes(_ rgb: [Float], size: Int) -> (normalized: MLXArray, guide: MLXArray) {
+        let n = size * size
+        var chw = [Float](repeating: 0, count: 3 * n), raw = [Float](repeating: 0, count: 3 * n)
+        for i in 0..<n {
+            for c in 0..<3 {
+                raw[c * n + i] = rgb[3 * i + c]
+                chw[c * n + i] = (rgb[3 * i + c] - mean[c]) / std[c]
+            }
+        }
+        return (MLXArray(chw, [1, 3, size, size]), MLXArray(raw, [1, 3, size, size]))
+    }
+
     // MARK: matting (T0.4)
 
     /// Upstream `preprocess_image`'s rembg branch. Returns `image` untouched when it already carries
@@ -187,7 +229,7 @@ enum ImagePreprocess {
     }
 
     private struct BBox { let x0: Int; let y0: Int; let side: Int }
-    private static func foregroundBBox(_ pm: [UInt8], W: Int, H: Int) -> BBox? {
+    private static func foregroundBBox(_ pm: [UInt8], W: Int, H: Int, margin: Double = 1.0) -> BBox? {
         let thr = UInt8(min(255, Int(alphaThreshold * 255)))
         var minX = W, minY = H, maxX = -1, maxY = -1
         for y in 0..<H {
@@ -198,6 +240,13 @@ enum ImagePreprocess {
             }
         }
         guard maxX >= minX, maxY >= minY else { return nil }
+        if margin != 1.0 {
+            // Pixal3D: float centre, side int(extent·margin), box (c − side//2, c + side//2), PIL-rounded
+            let side = Int(Double(max(maxX - minX, maxY - minY)) * margin)
+            let cxf = Double(minX + maxX) / 2, cyf = Double(minY + maxY) / 2
+            return BBox(x0: Int((cxf - Double(side / 2)).rounded()), y0: Int((cyf - Double(side / 2)).rounded()),
+                        side: max(1, 2 * (side / 2)))
+        }
         let cx = (minX + maxX) / 2, cy = (minY + maxY) / 2
         let side = max(maxX - minX, maxY - minY)
         return BBox(x0: cx - side/2, y0: cy - side/2, side: max(1, side))

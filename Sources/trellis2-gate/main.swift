@@ -11,6 +11,7 @@ import Foundation
 import MLXToolKit
 import MLXServeConformance
 import Trellis2Kit
+import TRELLIS2   // Pixal3D camera maths (host-side Double, no MLX kernels)
 
 var failures = 0
 func check(_ name: String, _ passed: Bool, _ note: String = "") {
@@ -233,9 +234,50 @@ for (key, bad) in [("atlasSize", MetaValue.int(3000)), ("seed", .int(-1)), ("ste
 }
 
 // ---------------------------------------------------------------------------------------------
+section("Pixal3D request options (AB-T-0485)")
+do {
+    let none = try Trellis2RequestOptions(metaData: [:], configuration: base)
+    check("Pixal3D off by default; fov 20°, frame front, no cameras",
+          !none.pixal3d && none.pixal3dFovDegrees == 20 && none.pixal3dFrame == "front" && none.pixal3dCameras == nil)
+    let front: [MetaValue] = [1, 0, 0, 0, 0, 0, -1, -2.8356, 0, 1, 0, 0, 0, 0, 0, 1].map { .double($0) }
+    let side: [MetaValue] = [0, 0, 1, 2.8356, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1].map { .double($0) }
+    let on = try Trellis2RequestOptions(metaData: [
+        "pixal3d": .bool(true), "pixal3dFovDegrees": .int(30), "pixal3dFrame": .string("world"),
+        "pixal3dCameras": .array([.array(front), .array(side)]),
+    ], configuration: base)
+    check("every Pixal3D key overrides", on.pixal3d && on.pixal3dFovDegrees == 30 && on.pixal3dFrame == "world"
+          && on.pixal3dCameras?.count == 2 && on.pixal3dCameras?[1][3] == 2.8356)
+    let only = try Trellis2RequestOptions(metaData: [:], configuration: Trellis2Configuration(pixal3dOnly: true))
+    check("a pixal3dOnly registration defaults requests to Pixal3D", only.pixal3d)
+    // camera maths: distance closed form, view 0 snaps to the canonical front, front→world is rigid
+    let cam = Pixal3DCamera()
+    check("fov 20° → distance 2.8356 (0.5/tan(fov/2))", abs(cam.distance - 2.835641) < 1e-5)
+    let tilted = Mat4([[1, 0, 0, 0], [0, 0.8, -0.6, -2.0], [0, 0.6, 0.8, 1.5], [0, 0, 0, 1]])
+    let calc = Pixal3DCamera.calcMats([Pixal3DCamera(c2w: tilted), Pixal3DCamera(c2w: tilted)])
+    let F = Mat4.front(distance: tilted.translationNorm)
+    check("calc_mat of view 0 is the canonical front F(|t0|)", zip(calc[0].m, F.m).allSatisfy { abs($0 - $1) < 1e-9 })
+    let W = Pixal3DCamera.frontToWorld([Pixal3DCamera(c2w: tilted)])
+    check("front→world maps F back onto C0", zip((W * F).m, tilted.m).allSatisfy { abs($0 - $1) < 1e-9 })
+} catch {
+    check("Pixal3D options parse", false, "\(error)")
+}
+for (key, bad) in [("pixal3d", MetaValue.string("yes")), ("pixal3dFovDegrees", .int(0)), ("pixal3dFovDegrees", .double(150)),
+                   ("pixal3dFrame", .string("up")), ("pixal3dCameras", .array([.array([.int(1), .int(0)])])),
+                   ("pixal3dCameras", .array([]))] {
+    do {
+        _ = try Trellis2RequestOptions(metaData: [key: bad], configuration: base)
+        check("refuses \(key) = \(bad)", false, "accepted")
+    } catch PackageError.unsupportedRequestFeature {
+        check("refuses \(key) = \(bad)", true)
+    } catch {
+        check("refuses \(key) = \(bad)", false, "threw \(error)")
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 section("Result")
 if failures == 0 {
-    print("✅ ALL GATES PASSED (C0–C13 static + MAT-1..5 + CAN-1..3 + FIT lanes + request options)")
+    print("✅ ALL GATES PASSED (C0–C13 static + MAT-1..5 + CAN-1..3 + FIT lanes + request options + Pixal3D options)")
 } else {
     print("❌ \(failures) gate check(s) FAILED")
     exit(1)

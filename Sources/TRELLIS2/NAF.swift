@@ -139,51 +139,100 @@ public struct NAF {
         return attend(queries: q, features: features, bandRows: bandRows)
     }
 
-    /// The neighbourhood-attention half of the forward, given the query map.
-    public func attend(queries q: MLXArray, features: MLXArray, bandRows: Int = 4) -> MLXArray {
+    /// Keys and values for the attention (LR grid), and the per-row window starts.
+    struct KV { let k: MLXArray, v: MLXArray, starts: [Int], L: Int, d: Int, C: Int }
+
+    func kv(queries q: MLXArray, features: MLXArray) -> KV {
         let o = q.dim(1)
         let C = features.dim(1), L = features.dim(2)
         precondition(features.dim(3) == L && o % L == 0 && L >= kernel, "NAF: shapes o=\(o) L=\(L)")
-        let d = o / L
         let dh = dim / heads, dv = C / heads
         let k = Self.avgPool(q, to: L).reshaped([L, L, heads, dh])          // keys at LR
         let v = features.asType(.float32)[0].transposed(1, 2, 0).reshaped([L, L, heads, dv])
         let half = kernel / 2
-        // window start per LR index (NATTEN border rule)
-        let starts = (0..<L).map { min(max($0 - half, 0), L - kernel) }
+        let starts = (0..<L).map { min(max($0 - half, 0), L - kernel) }    // NATTEN border rule
+        return KV(k: k, v: v, starts: starts, L: L, d: o / L, C: C)
+    }
+
+    /// HR rows [p0·d, (p0+nb)·d) of the output: [nb·d, o, C].
+    func band(queries q: MLXArray, _ kv: KV, p0: Int, nb: Int) -> MLXArray {
+        let o = q.dim(1), L = kv.L, d = kv.d, C = kv.C
+        let dh = dim / heads, dv = C / heads
+        var rIdx = [Int32](); rIdx.reserveCapacity(nb * kernel)
+        for p in p0 ..< (p0 + nb) { for a in 0..<kernel { rIdx.append(Int32(kv.starts[p] + a)) } }
+        var cIdx = [Int32](); cIdx.reserveCapacity(L * kernel)
+        for qc in 0..<L { for b in 0..<kernel { cIdx.append(Int32(kv.starts[qc] + b)) } }
+        let rI = MLXArray(rIdx), cI = MLXArray(cIdx)
+        // gather windows: [nb*9, L*9, heads, ch] → [nb, 9, L, 9, heads, ch] → [nb, L, heads, 81, ch]
+        func windows(_ t: MLXArray, ch: Int) -> MLXArray {
+            t.take(rI, axis: 0).take(cI, axis: 1)
+                .reshaped([nb, kernel, L, kernel, heads, ch])
+                .transposed(0, 2, 4, 1, 3, 5).reshaped([nb, L, heads, kernel * kernel, ch])
+        }
+        let kw = windows(kv.k, ch: dh), vw = windows(kv.v, ch: dv)
+        // queries of the HR pixels in these LR rows: [nb*d, o, h, dh] → [nb, L, h, d², dh]
+        let qb = q[0, (p0 * d) ..< ((p0 + nb) * d)].reshaped([nb, d, L, d, heads, dh])
+            .transposed(0, 2, 4, 1, 3, 5).reshaped([nb, L, heads, d * d, dh])
         let scale = Float(1.0 / Double(dh).squareRoot())
+        let logits = matmul(qb, kw.transposed(0, 1, 2, 4, 3)) * scale        // [nb, L, h, d², 81]
+        let attn = MLX.softmax(logits, axis: -1, precise: true)
+        let out = matmul(attn, vw)                                           // [nb, L, h, d², dv]
+        return out.reshaped([nb, L, heads, d, d, dv]).transposed(0, 3, 1, 4, 2, 5).reshaped([nb * d, o, C])
+    }
+
+    /// The full HR map [o, o, C] (the gates read crops of it). Peak ≈ 2× the map (bands + concat).
+    public func attend(queries q: MLXArray, features: MLXArray, bandRows: Int = 4) -> MLXArray {
+        let kv = kv(queries: q, features: features)
         var bands = [MLXArray]()
         var p0 = 0
-        while p0 < L {
-            let nb = min(bandRows, L - p0)
-            // rows of the 9×9 windows for LR rows p0..<p0+nb: [nb, 9]
-            var rIdx = [Int32](); rIdx.reserveCapacity(nb * kernel)
-            for p in p0 ..< (p0 + nb) { for a in 0..<kernel { rIdx.append(Int32(starts[p] + a)) } }
-            var cIdx = [Int32](); cIdx.reserveCapacity(L * kernel)
-            for qc in 0..<L { for b in 0..<kernel { cIdx.append(Int32(starts[qc] + b)) } }
-            let rI = MLXArray(rIdx), cI = MLXArray(cIdx)
-            // gather windows: [nb*9, L*9, heads, ch] → [nb, 9, L, 9, heads, ch] → [nb, L, heads, 81, ch]
-            func windows(_ t: MLXArray, ch: Int) -> MLXArray {
-                let rows = t.take(rI, axis: 0)                               // [nb*9, L, heads, ch]
-                let both = rows.take(cI, axis: 1)                            // [nb*9, L*9, heads, ch]
-                return both.reshaped([nb, kernel, L, kernel, heads, ch])
-                    .transposed(0, 2, 4, 1, 3, 5).reshaped([nb, L, heads, kernel * kernel, ch])
-            }
-            let kw = windows(k, ch: dh)                                      // [nb, L, h, 81, dh]
-            let vw = windows(v, ch: dv)                                      // [nb, L, h, 81, dv]
-            // queries of the HR pixels in these LR rows: [nb*d, o, h, dh] → [nb, L, h, d², dh]
-            let qb = q[0, (p0 * d) ..< ((p0 + nb) * d)].reshaped([nb, d, L, d, heads, dh])
-                .transposed(0, 2, 4, 1, 3, 5).reshaped([nb, L, heads, d * d, dh])
-            let logits = matmul(qb, kw.transposed(0, 1, 2, 4, 3)) * scale    // [nb, L, h, d², 81]
-            let attn = MLX.softmax(logits, axis: -1, precise: true)
-            let out = matmul(attn, vw)                                       // [nb, L, h, d², dv]
-            // → [nb, d, L, d, h, dv] → [nb*d, o, C]
-            let band = out.reshaped([nb, L, heads, d, d, dv]).transposed(0, 3, 1, 4, 2, 5)
-                .reshaped([nb * d, o, C])
-            MLX.eval(band)
-            bands.append(band)
+        while p0 < kv.L {
+            let nb = min(bandRows, kv.L - p0)
+            let b = band(queries: q, kv, p0: p0, nb: nb); MLX.eval(b)
+            bands.append(b)
             p0 += nb
         }
-        return MLX.concatenated(bands, axis: 0)                              // [o, o, C]
+        return MLX.concatenated(bands, axis: 0)
+    }
+
+    /// Bilinear samples of the HR map at grid_sample points `norm` [K,2] (align_corners=False,
+    /// border) WITHOUT materializing the map: each band of rows is computed, the corner pixels that
+    /// fall in it are gathered, and the band is dropped. Same values as
+    /// `Pixal3DProjection.sampleBilinear(attend(...), norm)`; peak is one band (~0.27 GB at o=1024)
+    /// instead of the 4 GB tex map plus its concatenation copy.
+    public func sample(queries q: MLXArray, features: MLXArray, at norm: MLXArray, bandRows: Int = 4) -> MLXArray {
+        let o = q.dim(1)
+        let kvs = kv(queries: q, features: features)
+        let cw = Pixal3DProjection.bilinearCorners(norm, H: o, W: o)
+        MLX.eval(cw.y0, cw.y1, cw.x0, cw.x1)
+        let ys = [cw.y0, cw.y0, cw.y1, cw.y1].map { $0.asArray(Int32.self) }
+        let xs = [cw.x0, cw.x1, cw.x0, cw.x1].map { $0.asArray(Int32.self) }
+        let K = ys[0].count
+        let rowsPerBand = bandRows * kvs.d
+        // unique corner pixels, grouped by band
+        var uniq = [Int32: Int32]()                          // pixel → position in the gathered table
+        var perBand = [[Int32]](repeating: [], count: (o + rowsPerBand - 1) / rowsPerBand)
+        for c in 0..<4 { for i in 0..<K {
+            let pix = ys[c][i] * Int32(o) + xs[c][i]
+            if uniq[pix] == nil { uniq[pix] = -1; perBand[Int(ys[c][i]) / rowsPerBand].append(pix) }
+        } }
+        var tables = [MLXArray]()
+        var pos: Int32 = 0
+        for (b, pixels) in perBand.enumerated() where !pixels.isEmpty {
+            let p0 = b * bandRows, nb = min(bandRows, kvs.L - p0)
+            let rowBase = Int32(p0 * kvs.d) * Int32(o)
+            let bandMap = band(queries: q, kvs, p0: p0, nb: nb).reshaped([-1, kvs.C])
+            let local = MLXArray(pixels.map { $0 - rowBase })
+            let t = bandMap.take(local, axis: 0); MLX.eval(t)
+            tables.append(t)
+            for pix in pixels { uniq[pix] = pos; pos += 1 }
+        }
+        let table = MLX.concatenated(tables, axis: 0)       // [U, C]
+        var acc: MLXArray? = nil
+        for (c, w) in [cw.w00, cw.w01, cw.w10, cw.w11].enumerated() {
+            let idx = MLXArray((0..<K).map { uniq[ys[c][$0] * Int32(o) + xs[c][$0]]! })
+            let term = table.take(idx, axis: 0) * w.reshaped([-1, 1])
+            acc = acc.map { $0 + term } ?? term
+        }
+        return acc!
     }
 }

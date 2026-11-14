@@ -61,6 +61,10 @@ extension Trellis2Pipeline {
     public func pixal3dSSDecode(_ zs: MLXArray) -> MLXArray {
         let c = ssDec.coords(ssDec(zs), resolution: 32); MLX.eval(c); return c
     }
+    /// SS decoder logits max-pooled 64³ → 32³ (the occupancy margin per 32³ voxel), [32,32,32].
+    public func pixal3dSSLogits(_ zs: MLXArray) -> MLXArray {
+        let l = ssDec(zs).reshaped([32, 2, 32, 2, 32, 2]).max(axes: [1, 3, 5]); MLX.eval(l); return l
+    }
     /// The cascade "upsample": shape-decoder output coords for a NORMALIZED LR slat.
     public func pixal3dUpsample(lrSlat: MLXArray, coords: MLXArray, shapeMean: MLXArray, shapeStd: MLXArray) -> MLXArray {
         let up = shapeDec(SparseTensor(feats: lrSlat * shapeStd + shapeMean, coords: coords)).coords
@@ -150,7 +154,9 @@ extension Trellis2Pipeline {
         slatCfgSDPA: SDPAPrecision = .fp32, texSDPA: SDPAPrecision? = nil, steps: Int = 12,
         maxHRTokens: Int? = nil, remeshRes: Int? = nil, seed: UInt64 = 0,
         frame: Pixal3DFrame = .front, noise: Pixal3DNoise? = nil,
-        noiseFn: [String: (MLXArray) -> MLXArray]? = nil, bake: Bool = true,
+        noiseFn: [String: (MLXArray) -> MLXArray]? = nil,
+        topology: (ss: MLXArray?, hr: MLXArray?)? = nil,   // gates: the oracle's coords at the two topology decisions
+        bake: Bool = true,
         capture: ((String, [String: MLXArray]) -> Void)? = nil,
         log: (String) -> Void = { print($0) }
     ) throws -> (mesh: BakedMesh?, hrResolution: Int, metrics: Trellis2StageMetrics, camera: Pixal3DCameraReport) {
@@ -185,7 +191,7 @@ extension Trellis2Pipeline {
                                            guidanceInterval: (0.6, 1.0), rescaleT: 5.0)
         MLX.eval(zs); metrics.ssSampleS = -t.timeIntervalSinceNow
         t = Date()
-        let coords = ssDec.coords(ssDec(zs), resolution: 32); MLX.eval(coords)
+        let coords = topology?.ss ?? ssDec.coords(ssDec(zs), resolution: 32); MLX.eval(coords)
         metrics.ssDecodeS = -t.timeIntervalSinceNow
         metrics.voxels32 = coords.dim(0)
         capture?("ss", ["samples": zs, "coords": coords])
@@ -219,9 +225,10 @@ extension Trellis2Pipeline {
         let ceiling = maxHRTokens.map { min(49_152, $0) } ?? tier.hrTokenCeiling ?? 49_152
         let tokenCap = maxHRTokens != nil ? ceiling : min(ceiling, max(12_000, derivedCap))
         metrics.hrTokenCap = tokenCap
-        let (hrCoords, hrResolution) = Pixal3DProjection.requantize(
+        var (hrCoords, hrResolution) = Pixal3DProjection.requantize(
             upCoords: upCoords, lrResolution: 512, targetResolution: tier.targetResolution,
             maxNumTokens: tokenCap, hardMaxTokens: ceiling)
+        if let forced = topology?.hr { hrCoords = forced; hrResolution = tier.targetResolution }
         MLX.eval(hrCoords)
         metrics.upsampleRequantizeS = -t.timeIntervalSinceNow
         metrics.hrTokens = hrCoords.dim(0)

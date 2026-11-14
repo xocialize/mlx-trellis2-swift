@@ -11,6 +11,8 @@ public struct SparseStructureFlowModel {
     public let blocks: [ModulatedTransformerCrossBlock]
     public let resolution: Int
     public let numHeads: Int
+    /// Pixal3D projection-conditioned SS flow: every block has a `proj_linear` [C, 1024].
+    public var isProjection: Bool { blocks.first?.projW != nil }
 
     public init(weights w: [String: MLXArray], numBlocks: Int = 30, resolution: Int = 16, numHeads: Int = 12) {
         func g(_ k: String) -> MLXArray { w[k]!.asType(.float32) }
@@ -37,18 +39,23 @@ public struct SparseStructureFlowModel {
                     toOutW: g(p + "cross_attn.to_out.weight"), toOutB: g(p + "cross_attn.to_out.bias"), numHeads: numHeads),
                 mlp: FeedForwardNet(w0: g(p + "mlp.mlp.0.weight"), b0: g(p + "mlp.mlp.0.bias"),
                                     w2: g(p + "mlp.mlp.2.weight"), b2: g(p + "mlp.mlp.2.bias")),
-                channels: C)
+                channels: C,
+                projW: w[p + "cross_attn.proj_linear.weight"]?.asType(.float32),   // Pixal3D only
+                projB: w[p + "cross_attn.proj_linear.bias"]?.asType(.float32))
         }
     }
 
     /// x: [B, Cin, R, R, R]; t: [B]; cond: [B, N, D]; phases: [L, headDim/2, 2].
-    public func callAsFunction(_ x: MLXArray, t: MLXArray, cond: MLXArray, phases: MLXArray) -> MLXArray {
+    /// `proj` (Pixal3D only): projected DINOv3 features per grid token [B, L, 1024], token order =
+    /// the patchified 16³ order (x slowest). nil on a projection flow = zero conditioning (bias only).
+    public func callAsFunction(_ x: MLXArray, t: MLXArray, cond: MLXArray, phases: MLXArray,
+                               proj: MLXArray? = nil) -> MLXArray {
         let B = x.dim(0), Cin = x.dim(1)
         var h = x.reshaped([B, Cin, -1]).transposed(0, 2, 1)          // patchify -> [B, L, Cin]
         h = matmul(h, inputW.transposed()) + inputB                    // [B, L, C]
         var tEmb = tEmbedder(t)                                         // [B, C]
         tEmb = matmul(tEmb * MLX.sigmoid(tEmb), adaLNW.transposed()) + adaLNB   // SiLU→Linear -> [B, 6C]
-        for blk in blocks { h = blk(h, mod: tEmb, context: cond, phases: phases) }
+        for blk in blocks { h = blk(h, mod: tEmb, context: cond, phases: phases, proj: proj) }
         h = layerNorm32(h)                                             // final (no affine)
         h = matmul(h, outW.transposed()) + outB                        // [B, L, Cout]
         let R = resolution

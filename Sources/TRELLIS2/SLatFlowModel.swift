@@ -25,6 +25,10 @@ public struct SLatFlowModel {
     public let tEmbedder: TimestepEmbedder
     public let blocks: [ModulatedTransformerCrossBlock]
     public let numHeads: Int
+    /// Pixal3D projection-conditioned flow (`image_attn_mode: "proj"`): every block has a `proj_linear`.
+    public var isProjection: Bool { blocks.first?.projW != nil }
+    /// `proj_in_channels` (2048 for the Pixal3D SLat flows), or nil on a stock flow.
+    public var projInChannels: Int? { blocks.first?.projW?.dim(1) }
 
     public init(weights w: [String: MLXArray], numBlocks: Int = 30, numHeads: Int = 12) {
         func g(_ k: String) -> MLXArray { w[k]!.asType(.float32) }
@@ -50,20 +54,26 @@ public struct SLatFlowModel {
                     toOutW: g(p + "cross_attn.to_out.weight"), toOutB: g(p + "cross_attn.to_out.bias"), numHeads: numHeads),
                 mlp: FeedForwardNet(w0: g(p + "mlp.mlp.0.weight"), b0: g(p + "mlp.mlp.0.bias"),
                                     w2: g(p + "mlp.mlp.2.weight"), b2: g(p + "mlp.mlp.2.bias")),
-                channels: C)
+                channels: C,
+                projW: w[p + "cross_attn.proj_linear.weight"]?.asType(.float32),   // Pixal3D only
+                projB: w[p + "cross_attn.proj_linear.bias"]?.asType(.float32))
         }
     }
 
     /// `concatCond` (feats [T, Cc], same coords) is concatenated to x along the channel
     /// dim before input_layer — the tex SLat DiT's shape conditioning (sp.sparse_cat dim=-1).
-    public func callAsFunction(_ x: SparseTensor, t: MLXArray, cond: MLXArray, concatCond: MLXArray? = nil) -> SparseTensor {
+    /// `proj` (Pixal3D only): the projected image features at the voxel tokens, [T, P] (same order as
+    /// `x.coords`); nil on a projection flow means the zero (negative) conditioning — bias only.
+    public func callAsFunction(_ x: SparseTensor, t: MLXArray, cond: MLXArray, concatCond: MLXArray? = nil,
+                               proj: MLXArray? = nil) -> SparseTensor {
         let T = x.count
         let inFeats = concatCond == nil ? x.feats : MLX.concatenated([x.feats, concatCond!], axis: 1)
         var h = (matmul(inFeats, inputW.transposed()) + inputB).reshaped([1, T, -1])   // [1,T,C]
         var tEmb = tEmbedder(t)
         tEmb = matmul(tEmb * MLX.sigmoid(tEmb), adaLNW.transposed()) + adaLNB           // [1,6C]
         let phases = sparseRopePhases(coords: x.coords)
-        for blk in blocks { h = blk(h, mod: tEmb, context: cond, phases: phases) }
+        let projB = proj.map { $0.reshaped([1, T, -1]) }
+        for blk in blocks { h = blk(h, mod: tEmb, context: cond, phases: phases, proj: projB) }
         h = layerNorm32(h)
         let C = h.dim(2)
         let outFeats = matmul(h.reshaped([T, C]), outW.transposed()) + outB             // [T,Cout]

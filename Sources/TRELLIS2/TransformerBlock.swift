@@ -42,15 +42,39 @@ public struct ModulatedTransformerCrossBlock {
     public let crossAttn: MultiHeadCrossAttention
     public let mlp: FeedForwardNet
     public let channels: Int
+    /// Pixal3D `proj_attention` (AB-T-0485): per-block `proj_linear` [C, P] + bias [C]. nil on the
+    /// stock TRELLIS.2 flows. When set, the cross-attention output gets `proj_linear(proj)` added
+    /// (`ProjectAttention`: `cross_attn_block(x, global) + proj_linear(proj)`).
+    public let projW: MLXArray?
+    public let projB: MLXArray?
 
     public init(modulation: MLXArray, norm2W: MLXArray, norm2B: MLXArray,
                 selfAttn: MultiHeadAttention, crossAttn: MultiHeadCrossAttention,
-                mlp: FeedForwardNet, channels: Int) {
+                mlp: FeedForwardNet, channels: Int, projW: MLXArray? = nil, projB: MLXArray? = nil) {
         self.modulation = modulation; self.norm2W = norm2W; self.norm2B = norm2B
         self.selfAttn = selfAttn; self.crossAttn = crossAttn; self.mlp = mlp; self.channels = channels
+        self.projW = projW; self.projB = projB
     }
 
-    public func callAsFunction(_ x: MLXArray, mod: MLXArray, context: MLXArray, phases: MLXArray) -> MLXArray {
+    /// The projection-attention term for this block: `proj @ projW^T + projB` ([1,T,C]), or just
+    /// the bias when `proj` is nil — Pixal3D's negative conditioning is zeros, so the
+    /// unconditional branch adds only `proj_linear.bias`. nil on a stock block.
+    func projTerm(_ proj: MLXArray?) -> MLXArray? {
+        guard let projW, let projB else { return nil }
+        guard let proj else { return projB.reshaped([1, 1, -1]) }
+        return matmul(proj, projW.transposed()) + projB
+    }
+
+    /// The cross-attention sub-block on an already-normed input (Pixal3D `ProjectAttention`
+    /// forward; stock: plain cross-attention). Exposed for the `proj_linear` block-I/O gate.
+    public func crossTerm(_ normed: MLXArray, context: MLXArray, proj: MLXArray? = nil) -> MLXArray {
+        let h = crossAttn(normed, context: context)
+        if let p = projTerm(proj) { return h + p }
+        return h
+    }
+
+    public func callAsFunction(_ x: MLXArray, mod: MLXArray, context: MLXArray, phases: MLXArray,
+                               proj: MLXArray? = nil) -> MLXArray {
         let C = channels
         let parts = (modulation + mod).reshaped([1, 6, C])           // (self.modulation + mod).chunk(6)
         func p(_ i: Int) -> MLXArray { parts[0..., i].reshaped([1, 1, C]) }
@@ -64,7 +88,7 @@ public struct ModulatedTransformerCrossBlock {
         var out = x + h
 
         h = layerNorm32(out, weight: norm2W, bias: norm2B)          // norm2 (affine)
-        h = crossAttn(h, context: context)
+        h = crossTerm(h, context: context, proj: proj)              // + proj_linear(proj) (Pixal3D)
         out = out + h
 
         h = layerNorm32(out)                                        // norm3 (no affine)

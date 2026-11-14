@@ -13,7 +13,10 @@ import MLXRandom
 /// back-off to ≥1024), then the 1024 flows at hr resolution. SLat flow DiTs load lazily per
 /// tier (each is ~5.2 GB fp32-resident); `generate` prunes cached flows to the tier's set.
 public final class Trellis2Pipeline {
-    let ssDit: SparseStructureFlowModel
+    /// The stock SS flow DiT. Loaded at init unless `loadStockStructFlow` is false (a Pixal3D-only
+    /// host skips its 5.2 GB), then lazily on the first stock `generate`.
+    var ssDitCache: SparseStructureFlowModel?
+    let ssDitURL: URL
     let ssDec: SparseStructureDecoder
     let shapeDec: ShapeSlatDecoder
     let texDec: ShapeSlatDecoder     // FlexiDualGrid decoder w/ 6-ch (PBR) output weights
@@ -25,6 +28,22 @@ public final class Trellis2Pipeline {
     }
     private let flowURL: (FlowKind) -> URL
     private var flows: [FlowKind: SLatFlowModel] = [:]
+
+    // Pixal3D (AB-T-0485): projection-conditioned flows + NAF, from `pixal3dDir` (the converted
+    // `pixal3d_*.safetensors` + `naf.safetensors`; defaults to the consolidated dir). Lazy, cached.
+    public var pixal3dDir: String?
+    var pixal3dFlows: [Pixal3DFlowKind: SLatFlowModel] = [:]
+    var pixal3dSS: (multiView: Bool, model: SparseStructureFlowModel)?
+    var nafCache: NAF?
+    let weightsDir: String?
+
+    /// The stock SS flow DiT (loads it if a Pixal3D-only init skipped it).
+    func structFlow() throws -> SparseStructureFlowModel {
+        if let m = ssDitCache { return m }
+        let m = SparseStructureFlowModel(weights: try Self.loadMaterialized(ssDitURL))
+        ssDitCache = m
+        return m
+    }
 
     /// Load a safetensors file and MATERIALIZE it now, on the calling thread (AB-A-0263 follow-up).
     /// `loadArrays` alone is lazy: the file is read inside the first `eval` that needs it, so the
@@ -44,7 +63,9 @@ public final class Trellis2Pipeline {
         func load(_ f: String) throws -> [String: MLXArray] {
             try Self.loadMaterialized(URL(fileURLWithPath: "\(ckptDir)/\(f).safetensors"))
         }
-        ssDit = SparseStructureFlowModel(weights: try load("ss_flow_img_dit_1_3B_64_bf16"))
+        weightsDir = nil
+        ssDitURL = URL(fileURLWithPath: "\(ckptDir)/ss_flow_img_dit_1_3B_64_bf16.safetensors")
+        ssDitCache = SparseStructureFlowModel(weights: try Self.loadMaterialized(ssDitURL))
         ssDec = SparseStructureDecoder(weights: try Self.loadMaterialized(URL(fileURLWithPath: ssDecPath)))
         shapeDec = ShapeSlatDecoder(weights: try load("shape_dec_next_dc_f16c32_fp16"))
         texDec = ShapeSlatDecoder(weights: try load("tex_dec_next_dc_f16c32_fp16"))
@@ -66,11 +87,13 @@ public final class Trellis2Pipeline {
     /// `tex_flow_1024`/`tex_dec`/`dino` `.safetensors`) — the layout the `xocialize/trellis2-mlx`
     /// repo publishes and the `trellis2-consolidate` tool assembles. No key remap: the published
     /// keys ARE the Swift module keys (each component self-verifies via its parity gate).
-    public init(consolidatedDir dir: String) throws {
+    public init(consolidatedDir dir: String, loadStockStructFlow: Bool = true) throws {
         func load(_ f: String) throws -> [String: MLXArray] {
             try Self.loadMaterialized(URL(fileURLWithPath: "\(dir)/\(f).safetensors"))
         }
-        ssDit = SparseStructureFlowModel(weights: try load("struct_flow"))
+        weightsDir = dir
+        ssDitURL = URL(fileURLWithPath: "\(dir)/struct_flow.safetensors")
+        ssDitCache = loadStockStructFlow ? SparseStructureFlowModel(weights: try load("struct_flow")) : nil
         ssDec = SparseStructureDecoder(weights: try load("struct_dec"))
         shapeDec = ShapeSlatDecoder(weights: try load("shape_dec"))
         texDec = ShapeSlatDecoder(weights: try load("tex_dec"))
@@ -195,7 +218,7 @@ public final class Trellis2Pipeline {
         //    SLat grid (all tiers: upstream ss_res=32 for '512' and both cascades).
         var t = Date()
         TRELLIS2Config.sdpaCastDtype = nil   // SS: fp32 SDPA, unconditionally
-        let zs = FlowEulerSampler.sampleSS(model: ssDit, noise: ssNoise, cond: cond, negCond: negCond, phases: ssPhases,
+        let zs = FlowEulerSampler.sampleSS(model: try structFlow(), noise: ssNoise, cond: cond, negCond: negCond, phases: ssPhases,
                                            steps: steps, guidanceStrength: 7.5, guidanceRescale: 0.7,
                                            guidanceInterval: (0.6, 1.0), rescaleT: 5.0)
         MLX.eval(zs); metrics.ssSampleS = -t.timeIntervalSinceNow   // [1a] SS flow sampler

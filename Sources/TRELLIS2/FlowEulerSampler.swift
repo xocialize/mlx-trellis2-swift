@@ -65,14 +65,8 @@ public enum FlowEulerSampler {
                     cachedVNeg = vNeg
                 }
                 cfgStep += 1
-                v = s * vPos + (1 - s) * vNeg
-                if guidanceRescale > 0 {
-                    let x0Pos = predToXstart(x, t, vPos, sigmaMin: sigmaMin)
-                    let x0Cfg = predToXstart(x, t, v, sigmaMin: sigmaMin)
-                    let x0Res = x0Cfg * (stdAll(x0Pos) / stdAll(x0Cfg))
-                    let x0 = guidanceRescale * x0Res + (1 - guidanceRescale) * x0Cfg
-                    v = xstartToPred(x, t, x0, sigmaMin: sigmaMin)
-                }
+                v = guided(x: x, t: t, vPos: vPos, vNeg: vNeg, strength: s,
+                           rescale: guidanceRescale, sigmaMin: sigmaMin)
             }
             x = x - (t - tPrev) * v
             MLX.eval(x)
@@ -80,15 +74,40 @@ public enum FlowEulerSampler {
         return x
     }
 
+    /// The step schedule `runLoop` uses (warped linspace(1,0,steps+1), computed in Double).
+    public static func schedule(steps: Int, rescaleT: Float) -> [Double] {
+        let rT = Double(rescaleT)
+        return (0...steps).map { i in
+            let lt = 1.0 - Double(i) / Double(steps)
+            return rT * lt / (1 + (rT - 1) * lt)
+        }
+    }
+
+    /// CFG combination + optional CFG-rescale for one step (the body of `runLoop`'s guided branch).
+    public static func guided(x: MLXArray, t: Float, vPos: MLXArray, vNeg: MLXArray, strength s: Float,
+                              rescale guidanceRescale: Float, sigmaMin: Float = 1e-5) -> MLXArray {
+        var v = s * vPos + (1 - s) * vNeg
+        if guidanceRescale > 0 {
+            let x0Pos = predToXstart(x, t, vPos, sigmaMin: sigmaMin)
+            let x0Cfg = predToXstart(x, t, v, sigmaMin: sigmaMin)
+            let x0Res = x0Cfg * (stdAll(x0Pos) / stdAll(x0Cfg))
+            let x0 = guidanceRescale * x0Res + (1 - guidanceRescale) * x0Cfg
+            v = xstartToPred(x, t, x0, sigmaMin: sigmaMin)
+        }
+        return v
+    }
+
     /// Dense sparse-structure stage. `model(x, t1000, cond, phases) -> v`.
     public static func sampleSS(
         model: SparseStructureFlowModel, noise: MLXArray, cond: MLXArray, negCond: MLXArray, phases: MLXArray,
+        proj: MLXArray? = nil,
         steps: Int = 12, guidanceStrength: Float = 7.5, guidanceRescale: Float = 0.7,
         guidanceInterval: (Float, Float) = (0.6, 1.0), rescaleT: Float = 5.0, sigmaMin: Float = 1e-5
     ) -> MLXArray {
+        // Pixal3D: `proj` rides the positive branch only; the negative branch is zero proj (bias only).
         runLoop(noise: noise, steps: steps, guidanceStrength: guidanceStrength, guidanceRescale: guidanceRescale,
                 guidanceInterval: guidanceInterval, rescaleT: rescaleT, sigmaMin: sigmaMin) { x, t1000, useCond in
-            model(x, t: t1000, cond: useCond ? cond : negCond, phases: phases)
+            model(x, t: t1000, cond: useCond ? cond : negCond, phases: phases, proj: useCond ? proj : nil)
         }
     }
 
@@ -97,13 +116,14 @@ public enum FlowEulerSampler {
     /// Returns the sampled feats [T, C].
     public static func sampleSLat(
         model: SLatFlowModel, noiseFeats: MLXArray, coords: MLXArray, cond: MLXArray, negCond: MLXArray,
-        concatCond: MLXArray? = nil, steps: Int = 12, guidanceStrength: Float = 7.5, guidanceRescale: Float = 0.5,
+        concatCond: MLXArray? = nil, proj: MLXArray? = nil, steps: Int = 12, guidanceStrength: Float = 7.5, guidanceRescale: Float = 0.5,
         guidanceInterval: (Float, Float) = (0.6, 1.0), rescaleT: Float = 3.0, sigmaMin: Float = 1e-5,
         negEvery: Int = 1
     ) -> MLXArray {
         runLoop(noise: noiseFeats, steps: steps, guidanceStrength: guidanceStrength, guidanceRescale: guidanceRescale,
                 guidanceInterval: guidanceInterval, rescaleT: rescaleT, sigmaMin: sigmaMin, negEvery: negEvery) { x, t1000, useCond in
-            model(SparseTensor(feats: x, coords: coords), t: t1000, cond: useCond ? cond : negCond, concatCond: concatCond).feats
+            model(SparseTensor(feats: x, coords: coords), t: t1000, cond: useCond ? cond : negCond,
+                  concatCond: concatCond, proj: useCond ? proj : nil).feats
         }
     }
 }

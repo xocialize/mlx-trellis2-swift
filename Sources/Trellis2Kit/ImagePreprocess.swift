@@ -305,3 +305,15 @@ enum ImagePreprocess {
         return rgb
     }
 }
+
+/// Public face of the Pixal3D preprocessing (AB-T-0485), for hosts and the parity gate.
+public enum Pixal3DPreprocess {
+    /// Single view: alpha-bbox crop with a 1.1 margin, black composite, resize. (normalized, guide), NCHW.
+    public static func singleView(_ image: Image, size: Int) throws -> (normalized: MLXArray, guide: MLXArray) {
+        try ImagePreprocess.pixal3dPixels(from: image, size: size)
+    }
+    /// Posed multi-view: no crop, full-frame resize, RGB premultiplied by alpha. (normalized, guide), NCHW.
+    public static func posedView(_ image: Image, size: Int) throws -> (normalized: MLXArray, guide: MLXArray) {
+        try ImagePreprocess.pixal3dViewPixels(from: image, size: size)
+    }
+}

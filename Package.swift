@@ -84,7 +84,8 @@ let package = Package(
         ], swiftSettings: [.interoperabilityMode(.Cxx)]),
         // Pixal3D (AB-T-0485 P2): every stage of the projection-conditioned path vs the CUDA goldens.
         .executableTarget(name: "pixal3dparity", dependencies: [
-            "TRELLIS2", .product(name: "MLX", package: "mlx-swift"),
+            "TRELLIS2", "Trellis2Kit", .product(name: "MLXToolKit", package: "mlx-engine-swift"),
+            .product(name: "MLX", package: "mlx-swift"),
             .product(name: "MLXRandom", package: "mlx-swift"),
         ], swiftSettings: [.interoperabilityMode(.Cxx)]),
         .executableTarget(name: "meshbake", dependencies: [

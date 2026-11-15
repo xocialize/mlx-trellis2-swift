@@ -164,6 +164,13 @@ extension Trellis2Pipeline {
         precondition(!views.isEmpty)
         let mv = multiViewWeights ?? (views.count > 1)
         releaseFlows()                          // the stock SLat flows are not part of this job
+        // one twin set resident: drop the other set's flows before this job loads its own
+        let keep = Set(Self.pixal3dFlowKinds(multiView: mv))
+        if pixal3dFlows.keys.contains(where: { !keep.contains($0) }) {
+            pixal3dFlows = pixal3dFlows.filter { keep.contains($0.key) }
+            if let ss = pixal3dSS, ss.multiView != mv { pixal3dSS = nil }
+            MLX.Memory.clearCache()
+        }
         let cams = views.map(\.camera)
         let cond = try pixal3dConditioner()
 

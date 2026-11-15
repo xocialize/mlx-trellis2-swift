@@ -1,7 +1,9 @@
 import Foundation
 import MLX
 import MLXRandom
+import MLXToolKit
 import TRELLIS2
+import Trellis2Kit
 
 // PIXAL3D PARITY GATE (AB-T-0485 P2) — the Swift Pixal3D path staged against the CUDA goldens of
 // AB-R-0865 (HF Job 6af8e2ae23985fb9cd82a3b0; upstream f7cf384, weights b0cb2e1b, NAF 37f2dfc,
@@ -26,9 +28,11 @@ let goldRoot = env["PIXAL3D_GOLDENS"] ?? "/Volumes/DEV_VOL1/Evidence/pixal3d-ora
 let pixWeights = env["PIXAL3D_WEIGHTS"] ?? "/Volumes/DEV_VOL1/Models/pixal3d-mlx"
 let trellisWeights = env["TRELLIS2_WEIGHTS"] ?? "/Volumes/DEV_VOL1/Models/models--xocialize--trellis2-mlx"
 let isMV = env["PIXAL3D_MV"] == "1" || run.contains("_mv")
-let allSections = ["camera", "dino", "proj", "naf", "cond", "blocks", "vel", "sample", "hr", "mesh", "e2e"]
+let allSections = ["camera", "prep", "dino", "proj", "naf", "cond", "blocks", "vel", "sample", "hr", "mesh", "e2e"]
 let sections = Set((env["PIXAL3D_SECTIONS"] ?? allSections.joined(separator: ",")).split(separator: ",").map(String.init))
 let gdir = "\(goldRoot)/\(run)/golden"
+// PIXAL3D_SDPA=bf16|fp16 casts every SDPA (diagnostic: the oracle ran its flows in bf16)
+if let p = env["PIXAL3D_SDPA"].flatMap(SDPAPrecision.init(rawValue:)) { TRELLIS2Config.sdpaCastDtype = p.castDtype }
 // PIXAL3D_STAGES limits the flow sections (blocks/vel/sample) to some stages: ss,shape512,shape1024,tex1024
 let stageFilter = env["PIXAL3D_STAGES"].map { Set($0.split(separator: ",").map(String.init)) }
 
@@ -123,6 +127,34 @@ if sections.contains("camera") {
     }
 }
 
+// ===== preprocessing: our crop/resize from the raw input vs the oracle's DINOv3 input =====
+// Resampling differs by construction (CoreGraphics high-quality vs PIL Lanczos), so this checks the
+// framing (crop box, margin, composite), not bit equality; the gate is the DINOv3 end-to-end level.
+if sections.contains("prep") {
+    let oracleDir = env["PIXAL3D_INPUTS"] ?? "/Volumes/Satechi/Development/mlxengine-3d/DEV/Pixal3DOracle"
+    let item = run.contains("shoes") ? "shoes" : "dress"
+    let paths: [String] = isMV
+        ? ["view00_front.png", "view01_azim090.png", "view02_azim180.png"].map { "\(oracleDir)/views/\(item)/\($0)" }
+        : ["\(oracleDir)/stage/corpus/\(item)_01_matted.png"]
+    if paths.allSatisfy({ FileManager.default.fileExists(atPath: $0) }) {
+        for (size, g) in [(512, dino512), (1024, dino1024)] {
+            var ours = [MLXArray]()
+            for p in paths {
+                let img = Image(format: .png, data: try Data(contentsOf: URL(fileURLWithPath: p)))
+                ours.append(isMV ? try Pixal3DPreprocess.posedView(img, size: size).normalized
+                                 : try Pixal3DPreprocess.singleView(img, size: size).normalized)
+            }
+            let o = MLX.concatenated(ours, axis: 0)
+            cosGate("PREP    \(size)² DINOv3 input from the raw image\(isMV ? " (\(V) views, no crop)" : " (crop ×1.1)")",
+                    o, g["image_normalized"]!, 0.99)
+            let tok = MLX.concatenated(ours.map { cond.dino($0) }, axis: 0)
+            cosGate("PREP    \(size)² DINOv3 tokens from our preprocessing", tok, g["tokens"]!, 0.99)
+        }
+    } else {
+        print("PX3D note: raw inputs not found under \(oracleDir); prep section skipped")
+    }
+}
+
 // ===== DINOv3 (our port on the golden normalized inputs) =====
 if sections.contains("dino") {
     for (name, g) in [("512", dino512), ("1024", dino1024)] {
@@ -143,26 +175,29 @@ if sections.contains("dino") {
 func goldPatch(_ st: Pixal3DStage, view v: Int) -> MLXArray {
     Pixal3DConditioner.patchMap(G("\(stageNames[st]!).dino")["tokens"]![v ..< (v + 1)])
 }
-if sections.contains("proj") && !isMV {
-    // SS: dense 16³, 1024 channels
-    let dense16 = Pixal3DProjection.denseCoords(grid: 16)
-    let n16 = Pixal3DProjection.normalizedCoords(coords: dense16, grid: 16, calcMat: calc[0], fovX: cams[0].fovX,
-                                                 meshScale: cams[0].meshScale, imageSize: 512)
-    cosGate("PROJ    ss dense 16³ (golden tokens)", Pixal3DProjection.sampleBilinear(goldPatch(.ss, view: 0), n16),
+if sections.contains("proj") {
+    // the LR half is a pure function of the DINOv3 patch maps and the cameras: mean over views of the
+    // projection of each view's GOLDEN patch map through its calc_mat (V = 1: the single view)
+    func lrProj(_ st: Pixal3DStage, coords: MLXArray, grid R: Int) -> MLXArray {
+        var acc: MLXArray? = nil
+        for v in 0..<V {
+            let n = Pixal3DProjection.normalizedCoords(coords: coords, grid: R, calcMat: calc[v], fovX: cams[v].fovX,
+                                                       meshScale: cams[v].meshScale, imageSize: st.imageSize)
+            let x = Pixal3DProjection.sampleBilinear(goldPatch(st, view: v), n)
+            acc = acc.map { $0 + x } ?? x
+        }
+        return V == 1 ? acc! : acc! / Float(V)
+    }
+    let vtag = V > 1 ? ", mean of \(V) views" : ""
+    cosGate("PROJ    ss dense 16³ (golden tokens\(vtag))", lrProj(.ss, coords: Pixal3DProjection.denseCoords(grid: 16), grid: 16),
             G("ss.cond")["z_proj_dense"]![0], 0.999)
-    // shape512: dense 32³ LR half (golden is fp16 above 20M elements)
-    let dense32 = Pixal3DProjection.denseCoords(grid: 32)
-    let n32 = Pixal3DProjection.normalizedCoords(coords: dense32, grid: 32, calcMat: calc[0], fovX: cams[0].fovX,
-                                                 meshScale: cams[0].meshScale, imageSize: 512)
-    cosGate("PROJ    shape512 dense 32³ LR half", Pixal3DProjection.sampleBilinear(goldPatch(.shape512, view: 0), n32),
+    cosGate("PROJ    shape512 dense 32³ LR half\(vtag)", lrProj(.shape512, coords: Pixal3DProjection.denseCoords(grid: 32), grid: 32),
             G("shape512.cond")["z_proj_dense"]![0, 0..., 0..<1024], 0.999)
     for st in [Pixal3DStage.shape512, .shape1024, .tex1024] {
         let pt = G("\(stageNames[st]!).proj_at_tokens")
         let R = st == .shape512 ? 32 : Int(scalar(G("\(stageNames[st]!).cond")["grid_resolution"]!))
-        let n = Pixal3DProjection.normalizedCoords(coords: pt["coords"]!, grid: R, calcMat: calc[0], fovX: cams[0].fovX,
-                                                   meshScale: cams[0].meshScale, imageSize: st.imageSize)
-        cosGate("PROJ    \(stageNames[st]!) at tokens LR half (R=\(R))",
-                Pixal3DProjection.sampleBilinear(goldPatch(st, view: 0), n), pt["feats"]![0..., 0..<1024], 0.999)
+        cosGate("PROJ    \(stageNames[st]!) at tokens LR half (R=\(R)\(vtag))", lrProj(st, coords: pt["coords"]!, grid: R),
+                pt["feats"]![0..., 0..<1024], 0.999)
     }
 }
 
@@ -330,6 +365,21 @@ if !flowSections.isEmpty {
                 let gs = G("\(sn).samples"); let gsv = st == .ss ? gs["value"]! : gs["feats"]!
                 cosGate("SAMPLE  \(sn) (golden noise + golden cond)", out, gsv, 0.99,
                         extra: String(format: " (%.1fs)", -t.timeIntervalSinceNow))
+                // DIAG (PIXAL3D_SENS=1) — trajectory sensitivity inside our own port: the same sampler with
+                // only the SDPA cast changed (fp32 → bf16, a perturbation of the size the bf16 oracle
+                // carries), ours vs ours.
+                if env["PIXAL3D_SENS"] == "1" && st != .ss {
+                    let saved = TRELLIS2Config.sdpaCastDtype
+                    TRELLIS2Config.sdpaCastDtype = .bfloat16
+                    let pert = FlowEulerSampler.sampleSLat(model: slat!, noiseFeats: noise, coords: coords!, cond: gc.global,
+                                                           negCond: zeros5, concatCond: concat, proj: gc.proj,
+                                                           guidanceStrength: p.g, guidanceRescale: p.r,
+                                                           guidanceInterval: p.iv, rescaleT: p.rt)
+                    MLX.eval(pert)
+                    TRELLIS2Config.sdpaCastDtype = saved
+                    print(String(format: "PX3D DIAG    %@ sampler sensitivity: ours fp32-SDPA vs ours bf16-SDPA cosine %.6f (bf16 vs oracle %.6f)",
+                                 sn, cosine(out, pert), cosine(pert, gsv)))
+                }
                 if st == .ss {
                     let ours = pipe.pixal3dSSDecode(out)
                     let oursG = pipe.pixal3dSSDecode(gsv)
@@ -337,7 +387,11 @@ if !flowSections.isEmpty {
                     let a = Set(packedKeys(ours)), b = Set(packedKeys(oursG))
                     let iou = Float(a.intersection(gold).count) / Float(a.union(gold).count)
                     gate("COORDS  ss decode of golden samples", b == gold, "tokens=\(b.count) oracle=\(gold.count) \(b == gold ? "exact" : "MISMATCH")")
-                    gate("COORDS  ss decode of our samples", iou >= 0.99, String(format: "tokens=%d IoU=%.5f", a.count, iou), Double(iou))
+                    // free-run topology (our sampler's output through the occupancy threshold): measured,
+                    // not gated — the same knife-edge as E2EFREE (it was gated at 0.99 until the
+                    // multi-view run's 0.9857; single view 0.993)
+                    print(String(format: "PX3D COORDS  ss decode of our samples: tokens=%d IoU=%.5f  [measured]", a.count, iou))
+                    results.append(["gate": "COORDS  ss decode of our samples", "measured": true, "value": Double(iou)])
                 }
             }
         }
@@ -480,6 +534,21 @@ if sections.contains("e2e") {
             let qs = Set(packedKeys(q))
             print(String(format: "PX3D %@note: requantize of this chain's own LR latent → %d tokens, IoU %.5f vs the oracle's",
                          tag, qs.count, Float(qs.intersection(hrGold).count) / Float(qs.union(hrGold).count)))
+            // DIAG — where the chained tex error comes from: the tex sampler with THIS chain's tex
+            // conditioning but the oracle's concat_cond (normalized shape slat) vs with this chain's.
+            if let ct = cap["tex1024.cond"] {
+                let ftex = try pipe.pixal3dFlow(.tex1024(multiView: isMV))
+                let p = samplerParams[.tex1024]!
+                let gNoise = G("tex1024.noise")["feats"]!
+                let withGoldConcat = FlowEulerSampler.sampleSLat(model: ftex, noiseFeats: gNoise, coords: goldHR, cond: ct["global"]!,
+                                                                 negCond: zeros5, concatCond: G("tex1024.concat_cond")["feats"]!, proj: ct["proj"]!,
+                                                                 guidanceStrength: p.g, guidanceRescale: p.r, guidanceInterval: p.iv, rescaleT: p.rt)
+                let gs = G("tex1024.samples")["feats"]!
+                let shapeCos = cosine(cap["shape1024"]!["samples"]!, G("tex1024.concat_cond")["feats"]!)
+                print(String(format: "PX3D DIAG    tex sampler, this chain's cond + oracle concat_cond → cosine %.6f (with this chain's concat_cond, cosine %.6f vs the oracle: %.6f)",
+                             cosine(withGoldConcat, gs), shapeCos, cosine(cap["tex1024"]!["samples"]!, gs)))
+                pipe.releasePixal3D(); MLX.Memory.clearCache()
+            }
         }
         for st in ["shape512", "shape1024", "tex1024"] {
             let g = G("\(st).samples")

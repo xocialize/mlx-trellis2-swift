@@ -121,13 +121,15 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
     /// and SLat flows, preload the single-view Pixal3D set at prepare, and default every request to
     /// `pixal3d: true`. nil/false = a stock registration (Pixal3D still available per request, lazily).
     public var pixal3dOnly: Bool?
+    /// With `pixal3dOnly`: preload the posed multi-view (`_mv`) set instead of the single-view one.
+    public var pixal3dMultiView: Bool?
 
     /// Explicit Codable surface: everything except the `matting` closure (which decodes to nil).
     enum CodingKeys: String, CodingKey {
         case quant, defaultMode, tierCeiling, maxAtlasSize, modelsRootDirectory, weightsRootOverride
         case steps, seed, texture, decimateFaces, yUpOutput, unwrapBackend, metricsPath
         case slatCfgAttention, texAttention, slatCfgInterval, slatCfgNegEvery, maxHRTokens
-        case additionalViewsScope, pixal3dWeightsDir, pixal3dOnly
+        case additionalViewsScope, pixal3dWeightsDir, pixal3dOnly, pixal3dMultiView
     }
 
     public init(quant: Quant = .bf16,
@@ -151,7 +153,8 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
                 additionalViewsScope: String? = nil,
                 matting: Trellis2Matting? = nil,
                 pixal3dWeightsDir: URL? = nil,
-                pixal3dOnly: Bool? = nil) {
+                pixal3dOnly: Bool? = nil,
+                pixal3dMultiView: Bool? = nil) {
         self.quant = quant
         self.defaultMode = defaultMode
         self.tierCeiling = tierCeiling
@@ -174,6 +177,7 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
         self.matting = matting
         self.pixal3dWeightsDir = pixal3dWeightsDir
         self.pixal3dOnly = pixal3dOnly
+        self.pixal3dMultiView = pixal3dMultiView
     }
 }
 
@@ -492,7 +496,7 @@ public final class Trellis2Package: ModelPackage {
         pipeline = try Trellis2Pipeline(consolidatedDir: ckptDir, loadStockStructFlow: !pixal3dOnly)
         pipeline?.pixal3dDir = configuration.pixal3dWeightsDir?.path   // nil → the consolidated dir
         if pixal3dOnly {
-            try pipeline?.preloadPixal3D(multiView: false)
+            try pipeline?.preloadPixal3D(multiView: configuration.pixal3dMultiView ?? false)
         }
         // A lane knows its tier: load its flows now (prepare), so a job reads nothing from disk and its
         // resident set is the declared one from the start. Without a tierCeiling they stay lazy.

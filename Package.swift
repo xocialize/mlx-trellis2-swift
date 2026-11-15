@@ -123,7 +123,7 @@ let package = Package(
         // MLXServeConformance; NO MLX kernels, NO weights — safe as a plain `swift run` (the CLI lane
         // the skill prescribes so nothing runs under `swift test`, whose metallib is unreliable).
         .executableTarget(name: "trellis2-gate", dependencies: [
-            "Trellis2Kit", "TRELLIS2",
+            "Trellis2Kit", "TRELLIS2", "MLXMesh",
             .product(name: "MLX", package: "mlx-swift"),
             .product(name: "MLXToolKit", package: "mlx-engine-swift"),
             .product(name: "MLXServeConformance", package: "mlx-engine-swift"),

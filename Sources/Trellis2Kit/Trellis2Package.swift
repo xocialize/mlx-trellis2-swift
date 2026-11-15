@@ -123,15 +123,13 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
     public var pixal3dOnly: Bool?
     /// With `pixal3dOnly`: preload the posed multi-view (`_mv`) set instead of the single-view one.
     public var pixal3dMultiView: Bool?
-    /// Pixal3D res512 texture (AB-T-0485 P3): "stockTex512" or "pixal3dTex1024"; nil = the package default.
-    public var pixal3dRes512Texture: String?
 
     /// Explicit Codable surface: everything except the `matting` closure (which decodes to nil).
     enum CodingKeys: String, CodingKey {
         case quant, defaultMode, tierCeiling, maxAtlasSize, modelsRootDirectory, weightsRootOverride
         case steps, seed, texture, decimateFaces, yUpOutput, unwrapBackend, metricsPath
         case slatCfgAttention, texAttention, slatCfgInterval, slatCfgNegEvery, maxHRTokens
-        case additionalViewsScope, pixal3dWeightsDir, pixal3dOnly, pixal3dMultiView, pixal3dRes512Texture
+        case additionalViewsScope, pixal3dWeightsDir, pixal3dOnly, pixal3dMultiView
     }
 
     public init(quant: Quant = .bf16,
@@ -156,8 +154,7 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
                 matting: Trellis2Matting? = nil,
                 pixal3dWeightsDir: URL? = nil,
                 pixal3dOnly: Bool? = nil,
-                pixal3dMultiView: Bool? = nil,
-                pixal3dRes512Texture: String? = nil) {
+                pixal3dMultiView: Bool? = nil) {
         self.quant = quant
         self.defaultMode = defaultMode
         self.tierCeiling = tierCeiling
@@ -181,7 +178,6 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
         self.pixal3dWeightsDir = pixal3dWeightsDir
         self.pixal3dOnly = pixal3dOnly
         self.pixal3dMultiView = pixal3dMultiView
-        self.pixal3dRes512Texture = pixal3dRes512Texture
     }
 }
 
@@ -190,15 +186,6 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
 /// `MLXServeEngine.run(.matting)`; throws propagate out of `Trellis2Package.run()` (a broken matter
 /// is a failed generation, not a silent full-frame fallback).
 public typealias Trellis2Matting = @Sendable (Image) async throws -> Matte
-
-extension Trellis2Configuration {
-    /// The res512 texture a Pixal3D res512 job uses (configuration, else the package default).
-    public var pixal3dRes512TextureChoice: Pixal3DRes512Texture {
-        pixal3dRes512Texture.flatMap(Pixal3DRes512Texture.init(rawValue:)) ?? Self.pixal3dRes512TextureDefault
-    }
-    /// Package default for the Pixal3D res512 texture (set by the P3 res512 study, README "Pixal3D mode").
-    public static let pixal3dRes512TextureDefault: Pixal3DRes512Texture = .stockTex512
-}
 
 // MARK: - Per-tier footprints (contract 1.13/1.14 FootprintConfigured; AB-A-0262)
 
@@ -212,6 +199,20 @@ extension Trellis2Configuration {
         Trellis2Configuration(defaultMode: tier, tierCeiling: tier, maxAtlasSize: maxAtlasSize,
                               modelsRootDirectory: modelsRootDirectory, weightsRootOverride: weightsRootOverride)
     }
+
+    /// A Pixal3D lane (AB-T-0485 P3): `pixal3dOnly`, pinned to a cascade `tier` (res1024 or res1536 —
+    /// res512 has no Pixal3D path), charged Pixal3D's footprint (`Trellis2Footprint.pixal3d…`). Every
+    /// request on it runs Pixal3D; the stock flows are never loaded. Weights: the stock snapshot
+    /// (decoders, DINOv3) + `xocialize/pixal3d-mlx`.
+    public static func pixal3dLane(_ tier: Mode, maxAtlasSize: Int = 1024, modelsRootDirectory: URL? = nil,
+                                   weightsRootOverride: URL? = nil, pixal3dWeightsDir: URL? = nil) -> Trellis2Configuration {
+        Trellis2Configuration(defaultMode: tier, tierCeiling: tier, maxAtlasSize: maxAtlasSize,
+                              modelsRootDirectory: modelsRootDirectory, weightsRootOverride: weightsRootOverride,
+                              pixal3dWeightsDir: pixal3dWeightsDir, pixal3dOnly: true)
+    }
+
+    /// True for a Pixal3D-only registration.
+    public var isPixal3DLane: Bool { pixal3dOnly ?? false }
 
     /// The tier the footprint is declared for: the lane's ceiling, else the default mode.
     public var chargedTier: Trellis2Tier { Trellis2Tier(mode: tierCeiling ?? defaultMode) }
@@ -284,6 +285,45 @@ public enum Trellis2Footprint {
     public static let measuredTokenCeiling = 32_768
     public static let activationPerHRTokenBeyond: Double = 1_550_000
 
+    // MARK: Pixal3D lanes (AB-T-0485 P3) — measured 2026-11-14, README "Pixal3D mode"
+    // Release, M5 Max 128 GB, mlx-engine-swift 0.74.1, `pixal3dOnly` lane through trellis2-run-engine
+    // (phys_footprint every 200 ms, one fresh process per run, matted inputs, no BiRefNet):
+    //   tier     asset   HR tokens (res)    peak phys   post-run resident
+    //   res1024  dress    8,500 (1024)       41.63 GB    31.21 GB
+    //   res1024  hair    10,729 (1024)       43.81 GB    30.98 GB
+    //   res1024  skirt   12,742 (1024)       43.37 GB    31.26 GB
+    //   res1024  shoes   15,242 (1024)       51.58 GB    31.11 GB
+    //   res1024  top      8,851 (1024)       41.02 GB    31.33 GB
+    //   res1536  dress   20,289 (1536)       56.36 GB    31.69 GB
+    //   res1536  hair    28,243 (1536)       66.90 GB    31.42 GB
+    //   res1536  skirt   29,804 (1536)       62.28 GB    31.34 GB
+    //   res1536  shoes   26,167 (1280)       65.14 GB    31.62 GB   (token back-off)
+    //   res1536  top     20,712 (1536)       56.54 GB    31.75 GB
+    // Activation over resident is bounded by 4 GB + 1.2 MB/token (every point ≥ 5.6 % under it).
+    /// Pixal3D cascade resident: Pixal3D SS + shape_512 + shape_1024 + tex_1024 (fp32-cast) + NAF + the
+    /// stock decoders + DINOv3.
+    public static let pixal3dResidentCascade: UInt64 = 32_000_000_000
+    /// Pixal3D cascade activation over resident: base + slope × HR tokens (fit through the measured
+    /// peaks plus headroom), charged at the tier's token bound; past `measuredTokenCeiling` the
+    /// conservative 1.55 MB/token.
+    public static let pixal3dCascadeActivationBase: UInt64 = 4_000_000_000
+    public static let pixal3dActivationPerHRToken: Double = 1_200_000
+    public static func pixal3dCascadeActivation(tokens: Int) -> UInt64 {
+        let inRange = min(tokens, measuredTokenCeiling), beyond = max(0, tokens - measuredTokenCeiling)
+        let bytes = Double(pixal3dCascadeActivationBase) + pixal3dActivationPerHRToken * Double(inRange)
+            + activationPerHRTokenBeyond * Double(beyond)
+        return UInt64(bytes.rounded(.up))
+    }
+
+    /// The manifest's footprint: the larger res1536 lane, stock or Pixal3D.
+    public static var worstLane: QuantFootprint {
+        let t = Trellis2Tier.res1536.hrTokenCeiling ?? 49_152
+        let stock = (residentCascade, cascadeActivation(tokens: t))
+        let pix = (pixal3dResidentCascade, pixal3dCascadeActivation(tokens: t))
+        let w = stock.0 + stock.1 >= pix.0 + pix.1 ? stock : pix
+        return QuantFootprint(quant: .bf16, residentBytes: w.0, peakActivationBytes: w.1)
+    }
+
     /// Activation for a cascade run of at most `tokens` HR tokens.
     public static func cascadeActivation(tokens: Int) -> UInt64 {
         let inRange = min(tokens, measuredTokenCeiling), beyond = max(0, tokens - measuredTokenCeiling)
@@ -298,9 +338,11 @@ extension Trellis2Configuration: FootprintConfigured {
     /// Without a `tierCeiling` a request above the configured tier is not re-charged; with one it is
     /// refused, so a lane's charge holds. Numbers: `Trellis2Footprint`.
     public var residentBytesHint: UInt64? {
-        chargedTier.isCascade ? Trellis2Footprint.residentCascade : Trellis2Footprint.residentRes512
+        if isPixal3DLane && chargedTier.isCascade { return Trellis2Footprint.pixal3dResidentCascade }
+        return chargedTier.isCascade ? Trellis2Footprint.residentCascade : Trellis2Footprint.residentRes512
     }
     public var peakActivationBytesHint: UInt64? {
+        if isPixal3DLane, let tokens = hrTokenBound { return Trellis2Footprint.pixal3dCascadeActivation(tokens: tokens) }
         guard let tokens = hrTokenBound else { return Trellis2Footprint.activationRes512(maxAtlasSize: maxAtlasSize) }
         return Trellis2Footprint.cascadeActivation(tokens: tokens)
     }
@@ -346,12 +388,57 @@ extension Trellis2Configuration: WeightSourcing {
     public var weightSources: [WeightSource] {
         [WeightSource(role: "snapshot", repo: Self.consolidatedRepo,
                       matching: ["*.safetensors", "*.json", "LICENSE", "NOTICE", "DINOv3_LICENSE.md"])]
+            + (isPixal3DLane ? [Self.pixal3dSource] : [])
+    }
+
+    // Pixal3D weights (AB-T-0485 P3): a second snapshot, declared only by a Pixal3D lane.
+    public static let pixal3dRepo = "xocialize/pixal3d-mlx"
+    static let pixal3dSource = WeightSource(role: "pixal3d", repo: pixal3dRepo,
+                                            matching: ["*.safetensors", "*.json", "LICENSE", "NOTICE", "NAF_LICENSE"])
+    /// The single-view set the repo publishes. The posed multi-view `_mv` set is not published: a
+    /// multi-view lane needs it in `pixal3dWeightsDir` (`Tools/pixal3d/convert_weights.py --mv`).
+    public static func pixal3dProbeFiles(multiView: Bool) -> [String] {
+        let sfx = multiView ? "_mv" : ""
+        return ["pixal3d_struct_flow", "pixal3d_shape_flow_512", "pixal3d_shape_flow_1024", "pixal3d_tex_flow_1024"]
+            .map { "\($0)\(sfx).safetensors" } + ["naf.safetensors"]
+    }
+    /// Content guard: a Pixal3D flow carries `proj_linear` (a stock flow under the same name would not).
+    public static let pixal3dCanonicalKey = "blocks.0.cross_attn.proj_linear.weight"
+
+    static func pixal3dPresent(at dir: URL, multiView: Bool) -> Bool {
+        let fm = FileManager.default
+        guard pixal3dProbeFiles(multiView: multiView).allSatisfy({ fm.fileExists(atPath: dir.appending(path: $0).path) })
+        else { return false }
+        return safetensorsHeaderContains(dir.appending(path: "pixal3d_struct_flow\(multiView ? "_mv" : "").safetensors"),
+                                         key: pixal3dCanonicalKey)
+    }
+
+    /// Where the Pixal3D weights are: `pixal3dWeightsDir` (flat or `<dir>/xocialize/pixal3d-mlx`), the
+    /// ModelStore copy of `xocialize/pixal3d-mlx`, then the stock snapshot dir (a local all-in-one
+    /// folder). nil when none holds the set this configuration runs.
+    public func pixal3dSnapshotDir(storeRoot: URL?, stockDir: URL? = nil) -> URL? {
+        let mv = pixal3dMultiView ?? false
+        var candidates = [URL]()
+        if let d = pixal3dWeightsDir { candidates += [d, d.appending(path: Self.pixal3dRepo)] }
+        if let d = ModelStore(root: storeRoot).directory(for: Self.pixal3dRepo) { candidates.append(d) }
+        if let d = stockDir { candidates.append(d) }
+        return candidates.first { Self.pixal3dPresent(at: $0, multiView: mv) }
     }
 
     /// Explicit `weightsRootOverride` first (dev escape hatch — flat `<dir>/<file>` or
     /// `<dir>/<org>/<name>/<file>`), then the ModelStore layout (`<root>/xocialize/trellis2-mlx`).
     /// nil store + no override ⇒ everything missing (fresh-machine posture, MAT-4).
     public func missingWeightSources(storeRoot: URL?) -> [WeightSource] {
+        let stock = missingStockSources(storeRoot: storeRoot)
+        guard isPixal3DLane else { return stock }
+        let stockDir = weightsRootOverride.flatMap { d in
+            Self.snapshotPresent(at: d) ? d : (Self.snapshotPresent(at: d.appending(path: Self.consolidatedRepo))
+                                               ? d.appending(path: Self.consolidatedRepo) : nil)
+        }
+        return stock + (pixal3dSnapshotDir(storeRoot: storeRoot, stockDir: stockDir) == nil ? [Self.pixal3dSource] : [])
+    }
+
+    func missingStockSources(storeRoot: URL?) -> [WeightSource] {
         if let dir = weightsRootOverride,
            Self.snapshotPresent(at: dir)
             || Self.snapshotPresent(at: dir.appending(path: Self.consolidatedRepo)) {
@@ -361,7 +448,7 @@ extension Trellis2Configuration: WeightSourcing {
            Self.snapshotPresent(at: dir) {
             return []
         }
-        return weightSources
+        return [weightSources[0]]
     }
 
     static func snapshotPresent(at dir: URL) -> Bool {
@@ -396,6 +483,17 @@ extension Trellis2Configuration: WeightPrewarming {
         guard let root else { return [] }
         // An override may hold the snapshot flat or under <org>/<name>, as load() resolves it.
         let dir = Self.snapshotPresent(at: root) ? root : root.appending(path: Self.consolidatedRepo)
+        if isPixal3DLane {
+            // the Pixal3D lane loads the stock decoders + DINOv3 and its own flows; never the stock flows
+            let stock = ["normalization.json"] + ["struct_dec", "shape_dec", "tex_dec", "dino"].map { "\($0).safetensors" }
+            var paths = stock.map { dir.appending(path: $0) }
+            if let pdir = pixal3dSnapshotDir(storeRoot: modelsRootDirectory, stockDir: dir) {
+                let sfx = (pixal3dMultiView ?? false) ? "_mv" : ""
+                let flows = ["pixal3d_struct_flow", "pixal3d_shape_flow_512", "pixal3d_shape_flow_1024", "pixal3d_tex_flow_1024"]
+                paths += flows.map { pdir.appending(path: "\($0)\(sfx).safetensors") } + [pdir.appending(path: "naf.safetensors")]
+            }
+            return paths
+        }
         let flows = chargedTier.isCascade ? ["shape_flow_512", "shape_flow_1024", "tex_flow_1024"]
                                           : ["shape_flow_512", "tex_flow_512"]
         let files = ["normalization.json"]
@@ -452,10 +550,9 @@ public final class Trellis2Package: ModelPackage {
                 // AB-A-0262 (v0.11.0): the res1536 numbers are now its lane's — resident cascade + the
                 // activation at the tier's hard HR token ceiling (32,768) — from `Trellis2Footprint`.
                 // A host's largest-footprint fallback is therefore still the worst tier.
-                footprints: [QuantFootprint(quant: .bf16,
-                                            residentBytes: Trellis2Footprint.residentCascade,
-                                            peakActivationBytes: Trellis2Footprint.cascadeActivation(
-                                                tokens: Trellis2Tier.res1536.hrTokenCeiling ?? 49_152))],
+                // P3 (AB-T-0485): the Pixal3D res1536 lane is a backer of the same capability; the manifest
+                // carries whichever res1536 lane is larger, so the largest-footprint fallback still holds.
+                footprints: [Trellis2Footprint.worstLane],
                 requiredBackends: [.metalGPU],
                 os: OSRequirement(minMacOS: SemanticVersion(major: 26, minor: 0, patch: 0)),
                 chipFloor: .pro),
@@ -507,10 +604,15 @@ public final class Trellis2Package: ModelPackage {
         let ckptDir = dir.path
         let pixal3dOnly = configuration.pixal3dOnly ?? false
         pipeline = try Trellis2Pipeline(consolidatedDir: ckptDir, loadStockStructFlow: !pixal3dOnly)
-        pipeline?.pixal3dDir = configuration.pixal3dWeightsDir?.path   // nil → the consolidated dir
+        // Pixal3D weights: pixal3dWeightsDir, the ModelStore copy of xocialize/pixal3d-mlx, else the stock dir
+        pipeline?.pixal3dDir = configuration.pixal3dSnapshotDir(storeRoot: root, stockDir: dir)?.path
+            ?? configuration.pixal3dWeightsDir?.path
         if pixal3dOnly {
-            try pipeline?.preloadPixal3D(multiView: configuration.pixal3dMultiView ?? false, tier: configuration.chargedTier,
-                                         res512Texture: configuration.pixal3dRes512TextureChoice)
+            guard configuration.chargedTier.isCascade else {
+                throw PackageError.unsupportedRequestFeature(
+                    "pixal3dOnly on \(configuration.chargedTier.rawValue): Pixal3D runs on res1024 / res1536 only (AB-T-0485 P3)")
+            }
+            try pipeline?.preloadPixal3D(multiView: configuration.pixal3dMultiView ?? false, tier: configuration.chargedTier)
         }
         // A lane knows its tier: load its flows now (prepare), so a job reads nothing from disk and its
         // resident set is the declared one from the start. Without a tierCeiling they stay lazy.
@@ -551,6 +653,12 @@ public final class Trellis2Package: ModelPackage {
 
         // Per-request overrides (AB-A-0263): metaData keys over the configuration; malformed → refused here.
         let options = try Trellis2RequestOptions(metaData: req.metaData, configuration: configuration)
+        // P3 res512 study (AB-T-0485): neither Pixal3D res512 texture passed its gate; res512 stays stock.
+        if options.pixal3d && !tier.isCascade {
+            throw PackageError.unsupportedRequestFeature(
+                "pixal3d: mode \(tier.rawValue) has no Pixal3D path (upstream ships no 512 mode; the P3 res512 "
+                + "study kept res512 stock); use res1024 or res1536")
+        }
 
         guard let pipeline else { throw PackageError.notLoaded }
 
@@ -699,6 +807,13 @@ public final class Trellis2Package: ModelPackage {
     /// one camera-to-world per view, no crop, the `_mv` weights. Cascade tiers only.
     private func runPixal3D(pipeline: Trellis2Pipeline, views: [Image], tier: Trellis2Tier,
                             options: Trellis2RequestOptions, mattingS: Double) throws -> ImageTo3DResponse {
+        let posedMV = options.pixal3dCameras != nil && views.count > 1
+        guard let pdir = pipeline.pixal3dDir.map({ URL(fileURLWithPath: $0) }),
+              Trellis2Configuration.pixal3dPresent(at: pdir, multiView: posedMV) else {
+            throw Trellis2Error.weightsNotFound(Trellis2Configuration.pixal3dRepo
+                + (posedMV ? " (+ the unpublished _mv set in pixal3dWeightsDir)" : "")
+                + " — register a Pixal3D lane (Trellis2Configuration.pixal3dLane) or set pixal3dWeightsDir")
+        }
         let fov = options.pixal3dFovDegrees * .pi / 180
         var cams: [Pixal3DCamera]
         if let mats = options.pixal3dCameras {
@@ -737,10 +852,7 @@ public final class Trellis2Package: ModelPackage {
             slatCfgSDPA: configuration.slatCfgAttention.flatMap { SDPAPrecision(rawValue: $0) } ?? .fp32,
             texSDPA: configuration.texAttention.flatMap { SDPAPrecision(rawValue: $0) } ?? .bf16,
             steps: options.steps, maxHRTokens: configuration.maxHRTokens, seed: options.seed,
-            frame: Pixal3DFrame(rawValue: options.pixal3dFrame) ?? .front,
-            res512Texture: options.pixal3dRes512Texture.flatMap(Pixal3DRes512Texture.init(rawValue:))
-                ?? configuration.pixal3dRes512TextureChoice,
-            log: { _ in })
+            frame: Pixal3DFrame(rawValue: options.pixal3dFrame) ?? .front, log: { _ in })
         guard let baked = bakedOpt else { throw PackageError.notLoaded }
         try Task.checkCancellation()
         let tGlb = Date()

@@ -97,18 +97,56 @@ conditions the sparse-structure and shape flows on the primary image alone and g
 only to the texture flow, so extra views can add colour evidence without steering geometry.
 `views_scope` in the metrics record says which scope ran.
 
-## Pixal3D mode (v0.13.0, AB-T-0485)
+## Pixal3D mode (v0.13.0; lanes and published weights v0.14.0; AB-T-0485)
 
-Released in v0.13.0 for **single view** (stage 1). The converted single-view weights are in the private
-HF repo `xocialize/pixal3d-mlx`. Posed multi-view is implemented and gated, but its samplers are 0.988
-against the 0.99 gate, so its `_mv` weights are not published (AB-R-0868). Lanes, engine contract fields
-and public weights are P3.
+Pixal3D single view is released on the cascade tiers (`res1024`, `res1536`). Since v0.14.0:
+- it has its own **lanes**, `Trellis2Configuration.pixal3dLane(_:)`, with measured footprints (table below);
+- its weights auto-download from the public HF repo
+  [`xocialize/pixal3d-mlx`](https://huggingface.co/xocialize/pixal3d-mlx) (MIT/Apache, ungated) next to
+  `xocialize/trellis2-mlx`.
 
-[Pixal3D](https://github.com/TencentARC/Pixal3D) (TencentARC, SIGGRAPH 2026; MIT, code `f7cf384`,
-weights `b0cb2e1b`) is TRELLIS.2 with the three flow models retrained so the image features are
-back-projected through a camera onto every voxel. The decoders and the bake are TRELLIS.2's,
-unchanged. In this package it is an option on the same `Trellis2Package`, not a separate model:
-the stock path is untouched when `pixal3d` is off.
+Posed multi-view is implemented and gated, but its samplers are 0.988 against the 0.99 gate, so its
+`_mv` weights are not published (AB-R-0868); a multi-view lane needs them locally in
+`pixal3dWeightsDir`. `res512` has no Pixal3D path (the P3 study below kept it stock).
+
+**Lanes (v0.14.0).** A Pixal3D lane is a separate registration (its own `PackageID`) that backs the same
+`imageTo3D` capability. Every request on it runs Pixal3D; it never loads the stock SS or SLat flows.
+It declares two weight sources: the stock snapshot (decoders, DINOv3) and `xocialize/pixal3d-mlx`.
+
+| Lane | Resident | Activation | Charged | Worst measured peak (phys) |
+|---|---|---|---|---|
+| Pixal3D res1024 | 32 GB | 38.4 GB | **70.4 GB** | 51.58 GB (shoes, 15,242 tokens) |
+| Pixal3D res1536 | 32 GB | 43.3 GB | **75.3 GB** | 66.90 GB (hair, 28,243 tokens) |
+
+Activation is 4 GB + 1.2 MB per HR token, charged at the tier's hard token ceiling (28,672 / 32,768),
+as for stock. That line clears every one of the 10 measured runs by at least 5.6 %. The Pixal3D
+res1536 lane is the package's largest, so the manifest footprint is now 75.3 GB. Measured with a
+release build on the M5 Max with 128 GB: `pixal3dOnly` lanes through `trellis2-run-engine`, five corpus
+items per tier, one fresh process per run, matted inputs. The per-run table is in `Trellis2Footprint`.
+
+**res512 (P3 study).** Upstream ships no Pixal3D tex-512 flow. Two candidates ran Pixal3D SS +
+shape-512 on the 32³ grid, decoded at 512, and differed only in texture:
+- **hybrid:** the stock tex-512 flow;
+- **tex-1024 on 32³:** the Pixal3D tex-1024 flow on the 32³ grid.
+
+`pixal3deval` renders each GLB through the run's camera and scores it against the photo. The rule
+was fixed before the runs: every corpus item at silhouette IoU ≥ 0.95, and front-view colour ΔE
+within +2 of Pixal3D res1024.
+
+| item | res1024 IoU / front ΔE | res512 IoU | hybrid front ΔE | tex-1024@32³ front ΔE |
+|---|---|---|---|---|
+| dress | 0.983 / 8.6 | 0.968 | 8.2 | **11.2** |
+| hair | 0.977 / 8.6 | 0.964 | 8.4 | 8.4 |
+| skirt | 0.987 / 13.7 | 0.982 | 15.3 | 16.7 |
+| shoes | 0.973 / 10.2 | 0.958 | 11.9 | 10.7 |
+| top | 0.988 / 15.1 | 0.979 | **30.5** | **18.1** |
+
+The geometry holds at 512 (IoU 0.958–0.982). Neither texture passes on every item: the hybrid
+paints the sailor collar red (its texture is not pixel-aligned), and the tex-1024 flow off-resolution
+misses on the dress and the top. So `res512` stays stock TRELLIS.2, and a Pixal3D request at res512
+is refused. The code path (`generatePixal3D(tier: .res512, res512Texture:)`) stays in the library,
+unexposed, for future work. A res512 run peaks at 28–31 GB. res1536 also got the alignment check:
+IoU 0.974–0.989 on all five items.
 
 **What is different from stock TRELLIS.2**
 
@@ -126,7 +164,8 @@ the stock path is untouched when `pixal3d` is off.
 - The cascade requantizes with `((c + 0.5) / 512 · (grid − 1)).round()` (stock: `· grid` and
   truncate), `Pixal3DProjection.requantize`.
 - No 512 mode upstream: Pixal3D runs on the cascade tiers (`res1024`, `res1536`) only. `res1024` is
-  the gated one; `res1536` runs the same code at grid 96 but has no golden.
+  the parity-gated one; `res1536` runs the same code at grid 96, has no golden, and passes the
+  alignment check (IoU ≥ 0.97 on the corpus).
 - Single view crops with a 1.1 margin (stock: none). The camera model maps the unit cube to that
   framing, so the margin is part of the camera.
 
@@ -161,9 +200,16 @@ re-orient. `Pixal3DCameraReport` carries the same from `generatePixal3D`.
 | `pixal3dCameras` | array of 16-number row-major camera-to-world matrices, image first then `additionalViews` | none |
 
 `additionalViews` without `pixal3dCameras` is refused in Pixal3D mode (pose-free views are the stock
-path's `additionalViews`). `res512` is refused. Configuration: `pixal3dWeightsDir` (where the
-converted weights are; default the consolidated snapshot) and `pixal3dOnly` (skip the stock SS and
-SLat flows, preload the Pixal3D set at prepare).
+path's `additionalViews`). `res512` is refused. Configuration:
+- `pixal3dLane(_:)`: a Pixal3D lane (`pixal3dOnly`, pinned tier, Pixal3D footprint, both weight sources);
+- `pixal3dWeightsDir`: where the converted weights are. Default: the ModelStore copy of
+  `xocialize/pixal3d-mlx`, then the stock snapshot directory;
+- `pixal3dMultiView`: preload the `_mv` set (local only).
+
+A stock registration can still take `pixal3d: true` per request when the Pixal3D weights are on disk;
+it loads them lazily and is charged the stock footprint, so use a lane for scheduling. The camera keys
+are package `metaData` for now. Typed contract fields are asked of mlx-engine in AB-A-0284, and the
+keys stay as a fallback.
 
 **Weights.** `Tools/pixal3d/convert_weights.py` converts the eight flows (fp32 on disk, 5.4–5.5 GB
 each) to bf16 like the stock flows (2.68 GB SS, 2.77 GB each SLat) with the stock module keys
@@ -171,7 +217,7 @@ each) to bf16 like the stock flows (2.68 GB SS, 2.77 GB each SLat) with the stoc
 and `naf_release.pth` to `naf.safetensors`. Output names: `pixal3d_struct_flow`,
 `pixal3d_shape_flow_512`, `pixal3d_shape_flow_1024`, `pixal3d_tex_flow_1024`, each with an `_mv` twin,
 plus `naf`. Tencent's `LICENSE` and `NOTICE` and NAF's Apache-2.0 text travel with them
-(AB-D-0229). The single-view set (4 flows + `naf`) is in the private HF repo `xocialize/pixal3d-mlx`; the `_mv` set is local only.
+(AB-D-0229). The single-view set (4 flows + `naf`) is in the public HF repo `xocialize/pixal3d-mlx`; the `_mv` set is local only.
 
 **Gate.** `swift run -c release pixal3dparity` checks every stage against the CUDA goldens of
 AB-R-0865 (mirrored to safetensors by `Tools/pixal3d/convert_goldens.py`): camera, DINOv3 tokens,
@@ -357,6 +403,7 @@ picked upstream, so apps lost the leak fix.
 - `Sources/parity/` — the parity harness. `swift run -c release parity` runs every gate.
 - `Sources/dinoparity/` — the DINOv3 conditioning gate (`swift run -c release dinoparity`).
 - `Sources/pixal3dparity/` — the Pixal3D gate against the CUDA goldens (`swift run -c release pixal3dparity`; README "Pixal3D mode").
+- `Sources/pixal3deval/` — renders a Pixal3D GLB through its camera and scores it against the photo (IoU, colour).
 - `Tools/pixal3d/` — Pixal3D weight and golden converters.
 - `Sources/meshbake/` — end-to-end mesh+texture demo (`swift run -c release meshbake`).
 

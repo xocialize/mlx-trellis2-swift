@@ -121,6 +121,30 @@ do {
 } catch {
     check("MAT gate (MAT-1..5)", false, "\(error)")
 }
+// Pixal3D lane (AB-T-0485 P3): two sources; satisfied only when both snapshots are present.
+do {
+    let stockDir = try stagedSnapshotDir()
+    let pixDir = FileManager.default.temporaryDirectory.appending(path: "pixal3d-mat-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: pixDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: stockDir); try? FileManager.default.removeItem(at: pixDir) }
+    for f in Trellis2Configuration.pixal3dProbeFiles(multiView: false) {
+        FileManager.default.createFile(atPath: pixDir.appending(path: f).path,
+            contents: f == "pixal3d_struct_flow.safetensors" ? safetensorsStub(withKey: Trellis2Configuration.pixal3dCanonicalKey) : Data("probe".utf8))
+    }
+    let fresh = Trellis2Configuration.pixal3dLane(ImageTo3DContract.res1024)
+    let half = Trellis2Configuration.pixal3dLane(ImageTo3DContract.res1024, weightsRootOverride: stockDir)
+    let both = Trellis2Configuration.pixal3dLane(ImageTo3DContract.res1024, weightsRootOverride: stockDir, pixal3dWeightsDir: pixDir)
+    let report = MaterializationConformance.check(freshConfiguration: fresh, satisfiedConfiguration: both)
+    print(report.summary)
+    check("MAT gate, Pixal3D lane (MAT-1..5)", report.passed)
+    check("Pixal3D lane with only the stock snapshot reports the Pixal3D source missing",
+          half.missingWeightSources(storeRoot: nil).map(\.repo) == [Trellis2Configuration.pixal3dRepo])
+    check("Pixal3D lane prewarms its own files, not the stock SS/shape flows",
+          both.prewarmPaths.contains { $0.lastPathComponent == "pixal3d_shape_flow_1024.safetensors" }
+          && !both.prewarmPaths.contains { $0.lastPathComponent == "struct_flow.safetensors" })
+} catch {
+    check("MAT gate, Pixal3D lane", false, "\(error)")
+}
 
 // ---------------------------------------------------------------------------------------------
 section("CAN-1..3 (CancellationConformance, offline)")
@@ -166,8 +190,8 @@ for tier in [ImageTo3DContract.res512, ImageTo3DContract.res1024, ImageTo3DContr
 }
 check("lane footprints rise with the tier", laneTotals == laneTotals.sorted() && Set(laneTotals).count == 3)
 let worst = manifest.requirements.footprints.map { $0.residentBytes + $0.peakActivationBytes }.max() ?? 0
-check("manifest footprint = the res1536 lane (largest-footprint fallback never under-reserves)",
-      worst == laneTotals.last)
+check("manifest footprint ≥ the stock res1536 lane (largest-footprint fallback never under-reserves)",
+      worst >= (laneTotals.last ?? 0))
 // A lane refuses a request above its tier before weights (run() checks it ahead of notLoaded).
 do {
     let lanePkg = Trellis2Package(configuration: .lane(ImageTo3DContract.res1024))
@@ -200,6 +224,37 @@ do {
 let roaming = Trellis2Configuration(defaultMode: ImageTo3DContract.res512)
 check("no tierCeiling = the pre-0.11 behaviour (charged for defaultMode)",
       roaming.residentBytesHint == Trellis2Configuration.lane(ImageTo3DContract.res512).residentBytesHint)
+
+// Pixal3D lanes (AB-T-0485 P3): one per tier, measured footprints, a backer of the same capability.
+var pixTotals: [UInt64] = []
+for tier in [ImageTo3DContract.res1024, ImageTo3DContract.res1536] {
+    let lane = Trellis2Configuration.pixal3dLane(tier)
+    let fit = FootprintConformance.check(manifest: manifest, configuration: lane)
+    let total = (lane.residentBytesHint ?? 0) + (lane.peakActivationBytesHint ?? 0)
+    pixTotals.append(total)
+    check("FIT Pixal3D lane \(tier.rawValue)", fit.passed && lane.isPixal3DLane,
+          String(format: "resident %.0f + activation %.0f = %.0f GB, HR token bound %@",
+                 Double(lane.residentBytesHint ?? 0) / 1e9, Double(lane.peakActivationBytesHint ?? 0) / 1e9,
+                 Double(total) / 1e9, lane.hrTokenBound.map(String.init) ?? "n/a"))
+}
+check("Pixal3D lane footprints rise with the tier", pixTotals == pixTotals.sorted() && Set(pixTotals).count == 2)
+check("manifest footprint ≥ every lane, stock and Pixal3D", (laneTotals + pixTotals).allSatisfy { $0 <= worst }
+      && worst == max(laneTotals.last ?? 0, pixTotals.last ?? 0))
+check("a Pixal3D lane declares both weight sources; a stock lane only the snapshot",
+      Trellis2Configuration.pixal3dLane(ImageTo3DContract.res1024).weightSources.map(\.repo)
+        == [Trellis2Configuration.consolidatedRepo, Trellis2Configuration.pixal3dRepo]
+      && Trellis2Configuration.lane(ImageTo3DContract.res1024).weightSources.count == 1)
+// P3 res512 decision: no Pixal3D res512 path — a Pixal3D request at res512 is refused before weights.
+do {
+    let stockLane = Trellis2Package(configuration: .lane(ImageTo3DContract.res512))
+    _ = try await stockLane.run(ImageTo3DRequest(image: Image(format: .png, data: Data()),
+                                                 mode: ImageTo3DContract.res512, metaData: ["pixal3d": .bool(true)]))
+    check("Pixal3D at res512 is refused (res512 stays stock)", false, "run() did not throw")
+} catch let PackageError.unsupportedRequestFeature(msg) {
+    check("Pixal3D at res512 is refused (res512 stays stock)", true, msg)
+} catch {
+    check("Pixal3D at res512 is refused (res512 stays stock)", false, "threw \(error)")
+}
 
 // ---------------------------------------------------------------------------------------------
 section("Per-request options from metaData (AB-A-0263)")

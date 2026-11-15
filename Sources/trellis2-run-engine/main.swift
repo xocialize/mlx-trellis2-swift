@@ -123,7 +123,9 @@ do {
     let hrRes = env["HR_RES"].flatMap { Int($0) } ?? 512
     let mode: Mode = hrRes == 1024 ? ImageTo3DContract.res1024
                    : hrRes == 1536 ? ImageTo3DContract.res1536 : ImageTo3DContract.res512
-    let pkgID = try await engine.register(Trellis2Package.registration,
+    // PIXAL3D_ONLY=1 registers the Pixal3D lane as its own package (contract 1.64.0, AB-A-0284) under id "pixal3d"
+    let pixal3dLane = env["PIXAL3D_ONLY"] == "1"
+    let pkgID = try await engine.register(pixal3dLane ? Pixal3DPackage.registration : Trellis2Package.registration,
                                           configuration: Trellis2Configuration(
                                               defaultMode: mode, tierCeiling: mode, maxAtlasSize: maxAtlas,
                                               weightsRootOverride: weightsOverride,
@@ -139,7 +141,8 @@ do {
                                               matting: matting,
                                               pixal3dWeightsDir: env["PIXAL3D_WEIGHTS"].map { URL(fileURLWithPath: $0) },
                                               pixal3dOnly: env["PIXAL3D_ONLY"] == "1" ? true : nil,
-                                              pixal3dMultiView: env["PIXAL3D_MV"] == "1" ? true : nil))
+                                              pixal3dMultiView: env["PIXAL3D_MV"] == "1" ? true : nil),
+                                          id: pixal3dLane ? PackageID(Pixal3DPackage.suggestedID) : nil)
     print("[engine] registered packageID=\(pkgID) | backers(imageTo3D)=\(await engine.packages(for: .imageTo3D))")
     let laneConfig = Trellis2Configuration(defaultMode: mode, tierCeiling: mode, maxAtlasSize: maxAtlas,
                                            maxHRTokens: env["MAX_HR_TOKENS"].flatMap { Int($0) })
@@ -157,13 +160,22 @@ do {
 
     print("[engine] tier: \(mode.rawValue)")
 
+    // Contract 1.64.0 typed cameras: CAMERA_FOV=<deg> (single view) or CAMERAS_JSON=[{"fovXDegrees":…,
+    // "cameraToWorld":[16]}…] (one per view); FRAME=front|world.
+    var cameras: [ImageTo3DCamera]? = env["CAMERA_FOV"].flatMap(Double.init).map { [ImageTo3DCamera(fovXDegrees: $0)] }
+    if let j = env["CAMERAS_JSON"] { cameras = try JSONDecoder().decode([ImageTo3DCamera].self, from: Data(j.utf8)) }
     let request = ImageTo3DRequest(image: image, additionalViews: extraViews.isEmpty ? nil : extraViews,
-                                   mode: mode, metaData: metaData)
+                                   mode: mode, cameras: cameras, frame: env["FRAME"].map { ImageTo3DFrame(rawValue: $0) },
+                                   metaData: metaData)
 
     let tRun = Date()
     let response = try await engine.run(request, package: pkgID)
     guard let resp = response as? ImageTo3DResponse else { fatalError("unexpected response \(type(of: response))") }
     try resp.mesh.data.write(to: URL(fileURLWithPath: outGLB))
+    if let cam = resp.camera {
+        print("[engine] response camera: fov \(cam.fovXDegrees ?? -1)° frame \(resp.frame?.rawValue ?? "nil") "
+              + "c2w \(cam.cameraToWorld ?? [])")
+    }
     // RUNS=N repeats the same request in this process (flows cached) and reports whether every GLB
     // is byte-identical to the first — the in-process half of the determinism check.
     let runs = env["RUNS"].flatMap { Int($0) } ?? 1

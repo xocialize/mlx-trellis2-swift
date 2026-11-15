@@ -330,9 +330,59 @@ for (key, bad) in [("pixal3d", MetaValue.string("yes")), ("pixal3dFovDegrees", .
 }
 
 // ---------------------------------------------------------------------------------------------
+section("Pixal3DPackage — its own lane (contract 1.64.0 cameras, AB-A-0284 / AB-D-0230)")
+let pm = Pixal3DPackage.manifest
+check("P3D C0 contract version", pm.contractVersion == ContractVersion.current, "\(pm.contractVersion)")
+check("P3D C1 one imageTo3D surface", pm.capabilities == [.imageTo3D], "\(pm.surfaces.map(\.name))")
+check("P3D C7/C8 licences admitted", LicensePolicy.permissiveOnly.evaluate(pm.license).isAdmitted
+      && LicensePolicy.permissiveOnly.admits(pm.license.portCodeLicense))
+check("P3D provenance is xocialize/pixal3d-mlx (distinct derived id from the stock package)",
+      pm.provenance.sourceRepo == Trellis2Configuration.pixal3dRepo && pm.provenance.sourceRepo != manifest.provenance.sourceRepo)
+if let surf = pm.surfaces.first {
+    check("P3D surface advertises only the tiers Pixal3D honors",
+          surf.supportedModes == [ImageTo3DContract.res1024, ImageTo3DContract.res1536], "\(surf.supportedModes.map(\.rawValue))")
+    let ctl = surf.imageTo3DControls
+    check("P3D controls declared and coherent (declarationProblems.isEmpty)",
+          ctl == Pixal3DPackage.controls && (ctl?.declarationProblems.isEmpty ?? false),
+          "\(ctl.map { $0.features.map(\.rawValue).sorted() } ?? [])")
+    check("P3D surface advertises cameras and frame", surf.parameters.contains { $0.name == "cameras" }
+          && surf.parameters.contains { $0.name == "frame" }, "\(surf.parameters.map(\.name))")
+}
+check("stock surface declares no camera controls", manifest.surfaces.first?.imageTo3DControls == nil)
+let pfp = pm.requirements.footprints.first
+check("P3D manifest footprint = the Pixal3D res1536 lane",
+      pfp.map { $0.residentBytes + $0.peakActivationBytes } == pixTotals.last)
+check("P3D registration (IoC)", Pixal3DPackage.registration.manifest.capabilities == [.imageTo3D])
+check("P3D lane declares both weight sources",
+      Trellis2Configuration.pixal3dLane(ImageTo3DContract.res1024).weightSources.count == 2)
+// typed-field refusals (what the engine pre-flight does; the packages check the same before weights)
+func refusalOf(_ pkg: any ModelPackage, _ req: ImageTo3DRequest) async -> String? {
+    do { _ = try await pkg.run(req); return nil }
+    catch let PackageError.unsupportedRequestFeature(m) { return m }
+    catch { return "other: \(error)" }
+}
+let img = Image(format: .png, data: Data())
+let stockPkg = Trellis2Package(configuration: .lane(ImageTo3DContract.res1024))
+let pixPkg = Pixal3DPackage(configuration: .pixal3dLane(ImageTo3DContract.res1024))
+let r1 = await refusalOf(stockPkg, ImageTo3DRequest(image: img, mode: ImageTo3DContract.res1024,
+                                                    cameras: [ImageTo3DCamera(fovXDegrees: 20)]))
+check("stock lane refuses typed cameras", r1?.contains("fovXDegrees") == true, r1 ?? "accepted")
+let r2 = await refusalOf(pixPkg, ImageTo3DRequest(image: img, mode: ImageTo3DContract.res1024,
+                                                  cameras: [ImageTo3DCamera(fovXDegrees: 150)]))
+check("Pixal3D refuses a fov outside its declared range", r2?.contains("150") == true, r2 ?? "accepted")
+let r3 = await refusalOf(pixPkg, ImageTo3DRequest(image: img, mode: ImageTo3DContract.res512))
+check("Pixal3D refuses res512", r3?.contains("res512") == true, r3 ?? "accepted")
+let r4 = await refusalOf(pixPkg, ImageTo3DRequest(image: img, mode: ImageTo3DContract.res1024, frame: .world))
+check("Pixal3D refuses frame world without poses (contract shape)", r4 != nil && !(r4!.hasPrefix("other")), r4 ?? "accepted")
+let r5 = await refusalOf(pixPkg, ImageTo3DRequest(image: img, mode: ImageTo3DContract.res1024,
+                                                  cameras: [ImageTo3DCamera(fovXDegrees: 20)]))
+check("Pixal3D accepts a single-view fov (then needs weights: notLoaded)", r5?.contains("notLoaded") == true
+      || r5?.hasPrefix("other") == true, r5 ?? "ran")
+
+// ---------------------------------------------------------------------------------------------
 section("Result")
 if failures == 0 {
-    print("✅ ALL GATES PASSED (C0–C13 static + MAT-1..5 + CAN-1..3 + FIT lanes + request options + Pixal3D options)")
+    print("✅ ALL GATES PASSED (C0–C13 static + MAT-1..5 + CAN-1..3 + FIT lanes + request options + Pixal3D options + Pixal3DPackage)")
 } else {
     print("❌ \(failures) gate check(s) FAILED")
     exit(1)

@@ -97,7 +97,7 @@ conditions the sparse-structure and shape flows on the primary image alone and g
 only to the texture flow, so extra views can add colour evidence without steering geometry.
 `views_scope` in the metrics record says which scope ran.
 
-## Pixal3D mode (v0.13.0; lanes and published weights v0.14.0; AB-T-0485)
+## Pixal3D mode (v0.13.0; lanes and weights v0.14.0; own package and typed cameras v0.15.0; AB-T-0485)
 
 Pixal3D single view is released on the cascade tiers (`res1024`, `res1536`). Since v0.14.0:
 - it has its own **lanes**, `Trellis2Configuration.pixal3dLane(_:)`, with measured footprints (table below);
@@ -109,9 +109,37 @@ Posed multi-view is implemented and gated, but its samplers are 0.988 against th
 `_mv` weights are not published (AB-R-0868); a multi-view lane needs them locally in
 `pixal3dWeightsDir`. `res512` has no Pixal3D path (the P3 study below kept it stock).
 
-**Lanes (v0.14.0).** A Pixal3D lane is a separate registration (its own `PackageID`) that backs the same
-`imageTo3D` capability. Every request on it runs Pixal3D; it never loads the stock SS or SLat flows.
-It declares two weight sources: the stock snapshot (decoders, DINOv3) and `xocialize/pixal3d-mlx`.
+**`Pixal3DPackage` (v0.15.0, engine contract 1.64.0 / mlx-engine-swift ≥ 0.79.0).** Pixal3D is its own
+`ModelPackage` type with its own manifest. As mlx-engine decided in AB-A-0284 / AB-D-0230, it is a
+separate lane, not a mode:
+- provenance `xocialize/pixal3d-mlx`;
+- the Pixal3D res1536 footprint;
+- a surface `pixal3d-image-to-3d` advertising only `res1024`/`res1536`;
+- `ImageTo3DControls(features: [.fov, .pose, .worldFrame, .cameraReport], fovXDegreesRange: 1…119)`.
+
+Register it beside the stock lanes with an explicit id:
+
+```swift
+let pixal3d = try await engine.register(Pixal3DPackage.registration,
+                                        configuration: .pixal3dLane(ImageTo3DContract.res1024), id: "pixal3d")
+let response = try await engine.run(
+    ImageTo3DRequest(image: photo, mode: ImageTo3DContract.res1024,
+                     cameras: [ImageTo3DCamera(fovXDegrees: 20)]), package: pixal3d) as! ImageTo3DResponse
+// response.camera = view 0's camera in the returned mesh's frame; response.frame = .front / .world
+```
+
+The typed fields win; the v0.13.0 `metaData` keys stay as the fallback for older hosts:
+- `ImageTo3DRequest.cameras`: one per view, `fovXDegrees` alone for a single photo, `cameraToWorld` on
+  every view for posed multi-view. It replaces `pixal3dFovDegrees` and `pixal3dCameras`.
+- `ImageTo3DRequest.frame`: replaces `pixal3dFrame`.
+
+The stock `Trellis2Package` surface declares no camera controls, so the engine, and the package itself,
+refuse cameras there. Before v0.15.0 a Pixal3D lane was `Trellis2Package` + `pixal3dLane`; that still
+runs, but `Pixal3DPackage` is the supported registration.
+
+**Lanes (v0.14.0).** A Pixal3D lane backs the same `imageTo3D` capability as the stock lanes. Every request
+on it runs Pixal3D; it never loads the stock SS or SLat flows. It declares two weight sources: the
+stock snapshot (decoders, DINOv3) and `xocialize/pixal3d-mlx`.
 
 | Lane | Resident | Activation | Charged | Worst measured peak (phys) |
 |---|---|---|---|---|
@@ -207,9 +235,9 @@ path's `additionalViews`). `res512` is refused. Configuration:
 - `pixal3dMultiView`: preload the `_mv` set (local only).
 
 A stock registration can still take `pixal3d: true` per request when the Pixal3D weights are on disk;
-it loads them lazily and is charged the stock footprint, so use a lane for scheduling. The camera keys
-are package `metaData` for now. Typed contract fields are asked of mlx-engine in AB-A-0284, and the
-keys stay as a fallback.
+it loads them lazily and is charged the stock footprint, so use a lane for scheduling. Since v0.15.0 the
+camera travels as typed contract fields (`ImageTo3DRequest.cameras` / `.frame`, contract 1.64.0); the
+`metaData` keys are the fallback.
 
 **Weights.** `Tools/pixal3d/convert_weights.py` converts the eight flows (fp32 on disk, 5.4–5.5 GB
 each) to bf16 like the stock flows (2.68 GB SS, 2.77 GB each SLat) with the stock module keys
@@ -390,7 +418,8 @@ the same as with 1024, so their charges don't move.
 
 ## Engine and mlx-swift pins
 
-From v0.11.0 the package needs mlx-engine-swift `from: "0.74.1"` and the fleet's mlx-swift fork,
+From v0.15.0 the package needs mlx-engine-swift `from: "0.79.0"` (contract 1.64.0: typed imageTo3D cameras,
+for `Pixal3DPackage`). From v0.11.0 to v0.14.0 it needed `from: "0.74.1"`, and the fleet's mlx-swift fork,
 `xocialize/mlx-swift` `from: "0.32.4"`. The fork is upstream 0.32.3 plus ml-explore/mlx-swift#501,
 the quantized-load leak fix (AB-D-0208).
 

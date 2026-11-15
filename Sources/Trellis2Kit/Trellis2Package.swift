@@ -526,11 +526,24 @@ public final class Trellis2Package: ModelPackage {
     public typealias Configuration = Trellis2Configuration
 
     public nonisolated static var manifest: PackageManifest {
+        makeManifest(sourceRepo: "microsoft/TRELLIS.2-4B", footprint: Trellis2Footprint.worstLane,
+                     surface: ImageTo3DContract.descriptor(
+                        name: "trellis2-image-to-3d",
+                        summary: "Generate a UV-textured 3D triangle mesh (GLB) from a single image. Invents "
+                               + "geometry + a base-color texture atlas from one view; pick detail via mode "
+                               + "res512/res1024/res1536.",
+                        modes: [ImageTo3DContract.res512, ImageTo3DContract.res1024, ImageTo3DContract.res1536]))
+    }
+
+    /// The manifest shape shared by the stock package and `Pixal3DPackage` (licence, backends, OS, chip,
+    /// specialty); each passes its own provenance, worst-lane footprint and surface.
+    nonisolated static func makeManifest(sourceRepo: String, footprint: QuantFootprint,
+                                         surface: ToolDescriptor) -> PackageManifest {
         PackageManifest(
             license: LicenseDeclaration(
                 weightLicense: .dinov3,    // C7 — DINOv3 governs; allowlisted. "Built with DINOv3".
                 portCodeLicense: .mit),    // C8 — our Swift port
-            provenance: Provenance(sourceRepo: "microsoft/TRELLIS.2-4B", revision: "main", tier: 3),
+            provenance: Provenance(sourceRepo: sourceRepo, revision: "main", tier: 3),
             requirements: RequirementsManifest(
                 // Split footprint (contract 1.14), T0.3 per-tier re-baseline (2026-07-15, engine-governed
                 // trellis2-run-engine phys_footprint peaks, single view). The QuantFootprint is the
@@ -552,17 +565,12 @@ public final class Trellis2Package: ModelPackage {
                 // A host's largest-footprint fallback is therefore still the worst tier.
                 // P3 (AB-T-0485): the Pixal3D res1536 lane is a backer of the same capability; the manifest
                 // carries whichever res1536 lane is larger, so the largest-footprint fallback still holds.
-                footprints: [Trellis2Footprint.worstLane],
+                footprints: [footprint],
                 requiredBackends: [.metalGPU],
                 os: OSRequirement(minMacOS: SemanticVersion(major: 26, minor: 0, patch: 0)),
                 chipFloor: .pro),
             specialties: [SpecialtyWeight(Specialty(rawValue: "3d-generation"), strength: 1.0)],
-            surfaces: [ImageTo3DContract.descriptor(
-                name: "trellis2-image-to-3d",
-                summary: "Generate a UV-textured 3D triangle mesh (GLB) from a single image. Invents "
-                       + "geometry + a base-color texture atlas from one view; pick detail via mode "
-                       + "res512/res1024/res1536.",
-                modes: [ImageTo3DContract.res512, ImageTo3DContract.res1024, ImageTo3DContract.res1536])])
+            surfaces: [surface])
     }
 
     private let configuration: Configuration
@@ -653,6 +661,14 @@ public final class Trellis2Package: ModelPackage {
 
         // Per-request overrides (AB-A-0263): metaData keys over the configuration; malformed → refused here.
         let options = try Trellis2RequestOptions(metaData: req.metaData, configuration: configuration)
+        // Contract 1.64.0 (AB-A-0284): typed cameras / frame. The stock surface declares no camera controls,
+        // so it refuses them (what the engine's pre-flight does); the Pixal3D path takes them.
+        if !options.pixal3d, let why = ImageTo3DControls.refusal(for: req, declared: nil) {
+            throw PackageError.unsupportedRequestFeature(why)
+        }
+        if options.pixal3d, let why = ImageTo3DControls.refusal(for: req, declared: Pixal3DPackage.controls) {
+            throw PackageError.unsupportedRequestFeature(why)
+        }
         // P3 res512 study (AB-T-0485): neither Pixal3D res512 texture passed its gate; res512 stays stock.
         if options.pixal3d && !tier.isCascade {
             throw PackageError.unsupportedRequestFeature(
@@ -685,7 +701,8 @@ public final class Trellis2Package: ModelPackage {
         }
         let mattingS = configuration.matting != nil ? -tMat.timeIntervalSinceNow : 0
         if options.pixal3d {
-            return try runPixal3D(pipeline: pipeline, views: views, tier: tier, options: options, mattingS: mattingS)
+            return try runPixal3D(pipeline: pipeline, views: views, tier: tier, options: options, mattingS: mattingS,
+                                  typedCameras: req.cameras, typedFrame: req.frame)
         }
         // Profiling bookends (metricsPath set): preprocessing (CPU) is timed separately from the
         // DINOv3 encode (GPU) — each encode is eval-barriered so the delta is real wall-clock.
@@ -806,17 +823,30 @@ public final class Trellis2Package: ModelPackage {
     /// Pixal3D projection-conditioned generation. Single view: crop ×1.1 and a FOV; posed multi-view:
     /// one camera-to-world per view, no crop, the `_mv` weights. Cascade tiers only.
     private func runPixal3D(pipeline: Trellis2Pipeline, views: [Image], tier: Trellis2Tier,
-                            options: Trellis2RequestOptions, mattingS: Double) throws -> ImageTo3DResponse {
-        let posedMV = options.pixal3dCameras != nil && views.count > 1
+                            options: Trellis2RequestOptions, mattingS: Double,
+                            typedCameras: [ImageTo3DCamera]? = nil, typedFrame: ImageTo3DFrame? = nil) throws -> ImageTo3DResponse {
+        // Typed contract fields (1.64.0) win over the v0.13.0 metaData keys (kept as the fallback).
+        let posedTyped = typedCameras.map { cs in !cs.isEmpty && cs.allSatisfy { $0.cameraToWorld != nil } } ?? false
+        let frameRaw = typedFrame?.rawValue ?? options.pixal3dFrame
+        let posedMV = (posedTyped || options.pixal3dCameras != nil) && views.count > 1
         guard let pdir = pipeline.pixal3dDir.map({ URL(fileURLWithPath: $0) }),
               Trellis2Configuration.pixal3dPresent(at: pdir, multiView: posedMV) else {
             throw Trellis2Error.weightsNotFound(Trellis2Configuration.pixal3dRepo
                 + (posedMV ? " (+ the unpublished _mv set in pixal3dWeightsDir)" : "")
                 + " — register a Pixal3D lane (Trellis2Configuration.pixal3dLane) or set pixal3dWeightsDir")
         }
-        let fov = options.pixal3dFovDegrees * .pi / 180
+        let fov = (typedCameras?.first?.fovXDegrees ?? options.pixal3dFovDegrees) * .pi / 180
         var cams: [Pixal3DCamera]
-        if let mats = options.pixal3dCameras {
+        if let tc = typedCameras, posedTyped {
+            cams = tc.map { c in Pixal3DCamera(fovX: (c.fovXDegrees.map { $0 * .pi / 180 }) ?? fov, meshScale: 1.0,
+                                               c2w: Mat4(flat: c.cameraToWorld!)) }
+        } else if typedCameras != nil {
+            guard views.count == 1 else {
+                throw PackageError.unsupportedRequestFeature(
+                    "pixal3d with additionalViews needs a cameraToWorld on every camera (posed multi-view)")
+            }
+            cams = [Pixal3DCamera(fovX: fov, meshScale: 1.0)]
+        } else if let mats = options.pixal3dCameras {
             guard mats.count == views.count else {
                 throw PackageError.unsupportedRequestFeature(
                     "pixal3dCameras has \(mats.count) matrices for \(views.count) views (image + additionalViews)")
@@ -829,7 +859,7 @@ public final class Trellis2Package: ModelPackage {
             }
             cams = [Pixal3DCamera(fovX: fov, meshScale: 1.0)]
         }
-        let posed = options.pixal3dCameras != nil
+        let posed = posedTyped || options.pixal3dCameras != nil
         let tPre = Date()
         let pviews: [Pixal3DView] = try views.enumerated().map { i, img in
             let p512 = posed ? try ImagePreprocess.pixal3dViewPixels(from: img, size: 512)
@@ -852,7 +882,7 @@ public final class Trellis2Package: ModelPackage {
             slatCfgSDPA: configuration.slatCfgAttention.flatMap { SDPAPrecision(rawValue: $0) } ?? .fp32,
             texSDPA: configuration.texAttention.flatMap { SDPAPrecision(rawValue: $0) } ?? .bf16,
             steps: options.steps, maxHRTokens: configuration.maxHRTokens, seed: options.seed,
-            frame: Pixal3DFrame(rawValue: options.pixal3dFrame) ?? .front, log: { _ in })
+            frame: Pixal3DFrame(rawValue: frameRaw) ?? .front, log: { _ in })
         guard let baked = bakedOpt else { throw PackageError.notLoaded }
         try Task.checkCancellation()
         let tGlb = Date()
@@ -887,7 +917,11 @@ public final class Trellis2Package: ModelPackage {
                 try? str.write(toFile: path, atomically: true, encoding: .utf8)
             }
         }
-        return ImageTo3DResponse(mesh: mesh)
+        // contract 1.64.0 camera report: view 0's camera in the returned mesh's frame, and that frame
+        return ImageTo3DResponse(mesh: mesh,
+                                 camera: ImageTo3DCamera(fovXDegrees: camera.fovXRadians * 180 / .pi,
+                                                         cameraToWorld: camera.camera0ToMesh),
+                                 frame: ImageTo3DFrame(rawValue: camera.frame.rawValue))
     }
 
     // MARK: weight resolution

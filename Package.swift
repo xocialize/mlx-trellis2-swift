@@ -33,7 +33,7 @@ let package = Package(
         // MAT gate (MaterializationConformance) and CAN gate (CancellationConformance). 0.67.0: contract 1.52.0 added
         // `Image.Format.rawRGBA16`, which the exhaustive switch in ImagePreprocess.decodeCGImage names (AB-A-0158).
         // 0.74.1: the mlx-swift leak-fix fork above, and GaeaPluginKit 0.11.1's floor (AB-A-0262).
-        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.74.1"),
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.79.0"),
         // First-run auto-materialization (MAT): HubClient snapshot download into the ModelStore layout.
         .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
         // Foreground matting for the run-engine harness driver ONLY (raw white-bg corpus inputs

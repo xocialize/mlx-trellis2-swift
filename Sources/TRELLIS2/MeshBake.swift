@@ -21,6 +21,8 @@ public struct BakedMesh {
     /// closest-point remap landed on an opposing-normal (wrong-wall) raw face.
     public let filledBeforeInpaint: [Bool]
     public let wallFlipped: [Bool]
+    /// Opt-in detail maps (normal map + tangents, AO); empty unless `MeshBake.run` was asked for them.
+    public var detail = BakedDetailMaps()
 }
 
 /// Which unwrap produces the bake's UV atlas (UV-UNWRAP-METAL-PLAN.md).
@@ -45,6 +47,7 @@ public enum MeshBake {
         fineRes: Float, remeshRes: Int = 256, targetFaces: Int = 120_000, atlasSize: Int = 1024,
         backend: UnwrapBackend = .xatlas,
         texMetallicRoughness: MLXArray? = nil,   // [N,2] metallic, roughness in [0,1]
+        detailMaps: DetailMapOptions = .none,
         log: (String) -> Void = { print($0) }
     ) throws -> (BakedMesh, BakeStageMetrics) {
         // Sub-stage timers: each `-t.timeIntervalSinceNow` read is preceded by the
@@ -189,95 +192,101 @@ public enum MeshBake {
         // ~2× surface, single center sample unrepresentative) and dilutes
         // single-sample crevice pinning (measured: 64%/36% of provenance's
         // remaining bad samples respectively).
-        t = Date()
         let ss = 2
         let ssSize = atlasSize * ss
-        let uvPix = finalUVs * Float(ssSize)
-        var pixParts: [MLXArray] = [], fidParts: [MLXArray] = [], baryParts: [MLXArray] = []
-        for (dx, dy): (Float, Float) in [(0, 0), (0.49, 0.49), (-0.49, 0.49), (0.49, -0.49), (-0.49, -0.49)] {
-            let jittered = dx == 0 && dy == 0 ? uvPix
-                : MLX.stacked([uvPix[0..., 0] + dx, uvPix[0..., 1] + dy], axis: 1)
-            let (p, f, b) = UVRasterize.rasterize(uvsPix: jittered, faces: finalMesh.faces, textureSize: ssSize)
-            pixParts.append(p); fidParts.append(f); baryParts.append(b)
-        }
-        let pix = MLX.concatenated(pixParts, axis: 0)
-        let fid = MLX.concatenated(fidParts, axis: 0)
-        let bary = MLX.concatenated(baryParts, axis: 0)
-        MLX.eval(pix, fid, bary)
-        m.rasterizeS = -t.timeIntervalSinceNow
-        let K = fid.dim(0)
-        m.coveredTexelWrites = K
-        log("  rasterized: \(K) covered texel-writes (5-pass conservative)")
-
-        // surface position per texel: Σ bary · verts[faces[fid]] → closest point on the raw shell →
-        // trilinear sample, then the first-write-wins write at supersample resolution. CHUNKED over
-        // the K texel-writes (AB-A-0263): every op here is per texel, so a chunk computes exactly what
-        // the whole batch would, and chunks write in k order, so first-write-wins is unchanged. At a
-        // 1024 atlas K is ~12–13M — one chunk, the pre-chunking computation. At 4096 K is ~16× that,
-        // and the unchunked [K,3] intermediates took the run to ~100 GB.
-        t = Date()
-        let chunk = 16 * 1024 * 1024
-        var ssRgb = [Float](repeating: 0, count: ssSize * ssSize * 3)
-        var ssMr = texMetallicRoughness != nil ? [Float](repeating: 0, count: ssSize * ssSize * 2) : []
-        var ssFilled = [Bool](repeating: false, count: ssSize * ssSize)
-        var ssFlip = [Bool](repeating: false, count: ssSize * ssSize)
-        let rawFaceNormals = origMesh.faceNormals()
+        let mrBaked = texMetallicRoughness != nil
+        var K = 0
+        var ssRgb = [Float](), ssMr = [Float](), ssFilled = [Bool](), ssFlip = [Bool]()
         var qmin = Float.infinity, qmax = -Float.infinity, hits = 0
         var writeS = 0.0
-        for k0 in stride(from: 0, to: K, by: chunk) {
-            let k1 = min(K, k0 + chunk), n = k1 - k0
-            let fidC = fid[k0 ..< k1], baryC = bary[k0 ..< k1]
-            let faceVerts = finalMesh.faces.take(fidC, axis: 0)                // [n,3] vertex ids
-            let v0 = finalMesh.vertices.take(faceVerts[0..., 0], axis: 0)      // [n,3]
-            let v1 = finalMesh.vertices.take(faceVerts[0..., 1], axis: 0)
-            let v2 = finalMesh.vertices.take(faceVerts[0..., 2], axis: 0)
-            let posRaw = baryC[0..., 0..<1] * v0 + baryC[0..., 1..<2] * v1 + baryC[0..., 2..<3] * v2   // [n,3]
-            // remap each texel position onto the original on-shell surface, so trilinear hits the thin PBR shell
-            let cp = origBVH.closestPoints(mesh: origMesh, queries: posRaw)
-            let pos = cp.points                                                                     // [n,3]
-            // diagnostic: does the remap land on a raw face whose normal opposes
-            // the texel's final-mesh face normal? (wrong-wall snap)
-            let fe1 = v1 - v0, fe2 = v2 - v0
-            let fnl = MLX.stacked([
-                fe1[0..., 1] * fe2[0..., 2] - fe1[0..., 2] * fe2[0..., 1],
-                fe1[0..., 2] * fe2[0..., 0] - fe1[0..., 0] * fe2[0..., 2],
-                fe1[0..., 0] * fe2[0..., 1] - fe1[0..., 1] * fe2[0..., 0],
-            ], axis: 1)
-            let rawFN = rawFaceNormals.take(cp.faceIndices, axis: 0)
-            let flipDot = (fnl * rawFN).sum(axis: 1)
-            MLX.eval(flipDot)
-            let flipArr = flipDot.asArray(Float.self)
-            MLX.eval(pos)
-            let query = ((pos + 0.5) * fineRes).reshaped([1, n, 3])
-            let sampled = GridSample3d.sample(feats: texBaseColor, coords: coords, grid: query, mode: "trilinear")[0]  // [n,3]
-            MLX.eval(sampled)
-            var mrSampled: [Float]? = nil
-            if let mr = texMetallicRoughness {
-                let mrS = GridSample3d.sample(feats: mr, coords: coords, grid: query, mode: "trilinear")[0]  // [n,2]
-                MLX.eval(mrS)
-                mrSampled = MLX.clip(mrS, min: 0, max: 1).asArray(Float.self)
+        // The raster arrays live only in this block (two copies of [K] texel writes: ~10 GB at a 4096
+        // atlas), so they are freed before the opt-in detail maps rasterize their own.
+        do {
+            t = Date()
+            let uvPix = finalUVs * Float(ssSize)
+            var pixParts: [MLXArray] = [], fidParts: [MLXArray] = [], baryParts: [MLXArray] = []
+            for (dx, dy): (Float, Float) in [(0, 0), (0.49, 0.49), (-0.49, 0.49), (0.49, -0.49), (-0.49, -0.49)] {
+                let jittered = dx == 0 && dy == 0 ? uvPix
+                    : MLX.stacked([uvPix[0..., 0] + dx, uvPix[0..., 1] + dy], axis: 1)
+                let (p, f, b) = UVRasterize.rasterize(uvsPix: jittered, faces: finalMesh.faces, textureSize: ssSize)
+                pixParts.append(p); fidParts.append(f); baryParts.append(b)
             }
-            qmin = min(qmin, query.min().item(Float.self)); qmax = max(qmax, query.max().item(Float.self))
-            hits += (sampled.sum(axis: 1) .> 0).asType(.int32).sum().item(Int.self)
+            let pix = MLX.concatenated(pixParts, axis: 0)
+            let fid = MLX.concatenated(fidParts, axis: 0)
+            let bary = MLX.concatenated(baryParts, axis: 0)
+            MLX.eval(pix, fid, bary)
+            m.rasterizeS = -t.timeIntervalSinceNow
+            K = fid.dim(0)
+            m.coveredTexelWrites = K
+            log("  rasterized: \(K) covered texel-writes (5-pass conservative)")
 
-            // 5) write texels (first-write-wins per sub-texel, in k order across chunks)
-            let tw = Date()
-            let px = pix[k0 ..< k1].asType(.int32).asArray(Int32.self)       // [n*2]
-            let col = MLX.clip(sampled, min: 0, max: 1).asArray(Float.self)   // [n*3]
-            for k in 0 ..< n {
-                let x = Int(px[k*2]), y = Int(px[k*2+1])
-                if x < 0 || x >= ssSize || y < 0 || y >= ssSize { continue }  // jitter can push 1 texel out
-                let p = y * ssSize + x
-                if ssFilled[p] { continue }   // first write wins: center pass beats jitter passes
-                ssRgb[p*3] = col[k*3]; ssRgb[p*3+1] = col[k*3+1]; ssRgb[p*3+2] = col[k*3+2]
-                if let mrS = mrSampled { ssMr[p*2] = mrS[k*2]; ssMr[p*2+1] = mrS[k*2+1] }
-                ssFilled[p] = true
-                if flipArr[k] < 0 { ssFlip[p] = true }
+            // surface position per texel: Σ bary · verts[faces[fid]] → closest point on the raw shell →
+            // trilinear sample, then the first-write-wins write at supersample resolution. CHUNKED over
+            // the K texel-writes (AB-A-0263): every op here is per texel, so a chunk computes exactly what
+            // the whole batch would, and chunks write in k order, so first-write-wins is unchanged. At a
+            // 1024 atlas K is ~12–13M — one chunk, the pre-chunking computation. At 4096 K is ~16× that,
+            // and the unchunked [K,3] intermediates took the run to ~100 GB.
+            t = Date()
+            let chunk = 16 * 1024 * 1024
+            ssRgb = [Float](repeating: 0, count: ssSize * ssSize * 3)
+            ssMr = texMetallicRoughness != nil ? [Float](repeating: 0, count: ssSize * ssSize * 2) : []
+            ssFilled = [Bool](repeating: false, count: ssSize * ssSize)
+            ssFlip = [Bool](repeating: false, count: ssSize * ssSize)
+            let rawFaceNormals = origMesh.faceNormals()
+            for k0 in stride(from: 0, to: K, by: chunk) {
+                let k1 = min(K, k0 + chunk), n = k1 - k0
+                let fidC = fid[k0 ..< k1], baryC = bary[k0 ..< k1]
+                let faceVerts = finalMesh.faces.take(fidC, axis: 0)                // [n,3] vertex ids
+                let v0 = finalMesh.vertices.take(faceVerts[0..., 0], axis: 0)      // [n,3]
+                let v1 = finalMesh.vertices.take(faceVerts[0..., 1], axis: 0)
+                let v2 = finalMesh.vertices.take(faceVerts[0..., 2], axis: 0)
+                let posRaw = baryC[0..., 0..<1] * v0 + baryC[0..., 1..<2] * v1 + baryC[0..., 2..<3] * v2   // [n,3]
+                // remap each texel position onto the original on-shell surface, so trilinear hits the thin PBR shell
+                let cp = origBVH.closestPoints(mesh: origMesh, queries: posRaw)
+                let pos = cp.points                                                                     // [n,3]
+                // diagnostic: does the remap land on a raw face whose normal opposes
+                // the texel's final-mesh face normal? (wrong-wall snap)
+                let fe1 = v1 - v0, fe2 = v2 - v0
+                let fnl = MLX.stacked([
+                    fe1[0..., 1] * fe2[0..., 2] - fe1[0..., 2] * fe2[0..., 1],
+                    fe1[0..., 2] * fe2[0..., 0] - fe1[0..., 0] * fe2[0..., 2],
+                    fe1[0..., 0] * fe2[0..., 1] - fe1[0..., 1] * fe2[0..., 0],
+                ], axis: 1)
+                let rawFN = rawFaceNormals.take(cp.faceIndices, axis: 0)
+                let flipDot = (fnl * rawFN).sum(axis: 1)
+                MLX.eval(flipDot)
+                let flipArr = flipDot.asArray(Float.self)
+                MLX.eval(pos)
+                let query = ((pos + 0.5) * fineRes).reshaped([1, n, 3])
+                let sampled = GridSample3d.sample(feats: texBaseColor, coords: coords, grid: query, mode: "trilinear")[0]  // [n,3]
+                MLX.eval(sampled)
+                var mrSampled: [Float]? = nil
+                if let mr = texMetallicRoughness {
+                    let mrS = GridSample3d.sample(feats: mr, coords: coords, grid: query, mode: "trilinear")[0]  // [n,2]
+                    MLX.eval(mrS)
+                    mrSampled = MLX.clip(mrS, min: 0, max: 1).asArray(Float.self)
+                }
+                qmin = min(qmin, query.min().item(Float.self)); qmax = max(qmax, query.max().item(Float.self))
+                hits += (sampled.sum(axis: 1) .> 0).asType(.int32).sum().item(Int.self)
+
+                // 5) write texels (first-write-wins per sub-texel, in k order across chunks)
+                let tw = Date()
+                let px = pix[k0 ..< k1].asType(.int32).asArray(Int32.self)       // [n*2]
+                let col = MLX.clip(sampled, min: 0, max: 1).asArray(Float.self)   // [n*3]
+                for k in 0 ..< n {
+                    let x = Int(px[k*2]), y = Int(px[k*2+1])
+                    if x < 0 || x >= ssSize || y < 0 || y >= ssSize { continue }  // jitter can push 1 texel out
+                    let p = y * ssSize + x
+                    if ssFilled[p] { continue }   // first write wins: center pass beats jitter passes
+                    ssRgb[p*3] = col[k*3]; ssRgb[p*3+1] = col[k*3+1]; ssRgb[p*3+2] = col[k*3+2]
+                    if let mrS = mrSampled { ssMr[p*2] = mrS[k*2]; ssMr[p*2+1] = mrS[k*2+1] }
+                    ssFilled[p] = true
+                    if flipArr[k] < 0 { ssFlip[p] = true }
+                }
+                writeS += -tw.timeIntervalSinceNow
             }
-            writeS += -tw.timeIntervalSinceNow
+            m.bakeSampleS = -t.timeIntervalSinceNow - writeS   // BVH closest-point remap + GridSample3d trilinear
         }
-        let mrBaked = texMetallicRoughness != nil
-        m.bakeSampleS = -t.timeIntervalSinceNow - writeS   // BVH closest-point remap + GridSample3d trilinear
         log("  bake diag: baseColor mean=\(texBaseColor.mean().item(Float.self))  query[\(qmin)..\(qmax)]  hitFrac=\(Float(hits) / Float(max(K, 1)))")
         t = Date(timeIntervalSinceNow: -writeS)   // the write timer below picks up the per-chunk writes
 
@@ -343,10 +352,22 @@ public enum MeshBake {
             rgba[p*4+3] = 255
         }
         m.inpaintS = -t.timeIntervalSinceNow
-        let baked = BakedMesh(vertices: finalMesh.vertices, faces: finalMesh.faces,
+
+        // 6) opt-in detail maps (normal map from the raw shell, AO on the output mesh). Off by
+        // default: nothing above depends on them, so a bake without them is byte-identical.
+        var detail = BakedDetailMaps()
+        if !detailMaps.isEmpty {
+            let (d, dm) = bakeDetailMaps(mesh: finalMesh, normals: finalNormals, uvs: finalUVs,
+                                         rawMesh: origMesh, rawBVH: origBVH, mrRGBA: &mrRGBA,
+                                         atlasSize: atlasSize, options: detailMaps, log: log)
+            detail = d
+            m.detail = dm
+        }
+        var baked = BakedMesh(vertices: finalMesh.vertices, faces: finalMesh.faces,
                               normals: finalNormals, uvs: finalUVs, texRGBA: rgba,
                               atlasSize: atlasSize, coverage: coverage, mrRGBA: mrRGBA,
                               filledBeforeInpaint: filledBeforeInpaint, wallFlipped: wallFlipped)
+        baked.detail = detail
         return (baked, m)
     }
 

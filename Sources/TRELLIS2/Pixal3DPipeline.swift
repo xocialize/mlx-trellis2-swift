@@ -172,7 +172,8 @@ extension Trellis2Pipeline {
         ssPhases: MLXArray,
         shapeMean: MLXArray, shapeStd: MLXArray, texMean: MLXArray, texStd: MLXArray,
         texture: Bool = true, targetFaces: Int = 120_000, yUp: Bool = false,
-        atlasSize: Int = 1024, pbrMaps: Bool = false, unwrapBackend: UnwrapBackend = .xatlas,
+        atlasSize: Int = 1024, pbrMaps: Bool = false, detailMaps: DetailMapOptions = .none,
+        unwrapBackend: UnwrapBackend = .xatlas,
         slatCfgSDPA: SDPAPrecision = .fp32, texSDPA: SDPAPrecision? = nil, steps: Int = 12,
         maxHRTokens: Int? = nil, remeshRes: Int? = nil, seed: UInt64 = 0,
         frame: Pixal3DFrame = .front, noise: Pixal3DNoise? = nil,
@@ -363,7 +364,8 @@ extension Trellis2Pipeline {
         let (bakedVoxel, bakeMetrics) = try MeshBake.run(shapeFeats: shapeOut.feats, coords: shapeOut.coords, texBaseColor: baseColor,
                                                          fineRes: Float(hrResolution), remeshRes: remesh,
                                                          targetFaces: targetFaces, atlasSize: atlasSize,
-                                                         backend: unwrapBackend, texMetallicRoughness: metallicRoughness, log: log)
+                                                         backend: unwrapBackend, texMetallicRoughness: metallicRoughness,
+                                                         detailMaps: detailMaps, log: log)
         metrics.meshbakeS = -t.timeIntervalSinceNow
         metrics.bake = bakeMetrics
 
@@ -377,11 +379,7 @@ extension Trellis2Pipeline {
             if let tr { cols = cols.enumerated().map { $0.element + tr[$0.offset] } }
             return MLX.stacked(cols, axis: 1)
         }
-        let baked = BakedMesh(vertices: rotate(bakedVoxel.vertices, R, tr), faces: bakedVoxel.faces,
-                              normals: rotate(bakedVoxel.normals, R), uvs: bakedVoxel.uvs,
-                              texRGBA: bakedVoxel.texRGBA, atlasSize: bakedVoxel.atlasSize, coverage: bakedVoxel.coverage,
-                              mrRGBA: bakedVoxel.mrRGBA, filledBeforeInpaint: bakedVoxel.filledBeforeInpaint,
-                              wallFlipped: bakedVoxel.wallFlipped)
+        let baked = bakedVoxel.mapped(positions: { rotate($0, R, tr) }, directions: { rotate($0, R) })
         metrics.yupS = -t.timeIntervalSinceNow
         return (baked, hrResolution, metrics, report)
     }

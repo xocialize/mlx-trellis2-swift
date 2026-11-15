@@ -181,6 +181,7 @@ public final class Trellis2Pipeline {
                          shapeMean: MLXArray, shapeStd: MLXArray, texMean: MLXArray, texStd: MLXArray,
                          texture: Bool = true, targetFaces: Int = 120_000, yUp: Bool = false,
                          atlasSize: Int = 1024, pbrMaps: Bool = false,
+                         detailMaps: DetailMapOptions = .none,
                          unwrapBackend: UnwrapBackend = .xatlas,
                          slatCfgSDPA: SDPAPrecision = .fp32, texSDPA: SDPAPrecision? = nil,
                          steps: Int = 12,
@@ -357,7 +358,8 @@ public final class Trellis2Pipeline {
         let (bakedInit, bakeMetrics) = try MeshBake.run(shapeFeats: shapeOut.feats, coords: shapeOut.coords, texBaseColor: baseColor,
                                      fineRes: Float(hrResolution), remeshRes: remesh,
                                      targetFaces: targetFaces, atlasSize: atlasSize,
-                                     backend: unwrapBackend, texMetallicRoughness: metallicRoughness, log: log)
+                                     backend: unwrapBackend, texMetallicRoughness: metallicRoughness,
+                                     detailMaps: detailMaps, log: log)
         metrics.meshbakeS = -t.timeIntervalSinceNow
         metrics.bake = bakeMetrics
         var baked = bakedInit
@@ -368,10 +370,7 @@ public final class Trellis2Pipeline {
             func toYUp(_ a: MLXArray) -> MLXArray {
                 MLX.stacked([a[0..., 0], a[0..., 2], -a[0..., 1]], axis: 1)
             }
-            baked = BakedMesh(vertices: toYUp(baked.vertices), faces: baked.faces, normals: toYUp(baked.normals),
-                              uvs: baked.uvs, texRGBA: baked.texRGBA, atlasSize: baked.atlasSize, coverage: baked.coverage,
-                              mrRGBA: baked.mrRGBA,
-                              filledBeforeInpaint: baked.filledBeforeInpaint, wallFlipped: baked.wallFlipped)
+            baked = baked.mapped(positions: toYUp, directions: toYUp)   // tangents follow the normals
             log("  [7] reoriented Y-up")
         }
         metrics.yupS = -t.timeIntervalSinceNow

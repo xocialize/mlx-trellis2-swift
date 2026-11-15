@@ -772,6 +772,7 @@ public final class Trellis2Package: ModelPackage {
             texMean: MLXArray(texMean), texStd: MLXArray(texStd),
             texture: options.texture, targetFaces: options.decimateFaces,
             yUp: options.yUp, atlasSize: options.atlasSize, pbrMaps: options.pbrMaps,
+            detailMaps: options.detailMaps,
             unwrapBackend: configuration.unwrapBackend == "provenance" ? .provenance : .xatlas,
             slatCfgSDPA: configuration.slatCfgAttention.flatMap { SDPAPrecision(rawValue: $0) } ?? .fp32,
             texSDPA: configuration.texAttention.flatMap { SDPAPrecision(rawValue: $0) } ?? .bf16,
@@ -786,11 +787,7 @@ public final class Trellis2Package: ModelPackage {
         try Task.checkCancellation()
 
         let tGlb = Date()
-        let glb = try GLTFExport.glbData(
-            positions: baked.vertices, indices: baked.faces,
-            normals: baked.normals, uvs: baked.uvs,
-            baseColorRGBA: (baked.texRGBA, baked.atlasSize, baked.atlasSize),
-            metallicRoughnessRGBA: options.pbrMaps ? baked.mrRGBA.map { ($0, baked.atlasSize, baked.atlasSize) } : nil)
+        let glb = try Self.glbData(baked, options: options)
         let glbExportS = -tGlb.timeIntervalSinceNow
         let mesh = Mesh(format: .glb, data: glb,
                         vertexCount: baked.vertices.dim(0), faceCount: baked.faces.dim(0),
@@ -813,6 +810,7 @@ public final class Trellis2Package: ModelPackage {
             rec["mesh_faces"] = baked.faces.dim(0)
             rec["atlas_size"] = baked.atlasSize
             rec["pbr_maps"] = baked.mrRGBA != nil && options.pbrMaps
+            if !options.detailMaps.isEmpty { Self.recordDetailMaps(&rec, baked) }
             rec["y_up"] = options.yUp
             rec["texture"] = options.texture
             rec["target_faces"] = options.decimateFaces
@@ -893,6 +891,7 @@ public final class Trellis2Package: ModelPackage {
             texMean: MLXArray(texMean), texStd: MLXArray(texStd),
             texture: options.texture, targetFaces: options.decimateFaces,
             yUp: options.yUp, atlasSize: options.atlasSize, pbrMaps: options.pbrMaps,
+            detailMaps: options.detailMaps,
             unwrapBackend: configuration.unwrapBackend == "provenance" ? .provenance : .xatlas,
             slatCfgSDPA: configuration.slatCfgAttention.flatMap { SDPAPrecision(rawValue: $0) } ?? .fp32,
             texSDPA: configuration.texAttention.flatMap { SDPAPrecision(rawValue: $0) } ?? .bf16,
@@ -901,11 +900,7 @@ public final class Trellis2Package: ModelPackage {
         guard let baked = bakedOpt else { throw PackageError.notLoaded }
         try Task.checkCancellation()
         let tGlb = Date()
-        let glb = try GLTFExport.glbData(
-            positions: baked.vertices, indices: baked.faces,
-            normals: baked.normals, uvs: baked.uvs,
-            baseColorRGBA: (baked.texRGBA, baked.atlasSize, baked.atlasSize),
-            metallicRoughnessRGBA: options.pbrMaps ? baked.mrRGBA.map { ($0, baked.atlasSize, baked.atlasSize) } : nil)
+        let glb = try Self.glbData(baked, options: options)
         let glbExportS = -tGlb.timeIntervalSinceNow
         let mesh = Mesh(format: .glb, data: glb, vertexCount: baked.vertices.dim(0), faceCount: baked.faces.dim(0),
                         hasVertexColors: false)
@@ -923,6 +918,7 @@ public final class Trellis2Package: ModelPackage {
             rec["mesh_verts"] = baked.vertices.dim(0)
             rec["mesh_faces"] = baked.faces.dim(0)
             rec["y_up"] = options.yUp
+            if !options.detailMaps.isEmpty { Self.recordDetailMaps(&rec, baked) }
             rec["glb_bytes"] = glb.count
             rec["gpu_peak_bytes"] = Int(Memory.peakMemory)
             rec["e2e_total_s"] = mattingS + preprocessS + stageMetrics.generateTotalS + glbExportS
@@ -937,6 +933,32 @@ public final class Trellis2Package: ModelPackage {
                                  camera: ImageTo3DCamera(fovXDegrees: camera.fovXRadians * 180 / .pi,
                                                          cameraToWorld: camera.camera0ToMesh),
                                  frame: ImageTo3DFrame(rawValue: camera.frame.rawValue))
+    }
+
+    // MARK: GLB
+
+    /// The response GLB: base colour, plus whichever opt-in maps the request switched on.
+    static func glbData(_ baked: BakedMesh, options: Trellis2RequestOptions) throws -> Data {
+        let d = baked.detail
+        let occlusion: GLTFExport.Occlusion? =
+            d.occlusionInMetallicRoughness && options.pbrMaps ? .metallicRoughnessRed
+            : d.occlusionRGBA.map { .texture(pixels: $0, width: d.occlusionSize, height: d.occlusionSize) }
+        return try GLTFExport.glbData(
+            positions: baked.vertices, indices: baked.faces,
+            normals: baked.normals, uvs: baked.uvs,
+            baseColorRGBA: (baked.texRGBA, baked.atlasSize, baked.atlasSize),
+            metallicRoughnessRGBA: options.pbrMaps ? baked.mrRGBA.map { ($0, baked.atlasSize, baked.atlasSize) } : nil,
+            tangents: d.normalRGBA != nil ? d.tangents : nil,
+            normalRGBA: d.normalRGBA.map { ($0, d.normalSize, d.normalSize) },
+            occlusion: occlusion)
+    }
+
+    /// Detail-map facts for the metrics record (only written when a map was asked for).
+    static func recordDetailMaps(_ rec: inout [String: Any], _ baked: BakedMesh) {
+        let d = baked.detail
+        rec["normal_map_size"] = d.normalRGBA != nil ? d.normalSize : 0
+        rec["ao_map_size"] = d.occlusionSize
+        rec["ao_in_metallic_roughness"] = d.occlusionInMetallicRoughness
     }
 
     // MARK: weight resolution

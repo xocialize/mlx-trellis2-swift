@@ -12,6 +12,7 @@ import MLXToolKit
 import MLXServeConformance
 import Trellis2Kit
 import TRELLIS2   // Pixal3D camera maths (host-side Double, no MLX kernels)
+import MLX        // detail-map GLB checks (a three-vertex triangle, no weights)
 
 var failures = 0
 func check(_ name: String, _ passed: Bool, _ note: String = "") {
@@ -400,9 +401,88 @@ check("Pixal3D accepts a single-view fov (then needs weights: notLoaded)", r5?.c
       || r5?.hasPrefix("other") == true, r5 ?? "ran")
 
 // ---------------------------------------------------------------------------------------------
+section("Detail-map request options (normal map, AO)")
+do {
+    let none = try Trellis2RequestOptions(metaData: [:], configuration: base)
+    check("detail maps off by default (byte-identical GLBs)", !none.normalMap && !none.aoMap
+          && none.normalMapSize == nil && none.aoMapSize == nil && none.detailMaps == .none && none.detailMaps.isEmpty)
+    let sizesOnly = try Trellis2RequestOptions(metaData: ["normalMapSize": .int(2048), "aoRays": .int(16)], configuration: base)
+    check("a size or ray key without its switch bakes nothing", sizesOnly.detailMaps.isEmpty)
+    let on = try Trellis2RequestOptions(metaData: [
+        "atlasSize": .int(2048), "normalMap": .bool(true), "aoMap": .bool(true),
+        "aoMapSize": .int(1024), "aoRays": .int(128), "aoDistance": .double(0.5),
+    ], configuration: base)
+    let d = on.detailMaps
+    check("normal map defaults to the atlas size; every AO key overrides",
+          d.normalMapSize == 2048 && d.aoMapSize == 1024 && d.aoRays == 128 && d.aoMaxDistance == 0.5)
+} catch {
+    check("detail-map options parse", false, "\(error)")
+}
+for (key, bad) in [("normalMap", MetaValue.int(1)), ("aoMap", .string("on")), ("normalMapSize", .int(3000)),
+                   ("aoMapSize", .int(256)), ("aoRays", .int(0)), ("aoRays", .int(1024)),
+                   ("aoDistance", .double(0)), ("aoDistance", .double(3))] {
+    do {
+        _ = try Trellis2RequestOptions(metaData: [key: bad], configuration: base)
+        check("refuses \(key) = \(bad)", false, "accepted")
+    } catch PackageError.unsupportedRequestFeature {
+        check("refuses \(key) = \(bad)", true)
+    } catch {
+        check("refuses \(key) = \(bad)", false, "threw \(error)")
+    }
+}
+do {
+    _ = try Trellis2RequestOptions(metaData: ["normalMapSize": .int(2048)], configuration: small)
+    check("maxAtlasSize 1024 refuses normalMapSize 2048", false, "accepted")
+} catch PackageError.unsupportedRequestFeature {
+    check("maxAtlasSize 1024 refuses normalMapSize 2048", true)
+} catch { check("maxAtlasSize 1024 refuses normalMapSize 2048", false, "\(error)") }
+
+// GLB: the detail maps land where glTF readers look for them, and nothing is written without them.
+do {
+    let pos = MLXArray([0, 0, 0, 1, 0, 0, 0, 1, 0] as [Float], [3, 3])
+    let idx = MLXArray([0, 1, 2] as [Int32], [1, 3])
+    let nrm = MLXArray([0, 0, 1, 0, 0, 1, 0, 0, 1] as [Float], [3, 3])
+    let uv = MLXArray([0, 1, 1, 1, 0, 0] as [Float], [3, 2])
+    let px = [UInt8](repeating: 128, count: 4 * 4 * 4)
+    func json(_ glb: Data) -> [String: Any] {
+        let n = Int(glb[12]) | Int(glb[13]) << 8 | Int(glb[14]) << 16 | Int(glb[15]) << 24
+        return (try? JSONSerialization.jsonObject(with: glb.subdata(in: 20 ..< 20 + n))) as? [String: Any] ?? [:]
+    }
+    let plain = try GLTFExport.glbData(positions: pos, indices: idx, normals: nrm, uvs: uv,
+                                       baseColorRGBA: (px, 4, 4), metallicRoughnessRGBA: (px, 4, 4))
+    let explicitNil = try GLTFExport.glbData(positions: pos, indices: idx, normals: nrm, uvs: uv,
+                                             baseColorRGBA: (px, 4, 4), metallicRoughnessRGBA: (px, 4, 4),
+                                             tangents: nil, normalRGBA: nil, occlusion: nil)
+    check("GLB without detail maps is unchanged by the new parameters", plain == explicitNil)
+    let tangents = MeshBake.vertexTangents(vertices: pos, faces: idx, uvs: uv, normals: nrm)
+    let t = tangents.asArray(Float.self)
+    // u runs along +x; glTF v runs down the image while +y goes up it → T = +x, w = +1
+    check("tangent of the unit triangle is +x, right-handed (w = +1)",
+          abs(t[0] - 1) < 1e-6 && abs(t[1]) < 1e-6 && abs(t[2]) < 1e-6 && t[3] == 1)
+    let orm = json(try GLTFExport.glbData(positions: pos, indices: idx, normals: nrm, uvs: uv,
+                                          baseColorRGBA: (px, 4, 4), metallicRoughnessRGBA: (px, 4, 4),
+                                          tangents: tangents, normalRGBA: (px, 4, 4), occlusion: .metallicRoughnessRed))
+    let mat = (orm["materials"] as? [[String: Any]])?.first ?? [:]
+    let pbr = mat["pbrMetallicRoughness"] as? [String: Any] ?? [:]
+    let mrIndex = (pbr["metallicRoughnessTexture"] as? [String: Any])?["index"] as? Int
+    let occIndex = (mat["occlusionTexture"] as? [String: Any])?["index"] as? Int
+    let attrs = ((orm["meshes"] as? [[String: Any]])?.first?["primitives"] as? [[String: Any]])?.first?["attributes"] as? [String: Any]
+    check("ORM: occlusionTexture is the metallicRoughness texture; normalTexture + TANGENT written",
+          mrIndex != nil && occIndex == mrIndex && (mat["normalTexture"] as? [String: Any])?["index"] != nil
+          && attrs?["TANGENT"] != nil && (orm["textures"] as? [Any])?.count == 3)
+    let sep = json(try GLTFExport.glbData(positions: pos, indices: idx, normals: nrm, uvs: uv, baseColorRGBA: (px, 4, 4),
+                                          occlusion: .texture(pixels: px, width: 4, height: 4)))
+    let sepMat = (sep["materials"] as? [[String: Any]])?.first ?? [:]
+    check("separate occlusion texture without a metallicRoughness map",
+          (sepMat["occlusionTexture"] as? [String: Any])?["index"] as? Int == 1 && (sep["textures"] as? [Any])?.count == 2)
+} catch {
+    check("detail-map GLB export", false, "\(error)")
+}
+
+// ---------------------------------------------------------------------------------------------
 section("Result")
 if failures == 0 {
-    print("✅ ALL GATES PASSED (C0–C13 static + MAT-1..5 + CAN-1..3 + FIT lanes + request options + Pixal3D options + Pixal3DPackage)")
+    print("✅ ALL GATES PASSED (C0–C13 static + MAT-1..5 + CAN-1..3 + FIT lanes + request options + Pixal3D options + Pixal3DPackage + detail maps)")
 } else {
     print("❌ \(failures) gate check(s) FAILED")
     exit(1)

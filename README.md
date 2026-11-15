@@ -440,6 +440,18 @@ thread order, and float addition is not associative:
 They now sum on the CPU in face order. Before this change the final face count drifted by up to
 0.07 % between identical runs.
 
+**Unit normals.** Every `NORMAL` is unit length, so the GLBs pass the Khronos glTF validator with
+no errors. The mesh reaching the unwrap carries a few zero-thickness fins: two coincident
+triangles with opposite winding. xatlas gives each fin a 3-vertex chart of its own, where the two
+face normals sum to (0,0,0) or to rounding noise. Up to v0.16.0 the bake wrote those vertices as
+zero vectors (`ACCESSOR_VECTOR3_NON_UNIT`: 3 on the Pixal3D res1024 dress, 33–36 on the stock
+shoes, 189 on the res512 dress at atlas 4096) or as unit vectors pointing in a noise direction.
+`Mesh.vertexNormals()` now gives any vertex whose sum has lost its direction (shorter than 1e-6 of
+its summed face-normal lengths) the normal of its largest incident face, or (0,0,1) when it has no
+face of nonzero area. Every other normal keeps its exact bytes, so only GLBs with fins change, and
+only in the fins' `NORMAL` entries (with a normal map on, also in their `TANGENT` entries; the
+textures came out byte-identical on the res512 dress at atlas 4096 with both detail maps).
+
 **Atlas size and memory.** The bake supersamples 2×, so a 4096 atlas rasterizes an 8192² grid.
 Since v0.12.0 the per-texel stage runs in 16M-texel chunks. Before chunking, a 4096 atlas peaked at
 about 100 GB even at res512. At atlas 1024 the chunked stage is a single chunk, the same computation

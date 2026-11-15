@@ -13,6 +13,7 @@ import MLXServeConformance
 import Trellis2Kit
 import TRELLIS2   // Pixal3D camera maths (host-side Double, no MLX kernels)
 import MLX        // detail-map GLB checks (a three-vertex triangle, no weights)
+import MLXMesh    // vertex-normal accumulation (host-side [Float], no MLX kernels)
 
 var failures = 0
 func check(_ name: String, _ passed: Bool, _ note: String = "") {
@@ -480,9 +481,29 @@ do {
 }
 
 // ---------------------------------------------------------------------------------------------
+section("Vertex normals are unit length (glTF ACCESSOR_VECTOR3_NON_UNIT)")
+// Host-side half of Mesh.vertexNormals(). Vertices 0–2: a zero-thickness fin (two coincident
+// triangles, opposite winding — the bake meets a few and xatlas charts each on its own), whose cross
+// products cancel to (0,0,0). 3–5: an ordinary triangle. 6: no face. 7–9: a zero-area face only.
+do {
+    let fins: [Float] = [0, 0, 2,  0, 0, -2,  0, 0, 1,  0, 0, 0]   // un-normalized face normals
+    let tris: [Int32] = [0, 1, 2,  0, 2, 1,  3, 4, 5,  7, 8, 9]
+    let (sums, repaired) = Mesh.accumulateVertexNormals(faceNormals: fins, faces: tris, vertexCount: 10)
+    let row = { (v: Int) in (sums[v*3], sums[v*3 + 1], sums[v*3 + 2]) }
+    let unit = (0 ..< 10).allSatisfy { v in
+        let (x, y, z) = row(v); return abs((x*x + y*y + z*z).squareRoot() - 1) < 1e-6 || v >= 3 && v <= 5 }
+    check("every vertex has a direction (fin, no face, zero-area face)", unit && repaired == [0, 1, 2, 6, 7, 8, 9], "\(repaired)")
+    check("fin vertices take their first face's normal (ties → lowest face index)",
+          (0 ..< 3).allSatisfy { row($0) == (0, 0, 1) })
+    check("ordinary vertices keep the plain sum, bit for bit", (3 ..< 6).allSatisfy { row($0) == (0, 0, 1) })
+    let again = Mesh.accumulateVertexNormals(faceNormals: fins, faces: tris, vertexCount: 10)
+    check("deterministic (AB-A-0263)", again.sums == sums && again.repaired == repaired)
+}
+
+// ---------------------------------------------------------------------------------------------
 section("Result")
 if failures == 0 {
-    print("✅ ALL GATES PASSED (C0–C13 static + MAT-1..5 + CAN-1..3 + FIT lanes + request options + Pixal3D options + Pixal3DPackage + detail maps)")
+    print("✅ ALL GATES PASSED (C0–C13 static + MAT-1..5 + CAN-1..3 + FIT lanes + request options + Pixal3D options + Pixal3DPackage + detail maps + vertex normals)")
 } else {
     print("❌ \(failures) gate check(s) FAILED")
     exit(1)

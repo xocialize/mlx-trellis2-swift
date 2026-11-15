@@ -97,7 +97,12 @@ conditions the sparse-structure and shape flows on the primary image alone and g
 only to the texture flow, so extra views can add colour evidence without steering geometry.
 `views_scope` in the metrics record says which scope ran.
 
-## Pixal3D mode (AB-T-0485, branch `pixal3d`, not released)
+## Pixal3D mode (v0.13.0, AB-T-0485)
+
+Released in v0.13.0 for **single view** (stage 1). The converted single-view weights are in the private
+HF repo `xocialize/pixal3d-mlx`. Posed multi-view is implemented and gated, but its samplers are 0.988
+against the 0.99 gate, so its `_mv` weights are not published (AB-R-0868). Lanes, engine contract fields
+and public weights are P3.
 
 [Pixal3D](https://github.com/TencentARC/Pixal3D) (TencentARC, SIGGRAPH 2026; MIT, code `f7cf384`,
 weights `b0cb2e1b`) is TRELLIS.2 with the three flow models retrained so the image features are
@@ -166,7 +171,7 @@ each) to bf16 like the stock flows (2.68 GB SS, 2.77 GB each SLat) with the stoc
 and `naf_release.pth` to `naf.safetensors`. Output names: `pixal3d_struct_flow`,
 `pixal3d_shape_flow_512`, `pixal3d_shape_flow_1024`, `pixal3d_tex_flow_1024`, each with an `_mv` twin,
 plus `naf`. Tencent's `LICENSE` and `NOTICE` and NAF's Apache-2.0 text travel with them
-(AB-D-0229). They are not published; publishing is P3.
+(AB-D-0229). The single-view set (4 flows + `naf`) is in the private HF repo `xocialize/pixal3d-mlx`; the `_mv` set is local only.
 
 **Gate.** `swift run -c release pixal3dparity` checks every stage against the CUDA goldens of
 AB-R-0865 (mirrored to safetensors by `Tools/pixal3d/convert_goldens.py`): camera, DINOv3 tokens,

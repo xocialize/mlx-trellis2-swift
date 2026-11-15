@@ -80,7 +80,7 @@ SOFTWARE.
 
 ---
 
-## Pixal3D and NAF — ported code (branch `pixal3d`, AB-T-0485; not released)
+## Pixal3D and NAF — ported code (v0.13.0, AB-T-0485)
 
 These are Swift translations, not vendored copies. The converted weights carry their own notices
 (Tencent's `LICENSE` and `NOTICE` from `TencentARC/Pixal3D` @ `b0cb2e1b`, and NAF's Apache-2.0 text,

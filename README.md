@@ -97,6 +97,138 @@ conditions the sparse-structure and shape flows on the primary image alone and g
 only to the texture flow, so extra views can add colour evidence without steering geometry.
 `views_scope` in the metrics record says which scope ran.
 
+## Pixal3D mode (AB-T-0485, branch `pixal3d`, not released)
+
+[Pixal3D](https://github.com/TencentARC/Pixal3D) (TencentARC, SIGGRAPH 2026; MIT, code `f7cf384`,
+weights `b0cb2e1b`) is TRELLIS.2 with the three flow models retrained so the image features are
+back-projected through a camera onto every voxel. The decoders and the bake are TRELLIS.2's,
+unchanged. In this package it is an option on the same `Trellis2Package`, not a separate model:
+the stock path is untouched when `pixal3d` is off.
+
+**What is different from stock TRELLIS.2**
+
+- Each flow block adds `proj_linear(proj)` to its cross-attention output
+  (`ModulatedTransformerCrossBlock.projW/projB`). `proj` is the image feature map sampled where each
+  voxel lands in the photo: DINOv3 patch tokens, and in the shape and texture stages also the NAF
+  upsampled map (2048 channels). Cross-attention sees only the 5 global DINOv3 tokens (CLS + 4
+  registers). Negative conditioning is zeros, so the unconditional branch adds only the bias.
+- Four conditioners: SS (DINOv3 512, dense 16³, no NAF), shape 512 (DINOv3 512 + NAF 512, 32³),
+  shape 1024 (DINOv3 1024 + NAF 512, hr/16), texture 1024 (DINOv3 1024 + NAF 1024, hr/16).
+- NAF (`valeoai/NAF` @ `37f2dfc`, Apache-2.0, 0.66 M params) is ported in `NAF.swift`, not NATTEN:
+  a small conv encoder with axial RoPE, then 9×9 dilated neighbourhood attention from the HR
+  pixels to the DINOv3 patches, with NATTEN's border rule. The HR map is never materialized: the
+  corner pixels the projection needs are gathered band by band (`NAF.sample`).
+- The cascade requantizes with `((c + 0.5) / 512 · (grid − 1)).round()` (stock: `· grid` and
+  truncate), `Pixal3DProjection.requantize`.
+- No 512 mode upstream: Pixal3D runs on the cascade tiers (`res1024`, `res1536`) only. `res1024` is
+  the gated one; `res1536` runs the same code at grid 96 but has no golden.
+- Single view crops with a 1.1 margin (stock: none). The camera model maps the unit cube to that
+  framing, so the margin is part of the camera.
+
+**Camera.** Single view takes a horizontal FOV, default 20° (P1 measured a fixed 20° aligning as
+well as MoGe-2 on the corpus, AB-R-0865); `distance = 0.5 / (mesh_scale · tan(fov/2))`,
+`mesh_scale` 1. Posed multi-view takes one camera-to-world matrix per view (Z-up world, the
+camera looks down its −Z with +Y up; view 0 is the canonical front
+`[[1,0,0,0],[0,0,−1,−d],[0,1,0,0],[0,0,0,1]]`). Every view is placed relative to view 0
+(`calc_mat_i = F(d₀)·inv(C₀)·C_i`), the projected features and global tokens are averaged over
+views with no visibility test, and the `_mv` weights run. Views are not cropped (the cameras fix
+the framing).
+
+**Output frame (decision).** Pixal3D's mesh is in the photo's camera frame, not upright: the
+decoder's voxel frame has the photo's up on +Y and the camera on +Z. The package always rotates it
+into Pixal3D's own world frame, `(x, y, z) → (x, −z, y)`: Z-up with the front camera at −Y, which
+is the axis convention of the stock output, so `yUp`, the bake and every Z-up consumer read it the
+same way. It does not try to make the object upright: "up" is the photo's up, and a product shot
+taken from above comes out tilted by the camera's elevation; no gravity estimate is made. For posed
+multi-view, `pixal3dFrame: "world"` maps the mesh into the frame the request's cameras are written
+in (`C₀·inv(F(d₀))`, rigid), which is upright when the host's cameras are gravity-aligned. The metrics
+record carries the camera (`pixal3d_fov_deg`, `pixal3d_distance`, `pixal3d_camera0_to_mesh`: view 0's
+camera-to-world in the returned mesh's frame), so a host that knows the photo's elevation can
+re-orient. `Pixal3DCameraReport` carries the same from `generatePixal3D`.
+
+**Request keys** (`ImageTo3DRequest.metaData`, with the other per-request options):
+
+| Key | Values | Default |
+|---|---|---|
+| `pixal3d` | bool | false (`true` on a `pixal3dOnly` registration) |
+| `pixal3dFovDegrees` | number in (0, 120) | 20 |
+| `pixal3dFrame` | `"front"` or `"world"` | `"front"` |
+| `pixal3dCameras` | array of 16-number row-major camera-to-world matrices, image first then `additionalViews` | none |
+
+`additionalViews` without `pixal3dCameras` is refused in Pixal3D mode (pose-free views are the stock
+path's `additionalViews`). `res512` is refused. Configuration: `pixal3dWeightsDir` (where the
+converted weights are; default the consolidated snapshot) and `pixal3dOnly` (skip the stock SS and
+SLat flows, preload the Pixal3D set at prepare).
+
+**Weights.** `Tools/pixal3d/convert_weights.py` converts the eight flows (fp32 on disk, 5.4–5.5 GB
+each) to bf16 like the stock flows (2.68 GB SS, 2.77 GB each SLat) with the stock module keys
+(`cross_attn.cross_attn_block.*` → `cross_attn.*`, `rope_phases` dropped, `proj_linear` kept),
+and `naf_release.pth` to `naf.safetensors`. Output names: `pixal3d_struct_flow`,
+`pixal3d_shape_flow_512`, `pixal3d_shape_flow_1024`, `pixal3d_tex_flow_1024`, each with an `_mv` twin,
+plus `naf`. Tencent's `LICENSE` and `NOTICE` and NAF's Apache-2.0 text travel with them
+(AB-D-0229). They are not published; publishing is P3.
+
+**Gate.** `swift run -c release pixal3dparity` checks every stage against the CUDA goldens of
+AB-R-0865 (mirrored to safetensors by `Tools/pixal3d/convert_goldens.py`): camera, DINOv3 tokens,
+projection, NAF crops (centre and edge), banded NAF sampling, end-to-end conditioning,
+`proj_linear` block I/O, velocities at steps 0/5/11, each sampler, the HR requantize, the mesh
+decoded from the golden latents, and the whole chain. Env: `PIXAL3D_RUN`, `PIXAL3D_GOLDENS`,
+`PIXAL3D_WEIGHTS`, `TRELLIS2_WEIGHTS`, `PIXAL3D_SECTIONS`, `PIXAL3D_STAGES`, `PIXAL3D_JSON`.
+`trellis2-gate` checks the request keys and the camera maths.
+
+**Gate results (2026-11-14, M5 Max 128 GB, release; goldens: HF Job `6af8e2ae23985fb9cd82a3b0`).**
+Thresholds are this repo's: 0.999 per op, 0.99 for DINOv3 / full forwards / samplers, coords exact or
+≤ 0.2 %. The oracle ran its flows in bf16; ours run fp32.
+
+| Stage | dress, single view | shoes, single view | dress, posed 3 views |
+|---|---|---|---|
+| camera (distance; multi-view `calc_mat`) | exact | exact | exact |
+| preprocessing (our crop/resize → DINOv3 tokens 512 / 1024) | 0.99990 / 0.99971 | 0.99988 / 0.99975 | 0.99970 / 0.99952 |
+| DINOv3 tokens 512 / 1024, `z_global` | 0.999999 | 0.999999 | 0.999998 |
+| projection (golden patch maps) | 1.000000 | 1.000000 | 1.000000 (mean of views) |
+| NAF crops, centre and edge, all 3 stages | 1.000000 | 1.000000 | 1.000000 (last view) |
+| conditioning end to end, every stage | 0.999999 | 0.999999 | 0.999999 |
+| `proj_linear` block I/O, blocks 0/15/29 | ≥ 0.99964 | ≥ 0.99909 | ≥ 0.99941 |
+| velocities, steps 0/5/11 (cond, uncond, guided) | ≥ 0.99769 | ≥ 0.99733 | ≥ 0.99749 |
+| samplers SS / shape 512 / shape 1024 / tex | 0.9987 / 0.9961 / 0.9949 / 0.99994 | pass, ≥ 0.99597 | 0.9981 / **0.9876** / **0.9881** / 0.99985 |
+| SS decode of the golden latent | exact | exact | exact |
+| HR requantize | 1 token in 8,546 | exact | 2 tokens in 16,050 |
+| mesh decoded from the golden latents, F@0.5 voxel | 0.9991 | 0.9991 | 0.9986 |
+| anchored chain latents shape 512 / 1024 / tex | 0.9961 / 0.9949 / **0.9885** | 0.9972 / 0.9945 / 0.9961 | **0.9883 / 0.9884 / 0.9890** |
+| anchored chain mesh, F@1 voxel (Chamfer, voxels) | 0.983 (0.18) | 0.987 (0.18) | 0.975 (0.26) |
+| free chain mesh, F@1 voxel (measured) | 0.686 | 0.645 | 0.439 |
+
+Bold is under its gate. What the misses are:
+- **Free chain.** With golden noise the SS sample matches at 0.998–0.999, but 16–47 voxels flip
+  through the occupancy threshold. They are low-margin voxels: median |logit| 7–17 against 109–122
+  for occupied ones. On a different token set the CFG-7.5 shape sampler lands on a different sample.
+  Inside our own port, moving only the token set (oracle coords → our coords) gives the same drop
+  (0.968 vs 0.966 on the dress). The gate injects the oracle's topology at the two coordinate
+  decisions, as this repo's parity methodology does for topology-adaptive stages; the free chain is
+  measured, not gated.
+- **Dress texture in the anchored chain (0.9885).** It is inherited from the shape latent (0.9949,
+  inside its gate) through `concat_cond`. Our conditioning with the oracle's shape latent gives
+  0.99992.
+- **Multi-view shape samplers (0.988).** Per-step velocities are as close as in single view
+  (0.99995 cond/uncond), but the multi-view CFG trajectory is more sensitive. Changing only the SDPA
+  cast (fp32 → bf16) moves our own multi-view shape-512 sample by 1 − cos = 1.1e-3, against 9e-5 in
+  single view (about 12×). The anchored multi-view mesh passes (F@1 0.975).
+
+**Generate time and memory on this Mac** (engine driver, `pixal3dOnly` registration, release, first
+job after prepare, 1024 lane, default bake at ≤ 300k faces):
+
+| Run | HR tokens | Generate | Peak `phys_footprint` | Resident between jobs |
+|---|---|---|---|---|
+| Pixal3D dress, single view | 8,500 | 113 s | 42.2 GB | 31.3 GB |
+| Pixal3D shoes, single view | 15,242 | 221 s | 51.9 GB | 31.1 GB |
+| Pixal3D dress, posed 3 views | 15,846 | 234 s | 52.5 GB | 31.3 GB |
+| stock TRELLIS.2 dress (reference) | 22,283 | 375 s | 58.2 GB | 30.3 GB |
+| stock TRELLIS.2 shoes (reference) | 11,054 | 156 s | 43.1 GB | 30.0 GB |
+
+Time and memory follow the HR token count, as for stock. Pixal3D makes fewer tokens than stock on the
+dress and more on the shoes, so neither is uniformly cheaper. The declared lane footprints are still
+stock's; per-lane Pixal3D footprints are P3.
+
 ## Footprint per tier (v0.11.0)
 
 Peak memory follows the number of HR tokens the cascade samples, not the tier's nominal
@@ -219,6 +351,8 @@ picked upstream, so apps lost the leak fix.
 - `Sources/TRELLIS2/` — the library (all ported components).
 - `Sources/parity/` — the parity harness. `swift run -c release parity` runs every gate.
 - `Sources/dinoparity/` — the DINOv3 conditioning gate (`swift run -c release dinoparity`).
+- `Sources/pixal3dparity/` — the Pixal3D gate against the CUDA goldens (`swift run -c release pixal3dparity`; README "Pixal3D mode").
+- `Tools/pixal3d/` — Pixal3D weight and golden converters.
 - `Sources/meshbake/` — end-to-end mesh+texture demo (`swift run -c release meshbake`).
 
 ## Build & run

@@ -395,6 +395,12 @@ to the configuration, so a request with no keys runs exactly the configured job.
 | `atlasSize` | 512, 1024, 2048, 4096 | 1024 |
 | `yUp` | bool | `yUpOutput` |
 | `pbrMaps` | bool: also write the metallic-roughness map (G = roughness, B = metallic) | false |
+| `normalMap` | bool: also write a tangent-space normal map (`normalTexture` + TANGENT) | false |
+| `normalMapSize` | 512, 1024, 2048, 4096 | the atlas size |
+| `aoMap` | bool: also write an ambient-occlusion map (`occlusionTexture`) | false |
+| `aoMapSize` | 512, 1024, 2048, 4096 | the atlas size |
+| `aoRays` | 1…256 rays per texel and side | 64 |
+| `aoDistance` | (0, 2], × the mesh's bounding-box diagonal | 0.25 |
 
 A malformed value is refused (`PackageError.unsupportedRequestFeature`) before weights are touched.
 Nothing is clamped silently. `pbrMaps` needs `texture`, because there is no tex decode to read the
@@ -450,6 +456,75 @@ lane's charge follows it. Measured peak phys for the dress with `pbrMaps` on:
 
 On the cascade lanes the HR stage stays the peak. res1536 with a 4096 atlas peaked at 65.23 GB,
 the same as with 1024, so their charges don't move.
+
+## Normal and AO maps
+
+Two opt-in outputs on the GLB, off by default. A request without them gives the same bytes as
+before they existed (checked against v0.13.0 and v0.16.0, below). Both packages take them (the
+`pixal3d` lane runs the same bake). `normalMapSize` and `aoMapSize` are capped by
+`maxAtlasSize`, like `atlasSize`. Neither needs `texture`.
+
+**Normal map (`normalMap`).** The decimated mesh loses the decoded surface's fine relief: lace,
+seams, fold edges. The bake keeps the raw dual-grid shell (10–18M faces at res1024, the same surface
+the colour is sampled from) and, per texel, casts a short cage ray from just outside the low-poly
+surface back along its normal; the outermost raw hit is the matching surface (closest point where
+the ray misses). The raw normal there goes into the texel's tangent frame and is written as a glTF
+tangent-space map (+X right, +Y image-up, +Z out) at 2× supersampling, box-averaged down. The GLB
+gets a TANGENT attribute: Lengyel per-vertex tangents, Gram–Schmidt against the written normals,
+handedness from the image-up bitangent (−dP/dv, glTF v runs down the image), the convention
+MikkTSpace-based tools use for glTF. The bake uses exactly the frame it writes, so a viewer that
+reads TANGENT reconstructs the baked normal.
+
+- The raw shell's winding is not consistent. Its vertex normals are summed with each face's sign
+  aligned at the vertex, so oppositely wound neighbours reinforce, and the result is turned to the
+  texel's side. With plain area-weighted normals, 51 % of the dress's texels fell back to flat.
+  With this sum, 2.9 % do.
+- A raw normal more than ~75° off the low-poly normal falls back to flat (a side wall or crevice
+  that the ray grabbed).
+
+**AO (`aoMap`).** Ray-cast on the output mesh with the BVH from `MLXMesh`: a new any-hit kernel
+(`BVH.occlusion`) generates cosine-weighted directions in the kernel (Hammersley set, per-texel
+rotation hashed from the index, so no ray buffer and no randomness) and stops a ray at its first hit.
+The output mesh is wound consistently only per chart (xatlas re-normalizes winding per chart, and
+the double-sided material hides inward charts in a viewer), so each texel casts both hemispheres and
+keeps the less occluded one. The inner side of a thin shell or a closed body sees the other wall at
+short range and is ~fully occluded. Following the normal alone blacked out whole charts.
+
+With `pbrMaps` on and the AO map at the atlas size, AO goes into the metallic-roughness texture's
+R channel, and `occlusionTexture` points at that texture (glTF ORM). Otherwise it is its own
+texture.
+
+Cost on the M5 Max, measured with `bakemaps` on the Pixal3D res1024 dress (292,520 faces, raw shell
+10.7M faces). Other GPU work was running on the machine during some runs; the best run is shown.
+
+| map edge | normal map (2× supersampled) | AO map (2 × 64 rays per texel) |
+|---|---|---|
+| 1024 | 0.45 s (2.9M sub-texels) | 0.30 s (0.78M texels) |
+| 2048 | 1.6 s | 1.2 s |
+| 4096 | 5.7 s | 4.7 s |
+
+The stock res1024 shoes (270,288 faces) at 1024: 0.46 s and 0.32 s. Tangents take under 10 ms. A
+1024 dress GLB with `pbrMaps` grows from 13.1 MB to 19.6 MB with both maps.
+
+**Memory.** The maps run after the colour bake. The colour bake's raster arrays are scoped to free
+before then, and the maps rasterize one jitter pass at a time. Measured peak phys:
+- `bakemaps`, atlas 4096: 28.91 GB without maps, 33.68 GB with both maps at 4096.
+- End to end on a res512 lane with `maxAtlasSize` 4096, dress, atlas 4096 + `pbrMaps` + both maps
+  at 4096: **43.27 GB** (43.54 GB on v0.13.0). That is level with the 43.59 GB above without maps,
+  so the 48 GB charge holds.
+- Pixal3D res1024 dress (`pixal3d` lane), maps at 1024: 42.10 GB (41.99 GB without them).
+- Stock res1024 shoes, maps at 1024: 43.04 GB. The HR stage stays the peak on the cascade lanes.
+
+**Checked.** With the maps off, the GLB bytes are identical to the release the branch was built on:
+v0.13.0, and again after rebasing onto v0.16.0 (Pixal3D res1024 dress sha256 `db75e0d5…`, stock
+res512 shoes `b6c9bbff…`). With the maps on, two bakes give identical bytes. The Khronos
+glTF validator raises nothing on the TANGENT accessor, the textures or the ORM sharing. The
+zero-length NORMAL entries it reports (3 on the Pixal3D dress, 33 on the res1024 shoes, the same
+counts on the v0.13.0 GLBs) predate this change.
+
+`swift run -c release bakemaps <bake-input.safetensors> <out.glb> --normal N --ao N [--pbr]` re-bakes
+saved decoder outputs (the arrays `MeshBake.run` takes), so the maps can be iterated without running
+diffusion. `--repeat` bakes twice and compares the bytes: identical with both maps on.
 
 ## Engine and mlx-swift pins
 

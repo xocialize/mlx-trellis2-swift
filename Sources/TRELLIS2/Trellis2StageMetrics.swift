@@ -32,6 +32,7 @@ public struct BakeStageMetrics: Codable, Sendable {
     public var charts = 0
     public var coveredTexelWrites = 0  // K (5-pass conservative)
     public var coverage: Float = 0     // texels filled before inpaint
+    public var detail: DetailMapMetrics? = nil   // opt-in normal/AO maps; nil when none were baked
 
     public init() {}
 }
@@ -111,6 +112,16 @@ public struct Trellis2StageMetrics: Codable, Sendable {
         if let v = shapeSlatHrS { r["shape_slat_hr_s"] = v }
         if let v = texSlatS { r["tex_slat_s"] = v }
         if let v = texDecodeS { r["tex_decode_s"] = v }
+        if let d = bake.detail {   // only when detail maps were asked for (records stay as before otherwise)
+            r["bake_tangents_s"] = d.tangentsS
+            r["bake_normal_map_s"] = d.normalMapS
+            r["bake_normal_map_texels"] = d.normalMapTexels
+            r["bake_normal_map_ray_hit_frac"] = d.normalMapRayHitFrac
+            r["bake_normal_map_flat_frac"] = d.normalMapFlatFrac
+            r["bake_ao_map_s"] = d.aoMapS
+            r["bake_ao_map_texels"] = d.aoMapTexels
+            r["bake_ao_mean"] = d.aoMean
+        }
         return r
     }
 }

@@ -96,6 +96,10 @@ let package = Package(
         .executableTarget(name: "meshbake", dependencies: [
             "TRELLIS2", .product(name: "MLX", package: "mlx-swift"),
         ], swiftSettings: [.interoperabilityMode(.Cxx)]),
+        // Detail-map bench: re-bake saved decoder outputs with the opt-in normal / AO maps.
+        .executableTarget(name: "bakemaps", dependencies: [
+            "TRELLIS2", .product(name: "MLX", package: "mlx-swift"),
+        ], swiftSettings: [.interoperabilityMode(.Cxx)]),
         // Phase-0 UV-unwrap baseline (UV-UNWRAP-METAL-PLAN.md): stage-split xatlas timing
         // + ModelIO comparison on corpus meshes. Bench-only PLY/GLB readers live here.
         .executableTarget(name: "unwrapbench", dependencies: [
@@ -120,6 +124,7 @@ let package = Package(
         // the skill prescribes so nothing runs under `swift test`, whose metallib is unreliable).
         .executableTarget(name: "trellis2-gate", dependencies: [
             "Trellis2Kit", "TRELLIS2",
+            .product(name: "MLX", package: "mlx-swift"),
             .product(name: "MLXToolKit", package: "mlx-engine-swift"),
             .product(name: "MLXServeConformance", package: "mlx-engine-swift"),
         ], swiftSettings: [.interoperabilityMode(.Cxx)]),

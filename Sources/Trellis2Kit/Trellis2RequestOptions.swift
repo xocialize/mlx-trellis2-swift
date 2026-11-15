@@ -1,5 +1,6 @@
 import Foundation
 import MLXToolKit
+import TRELLIS2
 
 /// Per-request overrides read from `ImageTo3DRequest.metaData` (AB-A-0263, MES Mesh 0.1). A host that
 /// keeps one `Trellis2Package` resident per lane and runs many jobs on it sets these per job; every
@@ -19,6 +20,18 @@ import MLXToolKit
 /// | `pixal3dFovDegrees` | number, (0, 120)         | 20 (Pixal3DCamera.defaultFovDegrees)   |
 /// | `pixal3dFrame`  | "front" or "world"           | "front"                                |
 /// | `pixal3dCameras`| array of 16-number arrays (row-major camera-to-world, one per view: image first, then `additionalViews`) | nil |
+/// | `normalMap`     | bool                         | false                                  |
+/// | `normalMapSize` | 512, 1024, 2048 or 4096, ≤ `maxAtlasSize` | the atlas size            |
+/// | `aoMap`         | bool                         | false                                  |
+/// | `aoMapSize`     | 512, 1024, 2048 or 4096, ≤ `maxAtlasSize` | the atlas size            |
+/// | `aoRays`        | integer 1...256              | 64                                     |
+/// | `aoDistance`    | number, (0, 2] (× bbox diagonal) | 0.25                               |
+///
+/// Detail maps: `normalMap` bakes the raw decoded surface's normals into a tangent-space map on the
+/// decimated mesh (glTF `normalTexture`, with a TANGENT attribute). `aoMap` ray-casts ambient
+/// occlusion on the output mesh (glTF `occlusionTexture`); with `pbrMaps` on and the AO at the atlas
+/// size, it rides the metallic-roughness texture's R channel (ORM). Neither needs `texture`. A size
+/// or ray key without its map switched on is accepted and ignored.
 ///
 /// Pixal3D mode (AB-T-0485): projection-conditioned flows on the cascade tiers. Single view takes a
 /// horizontal FOV (distance follows from it). Posed multi-view takes one camera-to-world matrix per
@@ -46,6 +59,18 @@ public struct Trellis2RequestOptions: Sendable, Equatable {
     public var pixal3dFrame: String
     /// Pixal3D posed multi-view cameras: one row-major 4×4 camera-to-world per view.
     public var pixal3dCameras: [[Double]]?
+    /// Bake a tangent-space normal map (glTF `normalTexture`) from the raw decoded surface.
+    public var normalMap: Bool
+    /// Normal-map edge; nil = the atlas size.
+    public var normalMapSize: Int?
+    /// Bake an ambient-occlusion map (glTF `occlusionTexture`).
+    public var aoMap: Bool
+    /// AO-map edge; nil = the atlas size.
+    public var aoMapSize: Int?
+    /// AO rays per texel.
+    public var aoRays: Int
+    /// AO ray length, × the mesh's bounding-box diagonal.
+    public var aoDistance: Double
 
     public enum Key {
         public static let seed = "seed"
@@ -59,6 +84,12 @@ public struct Trellis2RequestOptions: Sendable, Equatable {
         public static let pixal3dFovDegrees = "pixal3dFovDegrees"
         public static let pixal3dFrame = "pixal3dFrame"
         public static let pixal3dCameras = "pixal3dCameras"
+        public static let normalMap = "normalMap"
+        public static let normalMapSize = "normalMapSize"
+        public static let aoMap = "aoMap"
+        public static let aoMapSize = "aoMapSize"
+        public static let aoRays = "aoRays"
+        public static let aoDistance = "aoDistance"
     }
 
     public static let atlasSizes = [512, 1024, 2048, 4096]
@@ -66,6 +97,7 @@ public struct Trellis2RequestOptions: Sendable, Equatable {
     public static let decimateFacesRange = 1_000 ... 2_000_000
     /// The face target MeshBake uses when neither the request nor the configuration names one.
     public static let defaultDecimateFaces = 120_000
+    public static let aoRaysRange = 1 ... 256
 
     /// The configuration's job, with nothing overridden.
     public init(configuration c: Trellis2Configuration) {
@@ -80,6 +112,19 @@ public struct Trellis2RequestOptions: Sendable, Equatable {
         pixal3dFovDegrees = 20
         pixal3dFrame = "front"
         pixal3dCameras = nil
+        normalMap = false
+        normalMapSize = nil
+        aoMap = false
+        aoMapSize = nil
+        aoRays = 64
+        aoDistance = 0.25
+    }
+
+    /// The bake's detail-map request (`.none` unless `normalMap` or `aoMap` is on).
+    public var detailMaps: DetailMapOptions {
+        DetailMapOptions(normalMapSize: normalMap ? (normalMapSize ?? atlasSize) : nil,
+                         aoMapSize: aoMap ? (aoMapSize ?? atlasSize) : nil,
+                         aoRays: aoRays, aoMaxDistance: Float(aoDistance))
     }
 
     /// The configuration's job with `metaData`'s keys applied.
@@ -99,6 +144,17 @@ public struct Trellis2RequestOptions: Sendable, Equatable {
                     "metaData[\"atlasSize\"] = \(v) is above this registration's maxAtlasSize \(configuration.maxAtlasSize)")
             }
             atlasSize = v
+        }
+        if let v = try Self.textureSize(metaData, Key.normalMapSize, max: configuration.maxAtlasSize) { normalMapSize = v }
+        if let v = try Self.textureSize(metaData, Key.aoMapSize, max: configuration.maxAtlasSize) { aoMapSize = v }
+        if let v = try Self.bool(metaData, Key.normalMap) { normalMap = v }
+        if let v = try Self.bool(metaData, Key.aoMap) { aoMap = v }
+        if let v = try Self.int(metaData, Key.aoRays, in: Self.aoRaysRange) { aoRays = v }
+        if let v = try Self.number(metaData, Key.aoDistance) {
+            guard v > 0, v <= 2 else {
+                throw PackageError.unsupportedRequestFeature("metaData[\"aoDistance\"] = \(v): must be in (0, 2]")
+            }
+            aoDistance = v
         }
         if let v = try Self.bool(metaData, Key.yUp) { yUp = v }
         if let v = try Self.bool(metaData, Key.pbrMaps) { pbrMaps = v }
@@ -154,6 +210,21 @@ public struct Trellis2RequestOptions: Sendable, Equatable {
         case .double(let d) where d.isFinite: return d
         default: throw refuse(key, "a number", v)
         }
+    }
+
+    /// A texture edge: one of `atlasSizes`, at most the registration's `maxAtlasSize` (its charge
+    /// assumes no larger 2×-supersampled grid).
+    private static func textureSize(_ m: MetaData, _ key: String, max cap: Int) throws -> Int? {
+        guard let v = try int(m, key, in: 512 ... 4096) else { return nil }
+        guard atlasSizes.contains(v) else {
+            throw PackageError.unsupportedRequestFeature(
+                "metaData[\"\(key)\"] = \(v): one of \(atlasSizes.map(String.init).joined(separator: ", "))")
+        }
+        guard v <= cap else {
+            throw PackageError.unsupportedRequestFeature(
+                "metaData[\"\(key)\"] = \(v) is above this registration's maxAtlasSize \(cap)")
+        }
+        return v
     }
 
     private static func bool(_ m: MetaData, _ key: String) throws -> Bool? {

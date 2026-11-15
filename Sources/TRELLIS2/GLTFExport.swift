@@ -11,6 +11,14 @@ import UniformTypeIdentifiers
 /// Little-endian throughout (GLB requires it). Dependency-free beyond Foundation
 /// + macOS system frameworks.
 public enum GLTFExport {
+    /// Where the material's occlusion comes from.
+    public enum Occlusion {
+        /// The metallic-roughness texture's R channel (glTF ORM packing: R = occlusion).
+        case metallicRoughnessRed
+        /// Its own RGBA8 texture (occlusion read from R).
+        case texture(pixels: [UInt8], width: Int, height: Int)
+    }
+
     /// Write a single-primitive textured mesh as binary glTF (.glb).
     /// - positions: [V,3] Float, indices: [F,3] Int32, optional [V,3] normals,
     ///   optional [V,2] uvs, optional RGBA8 base-color texture (row-major).
@@ -21,24 +29,36 @@ public enum GLTFExport {
         normals: MLXArray? = nil,
         uvs: MLXArray? = nil,
         baseColorRGBA: (pixels: [UInt8], width: Int, height: Int)? = nil,
-        metallicRoughnessRGBA: (pixels: [UInt8], width: Int, height: Int)? = nil
+        metallicRoughnessRGBA: (pixels: [UInt8], width: Int, height: Int)? = nil,
+        tangents: MLXArray? = nil,
+        normalRGBA: (pixels: [UInt8], width: Int, height: Int)? = nil,
+        occlusion: Occlusion? = nil
     ) throws {
         let glb = try glbData(positions: positions, indices: indices, normals: normals,
                               uvs: uvs, baseColorRGBA: baseColorRGBA,
-                              metallicRoughnessRGBA: metallicRoughnessRGBA)
+                              metallicRoughnessRGBA: metallicRoughnessRGBA,
+                              tangents: tangents, normalRGBA: normalRGBA, occlusion: occlusion)
         try glb.write(to: url)
     }
 
     /// Serialize a single-primitive textured mesh as in-memory binary glTF (.glb) `Data` — the
     /// same bytes `writeGLB` writes to disk. Used by the engine `ModelPackage` path, whose
     /// canonical `Mesh` output is GLB bytes (no file needed).
+    ///
+    /// The optional detail maps: `tangents` [V,4] (glTF TANGENT, xyz unit + w handedness; needed for
+    /// `normalRGBA`, a tangent-space normal map), and `occlusion` (AO, either packed into the
+    /// metallic-roughness texture's R channel or its own texture). Each one left nil writes nothing,
+    /// so a call without them gives the same bytes as before they existed.
     public static func glbData(
         positions: MLXArray,
         indices: MLXArray,
         normals: MLXArray? = nil,
         uvs: MLXArray? = nil,
         baseColorRGBA: (pixels: [UInt8], width: Int, height: Int)? = nil,
-        metallicRoughnessRGBA: (pixels: [UInt8], width: Int, height: Int)? = nil
+        metallicRoughnessRGBA: (pixels: [UInt8], width: Int, height: Int)? = nil,
+        tangents: MLXArray? = nil,
+        normalRGBA: (pixels: [UInt8], width: Int, height: Int)? = nil,
+        occlusion: Occlusion? = nil
     ) throws -> Data {
         let V = positions.dim(0)
         let pos = positions.asType(.float32).asArray(Float.self)   // [V*3]
@@ -47,6 +67,15 @@ public enum GLTFExport {
         let uv = uvs.map { $0.asType(.float32).asArray(Float.self) }
         let png = baseColorRGBA.flatMap { encodePNG(pixels: $0.pixels, width: $0.width, height: $0.height) }
         let mrPng = metallicRoughnessRGBA.flatMap { encodePNG(pixels: $0.pixels, width: $0.width, height: $0.height) }
+        let tan = tangents.map { $0.asType(.float32).asArray(Float.self) }
+        precondition(tan == nil || tan!.count == V * 4, "tangents must be [V,4]")
+        precondition(normalRGBA == nil || (tan != nil && uv != nil), "a normal map needs tangents and uvs")
+        let nPng = normalRGBA.flatMap { encodePNG(pixels: $0.pixels, width: $0.width, height: $0.height) }
+        var occPng: Data? = nil
+        if case .texture(let px, let w, let h)? = occlusion { occPng = encodePNG(pixels: px, width: w, height: h) }
+        if case .metallicRoughnessRed? = occlusion {
+            precondition(mrPng != nil, "occlusion packed into metallicRoughness needs that texture")
+        }
 
         var bin = Data()
         var bufferViews: [[String: Any]] = []
@@ -91,6 +120,18 @@ public enum GLTFExport {
             uvAcc = accessors.count - 1
         }
 
+        // TANGENT (VEC4: xyz + handedness)
+        var tanAcc: Int? = nil
+        if let tan {
+            pad4()
+            let off = bin.count
+            for f in tan { putF32LE(f, &bin) }
+            bufferViews.append(["buffer": 0, "byteOffset": off, "byteLength": tan.count * 4, "target": 34962])
+            accessors.append(["bufferView": bufferViews.count - 1, "componentType": 5126,
+                              "count": V, "type": "VEC4"])
+            tanAcc = accessors.count - 1
+        }
+
         // indices (UNSIGNED_INT)
         pad4()
         let idxOff = bin.count
@@ -117,11 +158,28 @@ public enum GLTFExport {
             bufferViews.append(["buffer": 0, "byteOffset": off, "byteLength": mrPng.count])
             mrBV = bufferViews.count - 1
         }
+        var nBV: Int? = nil
+        if let nPng {
+            pad4()
+            let off = bin.count
+            bin.append(nPng)
+            bufferViews.append(["buffer": 0, "byteOffset": off, "byteLength": nPng.count])
+            nBV = bufferViews.count - 1
+        }
+        var occBV: Int? = nil
+        if let occPng {
+            pad4()
+            let off = bin.count
+            bin.append(occPng)
+            bufferViews.append(["buffer": 0, "byteOffset": off, "byteLength": occPng.count])
+            occBV = bufferViews.count - 1
+        }
 
         // --- assemble attributes / material ---
         var attributes: [String: Any] = ["POSITION": posAcc]
         if let nrmAcc { attributes["NORMAL"] = nrmAcc }
         if let uvAcc { attributes["TEXCOORD_0"] = uvAcc }
+        if let tanAcc { attributes["TANGENT"] = tanAcc }
 
         var primitive: [String: Any] = ["attributes": attributes, "indices": idxAcc, "mode": 4]
 
@@ -152,16 +210,31 @@ public enum GLTFExport {
             textures.append(["source": images.count - 1, "sampler": 0])
             pbr["metallicRoughnessTexture"] = ["index": textures.count - 1]
         }
+        var normalTex: Int? = nil, occlusionTex: Int? = nil
+        if let nBV {
+            images.append(["bufferView": nBV, "mimeType": "image/png"])
+            textures.append(["source": images.count - 1, "sampler": 0])
+            normalTex = textures.count - 1
+        }
+        if let occBV {
+            images.append(["bufferView": occBV, "mimeType": "image/png"])
+            textures.append(["source": images.count - 1, "sampler": 0])
+            occlusionTex = textures.count - 1
+        } else if case .metallicRoughnessRed? = occlusion, mrBV != nil {
+            occlusionTex = (pbr["metallicRoughnessTexture"] as? [String: Any])?["index"] as? Int
+        }
         if !images.isEmpty {
             root["images"] = images
             root["samplers"] = [[String: Any]()]
             root["textures"] = textures
         }
-        let material: [String: Any] = [
+        var material: [String: Any] = [
             "pbrMetallicRoughness": pbr,
             "alphaMode": "OPAQUE",
             "doubleSided": true,
         ]
+        if let normalTex { material["normalTexture"] = ["index": normalTex] }
+        if let occlusionTex { material["occlusionTexture"] = ["index": occlusionTex] }
         root["materials"] = [material]
         primitive["material"] = 0
         root["meshes"] = [["primitives": [primitive]]]
@@ -199,7 +272,10 @@ public enum GLTFExport {
         withUnsafeBytes(of: &le) { data.append(contentsOf: $0) }
     }
 
-    /// RGBA8 (straight alpha, row-major) -> PNG bytes via ImageIO.
+    /// RGBA8 (straight alpha, row-major) -> PNG bytes via ImageIO. Data maps (normal, occlusion,
+    /// metallic-roughness) carry the same sRGB tag as colour: glTF readers treat them as linear
+    /// regardless, and to a colour-managed browser decode on an sRGB pipeline the tag is a no-op,
+    /// where a linear tag would get the values re-curved.
     private static func encodePNG(pixels: [UInt8], width: Int, height: Int) -> Data? {
         guard width > 0, height > 0, pixels.count >= width * height * 4 else { return nil }
         guard let cs = CGColorSpace(name: CGColorSpace.sRGB),

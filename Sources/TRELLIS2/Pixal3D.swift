@@ -77,6 +77,44 @@ public struct Pixal3DCamera: Sendable, Equatable {
         return 0.5 / (meshScale * tan(fovX / 2))
     }
 
+    /// A named view of a turnaround / orbit rig.
+    public enum OrbitView: String, Sendable, CaseIterable {
+        case front, left, back, right
+        /// Azimuth about the Z-up axis: front 0°, left 90°, back 180°, right 270° (the object faces −Y).
+        public var azimuthDegrees: Double {
+            switch self { case .front: 0; case .left: 90; case .back: 180; case .right: 270 }
+        }
+    }
+
+    /// Camera-to-world for an orbit camera: Z-up world, camera at azimuth `a`, elevation `e`, distance `d`,
+    /// looking at the origin (−Z forward, +Y up). Azimuth 0 / elevation 0 is the canonical front `F(d)`;
+    /// azimuth 90 is upstream's example `[[0,0,1,d],[1,0,0,0],[0,1,0,0],[0,0,0,1]]`.
+    public static func orbitC2W(azimuthDegrees a: Double, elevationDegrees e: Double = 0, distance d: Double) -> Mat4 {
+        let az = a * .pi / 180, el = e * .pi / 180
+        let back = (sin(az) * cos(el), -cos(az) * cos(el), sin(el))          // camera +Z (object → camera)
+        let right = (cos(az), sin(az), 0.0)                                  // camera +X
+        let up = (back.1 * right.2 - back.2 * right.1,                        // camera +Y = back × right
+                  back.2 * right.0 - back.0 * right.2,
+                  back.0 * right.1 - back.1 * right.0)
+        return Mat4([[right.0, up.0, back.0, d * back.0],
+                     [right.1, up.1, back.1, d * back.1],
+                     [right.2, up.2, back.2, d * back.2],
+                     [0, 0, 0, 1]])
+    }
+
+    /// A turnaround rig: one camera per named view, same horizontal FOV, elevation 0, orbit distance
+    /// `pad · 0.5 / tan(fov/2)`. `pad` is the framing: the unit cube spans 1/pad of each view's width.
+    /// ComfyUI's Pixal3DMultiViewConditioning and upstream's example rig use pad 1.1 (d = 3.1192 at 20°)
+    /// for views cropped to the subject with a 1.1 margin; pad 1.0 is the full-width framing of
+    /// single-view `distance` (2.8356 at 20°, the P1 oracle rig). The views must be framed to match.
+    /// View 0 should be `.front` (the canonical front); the order is the request's view order.
+    public static func turnaround(_ views: [OrbitView], fovXDegrees: Double = defaultFovDegrees,
+                                  pad: Double = 1.1) -> [Pixal3DCamera] {
+        let fov = fovXDegrees * .pi / 180
+        let d = pad * 0.5 / tan(fov / 2)
+        return views.map { Pixal3DCamera(fovX: fov, meshScale: 1.0, c2w: orbitC2W(azimuthDegrees: $0.azimuthDegrees, distance: d)) }
+    }
+
     /// The per-view projection matrices (`calc_mat_i = F(d0) · inv(C_0) · C_i`), view 0 = F exactly.
     /// For a single camera without `c2w`, `[F(distance)]`.
     public static func calcMats(_ cams: [Pixal3DCamera]) -> [Mat4] {

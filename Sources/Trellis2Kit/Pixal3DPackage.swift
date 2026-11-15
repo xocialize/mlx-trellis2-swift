@@ -46,6 +46,23 @@ public final class Pixal3DPackage: ModelPackage {
     /// The id mlx-engine asked Pixal3D lanes to register under (AB-A-0284).
     public nonisolated static let suggestedID = "pixal3d"
 
+    /// Host-friendly turnaround preset (ComfyUI's Pixal3DMultiViewConditioning shape): named views in
+    /// request order — "front", "left", "back", "right" (azimuth 0/90/180/270, elevation 0, Z-up orbit) —
+    /// with one horizontal FOV, as contract-1.64.0 cameras for `ImageTo3DRequest.cameras`. `pad` is the
+    /// framing (the unit cube spans 1/pad of each view): 1.1 for views cropped to the subject with a 1.1
+    /// margin (ComfyUI, upstream's example rig), 1.0 for full-width framing. Throws on an unknown name.
+    public nonisolated static func turnaroundCameras(_ views: [String], fovXDegrees: Double = Pixal3DCamera.defaultFovDegrees,
+                                                     pad: Double = 1.1) throws -> [ImageTo3DCamera] {
+        let named = try views.map { name -> Pixal3DCamera.OrbitView in
+            guard let v = Pixal3DCamera.OrbitView(rawValue: name.lowercased()) else {
+                throw PackageError.unsupportedRequestFeature("turnaround view \"\(name)\": one of front, left, back, right")
+            }
+            return v
+        }
+        return Pixal3DCamera.turnaround(named, fovXDegrees: fovXDegrees, pad: pad)
+            .map { ImageTo3DCamera(fovXDegrees: fovXDegrees, cameraToWorld: $0.c2w!.m) }
+    }
+
     private let inner: Trellis2Package
 
     /// Any configuration becomes a Pixal3D one (`pixal3dOnly`); use `Trellis2Configuration.pixal3dLane`.

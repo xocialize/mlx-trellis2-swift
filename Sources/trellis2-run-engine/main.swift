@@ -141,7 +141,8 @@ do {
                                               matting: matting,
                                               pixal3dWeightsDir: env["PIXAL3D_WEIGHTS"].map { URL(fileURLWithPath: $0) },
                                               pixal3dOnly: env["PIXAL3D_ONLY"] == "1" ? true : nil,
-                                              pixal3dMultiView: env["PIXAL3D_MV"] == "1" ? true : nil),
+                                              pixal3dMultiView: env["PIXAL3D_MV"] == "1" ? true : nil,
+                                              flowWeightsBF16: env["FLOW_WEIGHTS"] == "bf16" ? true : nil),
                                           id: pixal3dLane ? PackageID(Pixal3DPackage.suggestedID) : nil)
     print("[engine] registered packageID=\(pkgID) | backers(imageTo3D)=\(await engine.packages(for: .imageTo3D))")
     let laneConfig = Trellis2Configuration(defaultMode: mode, tierCeiling: mode, maxAtlasSize: maxAtlas,

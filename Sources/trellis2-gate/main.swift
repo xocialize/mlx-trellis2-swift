@@ -237,6 +237,17 @@ for tier in [ImageTo3DContract.res1024, ImageTo3DContract.res1536] {
                  Double(lane.residentBytesHint ?? 0) / 1e9, Double(lane.peakActivationBytesHint ?? 0) / 1e9,
                  Double(total) / 1e9, lane.hrTokenBound.map(String.init) ?? "n/a"))
 }
+do {
+    var lean = Trellis2Configuration.pixal3dLane(ImageTo3DContract.res1024); lean.flowWeightsBF16 = true
+    let fit = FootprintConformance.check(manifest: manifest, configuration: lean)
+    let total = (lean.residentBytesHint ?? 0) + (lean.peakActivationBytesHint ?? 0)
+    check("FIT Pixal3D lane res1024, bf16-resident flows (11 GB less resident, same activation)", fit.passed
+          && lean.residentBytesHint == Trellis2Footprint.pixal3dResidentCascadeBF16 && total < pixTotals[0],
+          String(format: "%.1f GB", Double(total) / 1e9))
+    var stockBF16 = Trellis2Configuration.lane(ImageTo3DContract.res1024); stockBF16.flowWeightsBF16 = true
+    check("a stock lane with bf16 flows keeps its fp32 charge (unmeasured)",
+          stockBF16.residentBytesHint == Trellis2Configuration.lane(ImageTo3DContract.res1024).residentBytesHint)
+}
 check("Pixal3D lane footprints rise with the tier", pixTotals == pixTotals.sorted() && Set(pixTotals).count == 2)
 check("manifest footprint ≥ every lane, stock and Pixal3D", (laneTotals + pixTotals).allSatisfy { $0 <= worst }
       && worst == max(laneTotals.last ?? 0, pixTotals.last ?? 0))
@@ -313,6 +324,15 @@ do {
     check("calc_mat of view 0 is the canonical front F(|t0|)", zip(calc[0].m, F.m).allSatisfy { abs($0 - $1) < 1e-9 })
     let W = Pixal3DCamera.frontToWorld([Pixal3DCamera(c2w: tilted)])
     check("front→world maps F back onto C0", zip((W * F).m, tilted.m).allSatisfy { abs($0 - $1) < 1e-9 })
+    // turnaround preset: front = F(d), left = upstream's azimuth-90 example, d = 1.1 · 0.5/tan(10°) = 3.1192
+    let rig = Pixal3DCamera.turnaround([.front, .left, .back, .right])
+    let d = rig[0].c2w!.translationNorm
+    let exL = Mat4([[0, 0, 1, d], [1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1]])
+    check("turnaround: front is F(d), left is upstream's azimuth-90 matrix, d = 3.1192 (pad 1.1, 20°)",
+          abs(d - 3.11921) < 1e-4 && zip(rig[0].c2w!.m, Mat4.front(distance: d).m).allSatisfy { abs($0 - $1) < 1e-9 }
+          && zip(rig[1].c2w!.m, exL.m).allSatisfy { abs($0 - $1) < 1e-9 })
+    let typed = try Pixal3DPackage.turnaroundCameras(["front", "back"], fovXDegrees: 20)
+    check("turnaroundCameras gives valid contract cameras", typed.count == 2 && typed.allSatisfy { $0.shapeProblem == nil })
 } catch {
     check("Pixal3D options parse", false, "\(error)")
 }

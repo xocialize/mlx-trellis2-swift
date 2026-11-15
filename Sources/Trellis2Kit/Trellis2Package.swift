@@ -123,13 +123,18 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
     public var pixal3dOnly: Bool?
     /// With `pixal3dOnly`: preload the posed multi-view (`_mv`) set instead of the single-view one.
     public var pixal3dMultiView: Bool?
+    /// Flow weights resident in their stored bf16 instead of fp32 (`Trellis2Pipeline.flowWeightsBF16`):
+    /// byte-identical output (exact promotion in each matmul), 11 GB less resident, 8–15 % slower. Opt-in.
+    /// A Pixal3D lane with it is charged `Trellis2Footprint.pixal3dResidentCascadeBF16` (21 GB); stock lanes
+    /// keep their fp32 charge.
+    public var flowWeightsBF16: Bool?
 
     /// Explicit Codable surface: everything except the `matting` closure (which decodes to nil).
     enum CodingKeys: String, CodingKey {
         case quant, defaultMode, tierCeiling, maxAtlasSize, modelsRootDirectory, weightsRootOverride
         case steps, seed, texture, decimateFaces, yUpOutput, unwrapBackend, metricsPath
         case slatCfgAttention, texAttention, slatCfgInterval, slatCfgNegEvery, maxHRTokens
-        case additionalViewsScope, pixal3dWeightsDir, pixal3dOnly, pixal3dMultiView
+        case additionalViewsScope, pixal3dWeightsDir, pixal3dOnly, pixal3dMultiView, flowWeightsBF16
     }
 
     public init(quant: Quant = .bf16,
@@ -154,7 +159,8 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
                 matting: Trellis2Matting? = nil,
                 pixal3dWeightsDir: URL? = nil,
                 pixal3dOnly: Bool? = nil,
-                pixal3dMultiView: Bool? = nil) {
+                pixal3dMultiView: Bool? = nil,
+                flowWeightsBF16: Bool? = nil) {
         self.quant = quant
         self.defaultMode = defaultMode
         self.tierCeiling = tierCeiling
@@ -178,6 +184,7 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
         self.pixal3dWeightsDir = pixal3dWeightsDir
         self.pixal3dOnly = pixal3dOnly
         self.pixal3dMultiView = pixal3dMultiView
+        self.flowWeightsBF16 = flowWeightsBF16
     }
 }
 
@@ -303,6 +310,11 @@ public enum Trellis2Footprint {
     /// Pixal3D cascade resident: Pixal3D SS + shape_512 + shape_1024 + tex_1024 (fp32-cast) + NAF + the
     /// stock decoders + DINOv3.
     public static let pixal3dResidentCascade: UInt64 = 32_000_000_000
+    /// Pixal3D cascade resident with `flowWeightsBF16` (v0.16.0): the four flows stay bf16. Measured
+    /// 20.28 / 20.00 / 20.36 GB post-run (res1024 dress, res1024 hair, res1536 hair) against 31.2–31.4 fp32,
+    /// with byte-identical GLBs and the same activation (peaks 30.74 / 32.42 / 55.91 GB); 8–15 % slower.
+    /// Only the Pixal3D lanes are re-charged; a stock lane with bf16 flows keeps its fp32 charge (unmeasured).
+    public static let pixal3dResidentCascadeBF16: UInt64 = 21_000_000_000
     /// Pixal3D cascade activation over resident: base + slope × HR tokens (fit through the measured
     /// peaks plus headroom), charged at the tier's token bound; past `measuredTokenCeiling` the
     /// conservative 1.55 MB/token.
@@ -338,7 +350,9 @@ extension Trellis2Configuration: FootprintConfigured {
     /// Without a `tierCeiling` a request above the configured tier is not re-charged; with one it is
     /// refused, so a lane's charge holds. Numbers: `Trellis2Footprint`.
     public var residentBytesHint: UInt64? {
-        if isPixal3DLane && chargedTier.isCascade { return Trellis2Footprint.pixal3dResidentCascade }
+        if isPixal3DLane && chargedTier.isCascade {
+            return (flowWeightsBF16 ?? false) ? Trellis2Footprint.pixal3dResidentCascadeBF16 : Trellis2Footprint.pixal3dResidentCascade
+        }
         return chargedTier.isCascade ? Trellis2Footprint.residentCascade : Trellis2Footprint.residentRes512
     }
     public var peakActivationBytesHint: UInt64? {
@@ -612,6 +626,7 @@ public final class Trellis2Package: ModelPackage {
         let ckptDir = dir.path
         let pixal3dOnly = configuration.pixal3dOnly ?? false
         pipeline = try Trellis2Pipeline(consolidatedDir: ckptDir, loadStockStructFlow: !pixal3dOnly)
+        pipeline?.flowWeightsBF16 = configuration.flowWeightsBF16 ?? false
         // Pixal3D weights: pixal3dWeightsDir, the ModelStore copy of xocialize/pixal3d-mlx, else the stock dir
         pipeline?.pixal3dDir = configuration.pixal3dSnapshotDir(storeRoot: root, stockDir: dir)?.path
             ?? configuration.pixal3dWeightsDir?.path

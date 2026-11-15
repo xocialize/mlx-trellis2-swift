@@ -14,8 +14,10 @@ public struct SparseStructureFlowModel {
     /// Pixal3D projection-conditioned SS flow: every block has a `proj_linear` [C, 1024].
     public var isProjection: Bool { blocks.first?.projW != nil }
 
-    public init(weights w: [String: MLXArray], numBlocks: Int = 30, resolution: Int = 16, numHeads: Int = 12) {
-        func g(_ k: String) -> MLXArray { w[k]!.asType(.float32) }
+    /// `keepStorageDType`: see `SLatFlowModel.init`.
+    public init(weights w: [String: MLXArray], numBlocks: Int = 30, resolution: Int = 16, numHeads: Int = 12,
+                keepStorageDType: Bool = false) {
+        func g(_ k: String) -> MLXArray { keepStorageDType ? w[k]! : w[k]!.asType(.float32) }
         let inW = g("input_layer.weight")
         let C = inW.dim(0)
         inputW = inW; inputB = g("input_layer.bias")
@@ -40,8 +42,8 @@ public struct SparseStructureFlowModel {
                 mlp: FeedForwardNet(w0: g(p + "mlp.mlp.0.weight"), b0: g(p + "mlp.mlp.0.bias"),
                                     w2: g(p + "mlp.mlp.2.weight"), b2: g(p + "mlp.mlp.2.bias")),
                 channels: C,
-                projW: w[p + "cross_attn.proj_linear.weight"]?.asType(.float32),   // Pixal3D only
-                projB: w[p + "cross_attn.proj_linear.bias"]?.asType(.float32))
+                projW: w[p + "cross_attn.proj_linear.weight"].map { keepStorageDType ? $0 : $0.asType(.float32) },   // Pixal3D only
+                projB: w[p + "cross_attn.proj_linear.bias"].map { keepStorageDType ? $0 : $0.asType(.float32) })
         }
     }
 

@@ -30,8 +30,11 @@ public struct SLatFlowModel {
     /// `proj_in_channels` (2048 for the Pixal3D SLat flows), or nil on a stock flow.
     public var projInChannels: Int? { blocks.first?.projW?.dim(1) }
 
-    public init(weights w: [String: MLXArray], numBlocks: Int = 30, numHeads: Int = 12) {
-        func g(_ k: String) -> MLXArray { w[k]!.asType(.float32) }
+    /// `keepStorageDType`: keep the weights in their stored dtype (bf16 for the published flows) instead of
+    /// casting to fp32 at load. MLX promotes them inside each fp32 matmul, and bf16→fp32 is exact, so the
+    /// result is the same; resident memory halves (≈ 2.7 GB per flow) at a per-forward conversion cost.
+    public init(weights w: [String: MLXArray], numBlocks: Int = 30, numHeads: Int = 12, keepStorageDType: Bool = false) {
+        func g(_ k: String) -> MLXArray { keepStorageDType ? w[k]! : w[k]!.asType(.float32) }
         let inW = g("input_layer.weight"); let C = inW.dim(0)
         inputW = inW; inputB = g("input_layer.bias")
         adaLNW = g("adaLN_modulation.1.weight"); adaLNB = g("adaLN_modulation.1.bias")
@@ -55,8 +58,8 @@ public struct SLatFlowModel {
                 mlp: FeedForwardNet(w0: g(p + "mlp.mlp.0.weight"), b0: g(p + "mlp.mlp.0.bias"),
                                     w2: g(p + "mlp.mlp.2.weight"), b2: g(p + "mlp.mlp.2.bias")),
                 channels: C,
-                projW: w[p + "cross_attn.proj_linear.weight"]?.asType(.float32),   // Pixal3D only
-                projB: w[p + "cross_attn.proj_linear.bias"]?.asType(.float32))
+                projW: w[p + "cross_attn.proj_linear.weight"].map { keepStorageDType ? $0 : $0.asType(.float32) },   // Pixal3D only
+                projB: w[p + "cross_attn.proj_linear.bias"].map { keepStorageDType ? $0 : $0.asType(.float32) })
         }
     }
 

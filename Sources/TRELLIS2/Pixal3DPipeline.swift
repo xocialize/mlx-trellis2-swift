@@ -105,7 +105,7 @@ extension Trellis2Pipeline {
     /// Lazily load + cache a Pixal3D SLat flow (fp32-cast, ~5.5 GB resident).
     public func pixal3dFlow(_ kind: Pixal3DFlowKind) throws -> SLatFlowModel {
         if let m = pixal3dFlows[kind] { return m }
-        let m = SLatFlowModel(weights: try Self.loadMaterialized(pixal3dURL(kind.fileStem)))
+        let m = SLatFlowModel(weights: try Self.loadMaterialized(pixal3dURL(kind.fileStem)), keepStorageDType: flowWeightsBF16)
         precondition(m.isProjection, "\(kind.fileStem) is not a projection flow")
         pixal3dFlows[kind] = m
         return m
@@ -115,7 +115,8 @@ extension Trellis2Pipeline {
     public func pixal3dStructFlow(multiView: Bool) throws -> SparseStructureFlowModel {
         if let c = pixal3dSS, c.multiView == multiView { return c.model }
         pixal3dSS = nil
-        let m = SparseStructureFlowModel(weights: try Self.loadMaterialized(pixal3dURL(Pixal3DFlowKind.structStem(multiView: multiView))))
+        let m = SparseStructureFlowModel(weights: try Self.loadMaterialized(pixal3dURL(Pixal3DFlowKind.structStem(multiView: multiView))),
+                                         keepStorageDType: flowWeightsBF16)
         precondition(m.isProjection, "Pixal3D SS flow has no proj_linear")
         pixal3dSS = (multiView, m)
         return m

@@ -73,6 +73,8 @@ let t0All = Date()
 // ---- weights ----
 let pipe = try Trellis2Pipeline(consolidatedDir: trellisWeights, loadStockStructFlow: false)
 pipe.pixal3dDir = pixWeights
+pipe.flowWeightsBF16 = env["FLOW_WEIGHTS"] == "bf16"   // bf16-resident flows (exact promotion check)
+if pipe.flowWeightsBF16 { print("PX3D note: flow weights resident in bf16") }
 let normObj = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: "\(trellisWeights)/normalization.json"))) as! [String: Any]
 func normVec(_ k1: String, _ k2: String) -> MLXArray {
     MLXArray(((normObj[k1] as! [String: Any])[k2] as! [Double]).map { Float($0) })
@@ -124,6 +126,11 @@ if sections.contains("camera") {
         var worst = 0.0
         for v in 0..<V { for k in 0..<16 { worst = max(worst, abs(Double(g[v, k].item(Float.self)) - calc[v].m[k])) } }
         gate("CAMERA  calc_mat = F·inv(C0)·Ci", worst < 1e-4, String(format: "max|Δ|=%.2e over %d views", worst, V))
+        // the P1 rig (azimuth 0/90/180, full-width framing) is the turnaround preset at pad 1.0
+        let preset = Pixal3DCamera.turnaround([.front, .left, .back].prefix(V).map { $0 }, fovXDegrees: cams[0].fovX * 180 / .pi, pad: 1.0)
+        var pw = 0.0
+        for v in 0..<V { for k in 0..<16 { pw = max(pw, abs(preset[v].c2w!.m[k] - cams[v].c2w!.m[k])) } }
+        gate("CAMERA  turnaround preset (front/left/back, pad 1.0) = the oracle rig", pw < 1e-5, String(format: "max|Δ|=%.2e", pw))
     }
 }
 

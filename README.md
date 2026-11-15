@@ -97,7 +97,7 @@ conditions the sparse-structure and shape flows on the primary image alone and g
 only to the texture flow, so extra views can add colour evidence without steering geometry.
 `views_scope` in the metrics record says which scope ran.
 
-## Pixal3D mode (v0.13.0; lanes and weights v0.14.0; own package and typed cameras v0.15.0; AB-T-0485)
+## Pixal3D mode (v0.13.0; lanes and weights v0.14.0; own package and typed cameras v0.15.0; turnaround preset and bf16 flows v0.16.0; AB-T-0485)
 
 Pixal3D single view is released on the cascade tiers (`res1024`, `res1536`). Since v0.14.0:
 - it has its own **lanes**, `Trellis2Configuration.pixal3dLane(_:)`, with measured footprints (table below);
@@ -145,6 +145,23 @@ stock snapshot (decoders, DINOv3) and `xocialize/pixal3d-mlx`.
 |---|---|---|---|---|
 | Pixal3D res1024 | 32 GB | 38.4 GB | **70.4 GB** | 51.58 GB (shoes, 15,242 tokens) |
 | Pixal3D res1536 | 32 GB | 43.3 GB | **75.3 GB** | 66.90 GB (hair, 28,243 tokens) |
+
+**bf16-resident flows (v0.16.0, opt-in).** Set `Trellis2Configuration.flowWeightsBF16 = true` (driver:
+`FLOW_WEIGHTS=bf16`). The flow weights then stay in their stored bf16 instead of being cast to fp32 at
+load, and MLX promotes them inside each fp32 matmul. bf16→fp32 is exact, so the output is
+**byte-identical**: the same GLB on three runs.
+
+| Run | Resident (bf16 / fp32) | Peak phys (bf16 / fp32) | Time (bf16 / fp32) |
+|---|---|---|---|
+| res1024 dress | 20.3 / 31.2 GB | 30.7 / 41.6 GB | 128 / 114 s |
+| res1024 hair | 20.0 / 31.0 GB | 32.4 / 43.8 GB | 155 / 143 s |
+| res1536 hair | 20.4 / 31.4 GB | 55.9 / 66.9 GB | 564 / 490 s |
+
+It saves 11 GB everywhere and costs 8–15 % time (the per-forward weight conversion). A Pixal3D lane with
+it is charged 21 GB resident: **59.4 GB** at res1024 and **64.3 GB** at res1536. It is off by default,
+because the memory-for-speed trade is the host's call. Stock lanes with it keep their fp32 charge
+(unmeasured). An int8 lane (ComfyUI ships int8 flows at half of bf16) is not in reach without new
+quantized kernels and a new parity study, so it is not attempted.
 
 Activation is 4 GB + 1.2 MB per HR token, charged at the tier's hard token ceiling (28,672 / 32,768),
 as for stock. That line clears every one of the 10 measured runs by at least 5.6 %. The Pixal3D
@@ -197,14 +214,32 @@ IoU 0.974–0.989 on all five items.
 - Single view crops with a 1.1 margin (stock: none). The camera model maps the unit cube to that
   framing, so the margin is part of the camera.
 
-**Camera.** Single view takes a horizontal FOV, default 20° (P1 measured a fixed 20° aligning as
-well as MoGe-2 on the corpus, AB-R-0865); `distance = 0.5 / (mesh_scale · tan(fov/2))`,
-`mesh_scale` 1. Posed multi-view takes one camera-to-world matrix per view (Z-up world, the
+**Camera.** Single view takes a horizontal FOV, default 20°; `distance = 0.5 / (mesh_scale · tan(fov/2))`,
+`mesh_scale` 1.
+
+**The 20° default is proven only on matted product shots.** P1 measured a fixed 20° aligning as well as
+or better than MoGe-2 on the five corpus items (AB-R-0865), but those are studio product photos; MoGe-2
+read them as 30–49°. For in-the-wild photos (a phone shot, a wide lens), the host should supply the
+FOV, for example from EXIF focal length. Upstream defaults to a MoGe-2 estimate, and ComfyUI's template
+wires MoGe-2 with a 49.13° fallback. MoGe-2 is not ported, and nothing here estimates the FOV. Posed multi-view takes one camera-to-world matrix per view (Z-up world, the
 camera looks down its −Z with +Y up; view 0 is the canonical front
 `[[1,0,0,0],[0,0,−1,−d],[0,1,0,0],[0,0,0,1]]`). Every view is placed relative to view 0
 (`calc_mat_i = F(d₀)·inv(C₀)·C_i`), the projected features and global tokens are averaged over
 views with no visibility test, and the `_mv` weights run. Views are not cropped (the cameras fix
 the framing).
+
+**Turnaround preset (v0.16.0).** For turnaround sheets with named views, use
+`Pixal3DPackage.turnaroundCameras(["front", "left", "back", "right"], fovXDegrees: 20, pad: 1.1)` (or
+`Pixal3DCamera.turnaround`). It builds the contract cameras: a Z-up orbit at azimuth 0/90/180/270,
+elevation 0, distance `pad · 0.5 / tan(fov/2)`, and view 0 should be the front. This is the shape of
+ComfyUI's `Pixal3DMultiViewConditioning`.
+
+`pad` is the framing: the unit cube spans 1/pad of each view.
+- **1.1:** views cropped to the subject with a 1.1 margin (ComfyUI; upstream's example rig, d = 3.1192).
+- **1.0:** full-width framing, as in the P1 oracle rig (d = 2.8356), which the preset reproduces exactly
+  in `pixal3dparity`.
+
+The views must be framed to match: the package resizes posed views without cropping.
 
 **Output frame (decision).** Pixal3D's mesh is in the photo's camera frame, not upright: the
 decoder's voxel frame has the photo's up on +Y and the camera on +Z. The package always rotates it

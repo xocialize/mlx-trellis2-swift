@@ -32,6 +32,9 @@ public final class Trellis2Pipeline {
     // Pixal3D (AB-T-0485): projection-conditioned flows + NAF, from `pixal3dDir` (the converted
     // `pixal3d_*.safetensors` + `naf.safetensors`; defaults to the consolidated dir). Lazy, cached.
     public var pixal3dDir: String?
+    /// Keep SLat / SS flow weights in their stored bf16 when loading (instead of fp32): same results
+    /// (exact promotion inside each fp32 matmul), about half the flow residency. Set before flows load.
+    public var flowWeightsBF16 = false
     var pixal3dFlows: [Pixal3DFlowKind: SLatFlowModel] = [:]
     var pixal3dSS: (multiView: Bool, model: SparseStructureFlowModel)?
     var nafCache: NAF?
@@ -40,7 +43,7 @@ public final class Trellis2Pipeline {
     /// The stock SS flow DiT (loads it if a Pixal3D-only init skipped it).
     func structFlow() throws -> SparseStructureFlowModel {
         if let m = ssDitCache { return m }
-        let m = SparseStructureFlowModel(weights: try Self.loadMaterialized(ssDitURL))
+        let m = SparseStructureFlowModel(weights: try Self.loadMaterialized(ssDitURL), keepStorageDType: flowWeightsBF16)
         ssDitCache = m
         return m
     }
@@ -113,7 +116,7 @@ public final class Trellis2Pipeline {
     /// Lazily load + cache a SLat flow DiT (fp32-cast, ~5.2 GB resident each).
     public func flow(_ kind: FlowKind) throws -> SLatFlowModel {
         if let m = flows[kind] { return m }
-        let m = SLatFlowModel(weights: try Self.loadMaterialized(flowURL(kind)))
+        let m = SLatFlowModel(weights: try Self.loadMaterialized(flowURL(kind)), keepStorageDType: flowWeightsBF16)
         flows[kind] = m
         return m
     }

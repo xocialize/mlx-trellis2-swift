@@ -460,7 +460,8 @@ the same as with 1024, so their charges don't move.
 ## Normal and AO maps
 
 Two opt-in outputs on the GLB, off by default. A request without them gives the same bytes as
-before they existed (checked against v0.13.0, below). `normalMapSize` and `aoMapSize` are capped by
+before they existed (checked against v0.13.0 and v0.16.0, below). Both packages take them (the
+`pixal3d` lane runs the same bake). `normalMapSize` and `aoMapSize` are capped by
 `maxAtlasSize`, like `atlasSize`. Neither needs `texture`.
 
 **Normal map (`normalMap`).** The decimated mesh loses the decoded surface's fine relief: lace,
@@ -509,16 +510,17 @@ The stock res1024 shoes (270,288 faces) at 1024: 0.46 s and 0.32 s. Tangents tak
 before then, and the maps rasterize one jitter pass at a time. Measured peak phys:
 - `bakemaps`, atlas 4096: 28.91 GB without maps, 33.68 GB with both maps at 4096.
 - End to end on a res512 lane with `maxAtlasSize` 4096, dress, atlas 4096 + `pbrMaps` + both maps
-  at 4096: **43.54 GB**. That is level with the 43.59 GB above without maps, so the 48 GB charge
-  holds.
-- Pixal3D res1024 dress, maps at 1024: 42.66 GB (GPU 42.05 GB).
+  at 4096: **43.27 GB** (43.54 GB on v0.13.0). That is level with the 43.59 GB above without maps,
+  so the 48 GB charge holds.
+- Pixal3D res1024 dress (`pixal3d` lane), maps at 1024: 42.10 GB (41.99 GB without them).
 - Stock res1024 shoes, maps at 1024: 43.04 GB. The HR stage stays the peak on the cascade lanes.
 
-**Checked.** With the maps off, the GLB bytes are identical to v0.13.0 (Pixal3D res1024 dress,
-sha256 `db75e0d5…`; stock res512 shoes). With them on, two bakes give identical bytes. The Khronos
+**Checked.** With the maps off, the GLB bytes are identical to the release the branch was built on:
+v0.13.0, and again after rebasing onto v0.16.0 (Pixal3D res1024 dress sha256 `db75e0d5…`, stock
+res512 shoes `b6c9bbff…`). With the maps on, two bakes give identical bytes. The Khronos
 glTF validator raises nothing on the TANGENT accessor, the textures or the ORM sharing. The
-zero-length NORMAL entries it reports on every GLB (3 on the dress, 33 on the shoes) predate this
-change.
+zero-length NORMAL entries it reports (3 on the Pixal3D dress, 33 on the res1024 shoes, the same
+counts on the v0.13.0 GLBs) predate this change.
 
 `swift run -c release bakemaps <bake-input.safetensors> <out.glb> --normal N --ao N [--pbr]` re-bakes
 saved decoder outputs (the arrays `MeshBake.run` takes), so the maps can be iterated without running

@@ -81,6 +81,24 @@ enum ImagePreprocess {
         return planes(drawRGB(cg, side: size), size: size)      // premultipliedLast ⇒ RGB·alpha on black
     }
 
+    /// The alpha matte in the same Pixal3D single-view frame (crop ×1.1, resize to `size`), row-major
+    /// [size·size] in [0,1]. nil when the image has no usable alpha. For evaluation (silhouette IoU).
+    static func pixal3dAlpha(from image: Image, size: Int) throws -> [Float]? {
+        let (cg, hasAlpha) = try decodeCGImage(image)
+        guard hasAlpha else { return nil }
+        let side0 = max(cg.width, cg.height)
+        let scale = side0 > maxSide ? Double(maxSide) / Double(side0) : 1.0
+        let W = max(1, Int((Double(cg.width) * scale).rounded()))
+        let H = max(1, Int((Double(cg.height) * scale).rounded()))
+        let pm = drawRGBA8(cg, width: W, height: H)
+        guard let bbox = foregroundBBox(pm, W: W, H: H, margin: 1.1) else { return nil }
+        // alpha into RGB (opaque) so the same crop + resize path carries it
+        var am = [UInt8](repeating: 0, count: W * H * 4)
+        for i in 0..<(W * H) { let a = pm[4 * i + 3]; am[4*i] = a; am[4*i+1] = a; am[4*i+2] = a; am[4*i+3] = 255 }
+        let rgb = cropCompositeResize(am, W: W, H: H, bbox: bbox, target: size)
+        return (0..<(size * size)).map { rgb[3 * $0] }
+    }
+
     private static func planes(_ rgb: [Float], size: Int) -> (normalized: MLXArray, guide: MLXArray) {
         let n = size * size
         var chw = [Float](repeating: 0, count: 3 * n), raw = [Float](repeating: 0, count: 3 * n)
@@ -311,6 +329,10 @@ public enum Pixal3DPreprocess {
     /// Single view: alpha-bbox crop with a 1.1 margin, black composite, resize. (normalized, guide), NCHW.
     public static func singleView(_ image: Image, size: Int) throws -> (normalized: MLXArray, guide: MLXArray) {
         try ImagePreprocess.pixal3dPixels(from: image, size: size)
+    }
+    /// Single-view alpha matte in the same crop frame, [size·size] row-major (nil without alpha).
+    public static func singleViewAlpha(_ image: Image, size: Int) throws -> [Float]? {
+        try ImagePreprocess.pixal3dAlpha(from: image, size: size)
     }
     /// Posed multi-view: no crop, full-frame resize, RGB premultiplied by alpha. (normalized, guide), NCHW.
     public static func posedView(_ image: Image, size: Int) throws -> (normalized: MLXArray, guide: MLXArray) {

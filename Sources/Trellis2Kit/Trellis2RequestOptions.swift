@@ -46,6 +46,8 @@ public struct Trellis2RequestOptions: Sendable, Equatable {
     public var pixal3dFrame: String
     /// Pixal3D posed multi-view cameras: one row-major 4×4 camera-to-world per view.
     public var pixal3dCameras: [[Double]]?
+    /// Pixal3D res512 texture: "stockTex512" or "pixal3dTex1024" (nil = the configuration's choice).
+    public var pixal3dRes512Texture: String?
 
     public enum Key {
         public static let seed = "seed"
@@ -59,6 +61,7 @@ public struct Trellis2RequestOptions: Sendable, Equatable {
         public static let pixal3dFovDegrees = "pixal3dFovDegrees"
         public static let pixal3dFrame = "pixal3dFrame"
         public static let pixal3dCameras = "pixal3dCameras"
+        public static let pixal3dRes512Texture = "pixal3dRes512Texture"
     }
 
     public static let atlasSizes = [512, 1024, 2048, 4096]
@@ -80,6 +83,7 @@ public struct Trellis2RequestOptions: Sendable, Equatable {
         pixal3dFovDegrees = 20
         pixal3dFrame = "front"
         pixal3dCameras = nil
+        pixal3dRes512Texture = nil
     }
 
     /// The configuration's job with `metaData`'s keys applied.
@@ -114,6 +118,12 @@ public struct Trellis2RequestOptions: Sendable, Equatable {
                 throw Self.refuse(Key.pixal3dFrame, "\"front\" or \"world\"", v)
             }
             pixal3dFrame = f
+        }
+        if let v = Self.value(metaData, Key.pixal3dRes512Texture) {
+            guard case .string(let t) = v, t == "stockTex512" || t == "pixal3dTex1024" else {
+                throw Self.refuse(Key.pixal3dRes512Texture, "\"stockTex512\" or \"pixal3dTex1024\"", v)
+            }
+            pixal3dRes512Texture = t
         }
         if let v = Self.value(metaData, Key.pixal3dCameras) {
             guard case .array(let views) = v, !views.isEmpty else {

@@ -123,13 +123,15 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
     public var pixal3dOnly: Bool?
     /// With `pixal3dOnly`: preload the posed multi-view (`_mv`) set instead of the single-view one.
     public var pixal3dMultiView: Bool?
+    /// Pixal3D res512 texture (AB-T-0485 P3): "stockTex512" or "pixal3dTex1024"; nil = the package default.
+    public var pixal3dRes512Texture: String?
 
     /// Explicit Codable surface: everything except the `matting` closure (which decodes to nil).
     enum CodingKeys: String, CodingKey {
         case quant, defaultMode, tierCeiling, maxAtlasSize, modelsRootDirectory, weightsRootOverride
         case steps, seed, texture, decimateFaces, yUpOutput, unwrapBackend, metricsPath
         case slatCfgAttention, texAttention, slatCfgInterval, slatCfgNegEvery, maxHRTokens
-        case additionalViewsScope, pixal3dWeightsDir, pixal3dOnly, pixal3dMultiView
+        case additionalViewsScope, pixal3dWeightsDir, pixal3dOnly, pixal3dMultiView, pixal3dRes512Texture
     }
 
     public init(quant: Quant = .bf16,
@@ -154,7 +156,8 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
                 matting: Trellis2Matting? = nil,
                 pixal3dWeightsDir: URL? = nil,
                 pixal3dOnly: Bool? = nil,
-                pixal3dMultiView: Bool? = nil) {
+                pixal3dMultiView: Bool? = nil,
+                pixal3dRes512Texture: String? = nil) {
         self.quant = quant
         self.defaultMode = defaultMode
         self.tierCeiling = tierCeiling
@@ -178,6 +181,7 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
         self.pixal3dWeightsDir = pixal3dWeightsDir
         self.pixal3dOnly = pixal3dOnly
         self.pixal3dMultiView = pixal3dMultiView
+        self.pixal3dRes512Texture = pixal3dRes512Texture
     }
 }
 
@@ -186,6 +190,15 @@ public struct Trellis2Configuration: PackageConfiguration, ModelStorable, QuantC
 /// `MLXServeEngine.run(.matting)`; throws propagate out of `Trellis2Package.run()` (a broken matter
 /// is a failed generation, not a silent full-frame fallback).
 public typealias Trellis2Matting = @Sendable (Image) async throws -> Matte
+
+extension Trellis2Configuration {
+    /// The res512 texture a Pixal3D res512 job uses (configuration, else the package default).
+    public var pixal3dRes512TextureChoice: Pixal3DRes512Texture {
+        pixal3dRes512Texture.flatMap(Pixal3DRes512Texture.init(rawValue:)) ?? Self.pixal3dRes512TextureDefault
+    }
+    /// Package default for the Pixal3D res512 texture (set by the P3 res512 study, README "Pixal3D mode").
+    public static let pixal3dRes512TextureDefault: Pixal3DRes512Texture = .stockTex512
+}
 
 // MARK: - Per-tier footprints (contract 1.13/1.14 FootprintConfigured; AB-A-0262)
 
@@ -496,7 +509,8 @@ public final class Trellis2Package: ModelPackage {
         pipeline = try Trellis2Pipeline(consolidatedDir: ckptDir, loadStockStructFlow: !pixal3dOnly)
         pipeline?.pixal3dDir = configuration.pixal3dWeightsDir?.path   // nil → the consolidated dir
         if pixal3dOnly {
-            try pipeline?.preloadPixal3D(multiView: configuration.pixal3dMultiView ?? false)
+            try pipeline?.preloadPixal3D(multiView: configuration.pixal3dMultiView ?? false, tier: configuration.chargedTier,
+                                         res512Texture: configuration.pixal3dRes512TextureChoice)
         }
         // A lane knows its tier: load its flows now (prepare), so a job reads nothing from disk and its
         // resident set is the declared one from the start. Without a tierCeiling they stay lazy.
@@ -685,10 +699,6 @@ public final class Trellis2Package: ModelPackage {
     /// one camera-to-world per view, no crop, the `_mv` weights. Cascade tiers only.
     private func runPixal3D(pipeline: Trellis2Pipeline, views: [Image], tier: Trellis2Tier,
                             options: Trellis2RequestOptions, mattingS: Double) throws -> ImageTo3DResponse {
-        guard tier.isCascade else {
-            throw PackageError.unsupportedRequestFeature(
-                "pixal3d: mode \(tier.rawValue) has no Pixal3D flows (upstream ships no 512 mode); use res1024 or res1536")
-        }
         let fov = options.pixal3dFovDegrees * .pi / 180
         var cams: [Pixal3DCamera]
         if let mats = options.pixal3dCameras {
@@ -727,7 +737,10 @@ public final class Trellis2Package: ModelPackage {
             slatCfgSDPA: configuration.slatCfgAttention.flatMap { SDPAPrecision(rawValue: $0) } ?? .fp32,
             texSDPA: configuration.texAttention.flatMap { SDPAPrecision(rawValue: $0) } ?? .bf16,
             steps: options.steps, maxHRTokens: configuration.maxHRTokens, seed: options.seed,
-            frame: Pixal3DFrame(rawValue: options.pixal3dFrame) ?? .front, log: { _ in })
+            frame: Pixal3DFrame(rawValue: options.pixal3dFrame) ?? .front,
+            res512Texture: options.pixal3dRes512Texture.flatMap(Pixal3DRes512Texture.init(rawValue:))
+                ?? configuration.pixal3dRes512TextureChoice,
+            log: { _ in })
         guard let baked = bakedOpt else { throw PackageError.notLoaded }
         try Task.checkCancellation()
         let tGlb = Date()

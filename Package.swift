@@ -82,6 +82,11 @@ let package = Package(
         .executableTarget(name: "cascadeparity", dependencies: [
             "TRELLIS2", .product(name: "MLX", package: "mlx-swift"),
         ], swiftSettings: [.interoperabilityMode(.Cxx)]),
+        // Pixal3D (AB-T-0485 P3): render a Pixal3D GLB through its camera vs the photo (IoU, colour). CPU.
+        .executableTarget(name: "pixal3deval", dependencies: [
+            "TRELLIS2", "Trellis2Kit", .product(name: "MLXToolKit", package: "mlx-engine-swift"),
+            .product(name: "MLX", package: "mlx-swift"),
+        ], swiftSettings: [.interoperabilityMode(.Cxx)]),
         // Pixal3D (AB-T-0485 P2): every stage of the projection-conditioned path vs the CUDA goldens.
         .executableTarget(name: "pixal3dparity", dependencies: [
             "TRELLIS2", "Trellis2Kit", .product(name: "MLXToolKit", package: "mlx-engine-swift"),

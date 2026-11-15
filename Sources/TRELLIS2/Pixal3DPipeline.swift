@@ -32,6 +32,16 @@ public enum Pixal3DFrame: String, Sendable {
     case world
 }
 
+/// What textures a Pixal3D res512 run (AB-T-0485 P3). Upstream ships no Pixal3D tex-512 flow and has
+/// no 512 mode; the res512 lane runs Pixal3D SS + shape-512 on the 32³ grid and one of these textures.
+public enum Pixal3DRes512Texture: String, Sendable, CaseIterable {
+    /// Stock TRELLIS.2 tex-512 flow (cross-attention to all DINOv3 tokens, no projection) on the
+    /// Pixal3D shape latent — the VAE latent space is shared. Geometry pixel-aligned, texture not.
+    case stockTex512
+    /// The Pixal3D tex-1024 flow run on the 32³ grid with the tex-1024 conditioner (projection at R=32).
+    case pixal3dTex1024
+}
+
 /// Golden-noise injection for the parity gates (nil fields → the seeded MLXRandom noise).
 public struct Pixal3DNoise {
     public var ss: MLXArray?, shape512: MLXArray?, shape1024: MLXArray?, tex: MLXArray?
@@ -122,17 +132,28 @@ extension Trellis2Pipeline {
         Pixal3DConditioner(dino: dino, naf: try nafModel())
     }
 
-    public static func pixal3dFlowKinds(multiView: Bool) -> [Pixal3DFlowKind] {
-        [.shape512(multiView: multiView), .shape1024(multiView: multiView), .tex1024(multiView: multiView)]
+    /// The Pixal3D SLat flows a tier runs: the cascade set, or res512's shape-512 (+ the Pixal3D
+    /// tex-1024 when res512 textures with it; the hybrid's stock tex-512 is a stock flow).
+    public static func pixal3dFlowKinds(multiView: Bool, tier: Trellis2Tier = .res1024,
+                                        res512Texture: Pixal3DRes512Texture = .stockTex512) -> [Pixal3DFlowKind] {
+        if tier.isCascade {
+            return [.shape512(multiView: multiView), .shape1024(multiView: multiView), .tex1024(multiView: multiView)]
+        }
+        return res512Texture == .pixal3dTex1024 ? [.shape512(multiView: multiView), .tex1024(multiView: multiView)]
+                                                : [.shape512(multiView: multiView)]
     }
 
-    /// Load the Pixal3D working set now (SS + the three cascade flows + NAF) and drop the stock SLat
-    /// flows, so a Pixal3D job reads nothing from disk.
-    public func preloadPixal3D(multiView: Bool) throws {
-        releaseFlows()
-        pixal3dFlows = pixal3dFlows.filter { Self.pixal3dFlowKinds(multiView: multiView).contains($0.key) }
+    /// Load a tier's Pixal3D working set now (SS + its SLat flows + NAF, + stock tex-512 for the res512
+    /// hybrid) and drop everything else, so a Pixal3D job reads nothing from disk.
+    public func preloadPixal3D(multiView: Bool, tier: Trellis2Tier = .res1024,
+                               res512Texture: Pixal3DRes512Texture = .stockTex512) throws {
+        let kinds = Self.pixal3dFlowKinds(multiView: multiView, tier: tier, res512Texture: res512Texture)
+        let stock: Set<FlowKind> = (!tier.isCascade && res512Texture == .stockTex512) ? [.tex512] : []
+        releaseFlows(keeping: stock)
+        pixal3dFlows = pixal3dFlows.filter { kinds.contains($0.key) }
         _ = try pixal3dStructFlow(multiView: multiView)
-        for k in Self.pixal3dFlowKinds(multiView: multiView) { _ = try pixal3dFlow(k) }
+        for k in kinds { _ = try pixal3dFlow(k) }
+        for k in stock { _ = try flow(k) }
         _ = try nafModel()
     }
 
@@ -156,16 +177,18 @@ extension Trellis2Pipeline {
         frame: Pixal3DFrame = .front, noise: Pixal3DNoise? = nil,
         noiseFn: [String: (MLXArray) -> MLXArray]? = nil,
         topology: (ss: MLXArray?, hr: MLXArray?)? = nil,   // gates: the oracle's coords at the two topology decisions
+        res512Texture: Pixal3DRes512Texture = .stockTex512,
         bake: Bool = true,
         capture: ((String, [String: MLXArray]) -> Void)? = nil,
         log: (String) -> Void = { print($0) }
     ) throws -> (mesh: BakedMesh?, hrResolution: Int, metrics: Trellis2StageMetrics, camera: Pixal3DCameraReport) {
-        precondition(tier.isCascade, "Pixal3D has no 512 mode (AB-R-0859 §3); use res1024 or res1536")
         precondition(!views.isEmpty)
         let mv = multiViewWeights ?? (views.count > 1)
-        releaseFlows()                          // the stock SLat flows are not part of this job
-        // one twin set resident: drop the other set's flows before this job loads its own
-        let keep = Set(Self.pixal3dFlowKinds(multiView: mv))
+        // the stock SLat flows are not part of this job, except stock tex-512 on a res512 hybrid
+        let stockKeep: Set<FlowKind> = (!tier.isCascade && res512Texture == .stockTex512) ? [.tex512] : []
+        releaseFlows(keeping: stockKeep)
+        // one twin set resident: drop the other set's flows (and the other tier's) before loading
+        let keep = Set(Self.pixal3dFlowKinds(multiView: mv, tier: tier, res512Texture: res512Texture))
         if pixal3dFlows.keys.contains(where: { !keep.contains($0) }) {
             pixal3dFlows = pixal3dFlows.filter { keep.contains($0.key) }
             if let ss = pixal3dSS, ss.multiView != mv { pixal3dSS = nil }
@@ -176,6 +199,7 @@ extension Trellis2Pipeline {
 
         var metrics = Trellis2StageMetrics()
         metrics.tier = "pixal3d-" + tier.rawValue + (mv ? "-mv" : "")
+            + (tier.isCascade ? "" : "-" + res512Texture.rawValue)
         metrics.seed = seed
         metrics.backend = unwrapBackend.rawValue
         metrics.stepsSS = steps; metrics.stepsSLat = steps
@@ -221,42 +245,51 @@ extension Trellis2Pipeline {
         capture?("shape512", ["samples": lrSlat, "coords": coords])
         log("  [2] Pixal3D LR shape SLat: \(coords.dim(0)) tokens (\(String(format: "%.1f", metrics.shapeSlatS))s)")
 
-        // 2b) decoder upsample → Pixal3D requantize ((c+0.5)/512·(grid−1)).round(), token back-off
-        t = Date()
-        let upCoords = shapeDec(SparseTensor(feats: lrSlat * shapeStd + shapeMean, coords: coords)).coords
-        MLX.eval(upCoords)
-        let physBudget = Double(ProcessInfo.processInfo.physicalMemory) * 0.70
-        let metalBudget = MTLCreateSystemDefaultDevice().map { Double($0.recommendedMaxWorkingSetSize) }
-        let budgetBytes = min(metalBudget ?? physBudget, physBudget)
-        let derivedCap = Int((budgetBytes - 5e9 - 28e9) / 1.55e6)
-        let ceiling = maxHRTokens.map { min(49_152, $0) } ?? tier.hrTokenCeiling ?? 49_152
-        let tokenCap = maxHRTokens != nil ? ceiling : min(ceiling, max(12_000, derivedCap))
-        metrics.hrTokenCap = tokenCap
-        var (hrCoords, hrResolution) = Pixal3DProjection.requantize(
-            upCoords: upCoords, lrResolution: 512, targetResolution: tier.targetResolution,
-            maxNumTokens: tokenCap, hardMaxTokens: ceiling)
-        if let forced = topology?.hr { hrCoords = forced; hrResolution = tier.targetResolution }
-        MLX.eval(hrCoords)
-        metrics.upsampleRequantizeS = -t.timeIntervalSinceNow
-        metrics.hrTokens = hrCoords.dim(0)
-        let grid = hrResolution / 16
-        capture?("hr", ["up_coords": upCoords, "coords": hrCoords, "hr_resolution": MLXArray(Int32(hrResolution))])
-        log("  [2b] upsample \(upCoords.dim(0)) → requantized \(hrCoords.dim(0)) tokens @\(grid)³ (hr \(hrResolution))")
+        var shapeSlat = lrSlat
+        var hrCoords = coords
+        var hrResolution = 512
+        if tier.isCascade {
+            // 2b) decoder upsample → Pixal3D requantize ((c+0.5)/512·(grid−1)).round(), token back-off
+            t = Date()
+            let upCoords = shapeDec(SparseTensor(feats: lrSlat * shapeStd + shapeMean, coords: coords)).coords
+            MLX.eval(upCoords)
+            let physBudget = Double(ProcessInfo.processInfo.physicalMemory) * 0.70
+            let metalBudget = MTLCreateSystemDefaultDevice().map { Double($0.recommendedMaxWorkingSetSize) }
+            let budgetBytes = min(metalBudget ?? physBudget, physBudget)
+            let derivedCap = Int((budgetBytes - 5e9 - 28e9) / 1.55e6)
+            let ceiling = maxHRTokens.map { min(49_152, $0) } ?? tier.hrTokenCeiling ?? 49_152
+            let tokenCap = maxHRTokens != nil ? ceiling : min(ceiling, max(12_000, derivedCap))
+            metrics.hrTokenCap = tokenCap
+            (hrCoords, hrResolution) = Pixal3DProjection.requantize(
+                upCoords: upCoords, lrResolution: 512, targetResolution: tier.targetResolution,
+                maxNumTokens: tokenCap, hardMaxTokens: ceiling)
+            if let forced = topology?.hr { hrCoords = forced; hrResolution = tier.targetResolution }
+            MLX.eval(hrCoords)
+            metrics.upsampleRequantizeS = -t.timeIntervalSinceNow
+            metrics.hrTokens = hrCoords.dim(0)
+            let gridHR = hrResolution / 16
+            capture?("hr", ["up_coords": upCoords, "coords": hrCoords, "hr_resolution": MLXArray(Int32(hrResolution))])
+            log("  [2b] upsample \(upCoords.dim(0)) → requantized \(hrCoords.dim(0)) tokens @\(gridHR)³ (hr \(hrResolution))")
 
-        // 2c) shape 1024 (HR) — proj at hr/16, DINOv3 1024 + NAF 1024→512
-        t = Date()
-        let cHR = cond.condition(views, stage: .shape1024, coords: hrCoords, grid: grid)
-        capture?("shape1024.cond", ["global": cHR.global, "proj": cHR.proj])
-        MLXRandom.seed(seed &+ 2)
-        let hrNoise = noise?.shape1024 ?? noiseFn?["shape1024"]?(hrCoords) ?? MLXRandom.normal([hrCoords.dim(0), 32])
-        let shapeSlat = FlowEulerSampler.sampleSLat(
-            model: try pixal3dFlow(.shape1024(multiView: mv)), noiseFeats: hrNoise, coords: hrCoords,
-            cond: cHR.global, negCond: zeros5, proj: cHR.proj,
-            steps: steps, guidanceStrength: 7.5, guidanceRescale: 0.5, guidanceInterval: (0.6, 1.0), rescaleT: 3.0)
-        MLX.eval(shapeSlat)
-        metrics.shapeSlatHrS = -t.timeIntervalSinceNow
-        capture?("shape1024", ["samples": shapeSlat, "coords": hrCoords])
-        log("  [2c] Pixal3D HR shape SLat: \(hrCoords.dim(0)) tokens (\(String(format: "%.1f", metrics.shapeSlatHrS ?? 0))s)")
+            // 2c) shape 1024 (HR) — proj at hr/16, DINOv3 1024 + NAF 1024→512
+            t = Date()
+            let cHR = cond.condition(views, stage: .shape1024, coords: hrCoords, grid: gridHR)
+            capture?("shape1024.cond", ["global": cHR.global, "proj": cHR.proj])
+            MLXRandom.seed(seed &+ 2)
+            let hrNoise = noise?.shape1024 ?? noiseFn?["shape1024"]?(hrCoords) ?? MLXRandom.normal([hrCoords.dim(0), 32])
+            shapeSlat = FlowEulerSampler.sampleSLat(
+                model: try pixal3dFlow(.shape1024(multiView: mv)), noiseFeats: hrNoise, coords: hrCoords,
+                cond: cHR.global, negCond: zeros5, proj: cHR.proj,
+                steps: steps, guidanceStrength: 7.5, guidanceRescale: 0.5, guidanceInterval: (0.6, 1.0), rescaleT: 3.0)
+            MLX.eval(shapeSlat)
+            metrics.shapeSlatHrS = -t.timeIntervalSinceNow
+            capture?("shape1024", ["samples": shapeSlat, "coords": hrCoords])
+            log("  [2c] Pixal3D HR shape SLat: \(hrCoords.dim(0)) tokens (\(String(format: "%.1f", metrics.shapeSlatHrS ?? 0))s)")
+        } else {
+            metrics.hrTokens = coords.dim(0)
+            log("  [2b] res512: no HR pass; decode at 512 from the 32³ shape latent")
+        }
+        let grid = hrResolution / 16
         TRELLIS2Config.sdpaCastDtype = texSDPA?.castDtype ?? savedCast
 
         // 3) shape decode
@@ -273,14 +306,24 @@ extension Trellis2Pipeline {
         var metallicRoughness: MLXArray? = nil
         if texture {
             t = Date()
-            let cTex = cond.condition(views, stage: .tex1024, coords: hrCoords, grid: grid)
-            capture?("tex1024.cond", ["global": cTex.global, "proj": cTex.proj])
             MLXRandom.seed(seed &+ 1)
             let texNoise = noise?.tex ?? noiseFn?["tex"]?(hrCoords) ?? MLXRandom.normal([hrCoords.dim(0), 32])
-            let texSlat = FlowEulerSampler.sampleSLat(
-                model: try pixal3dFlow(.tex1024(multiView: mv)), noiseFeats: texNoise, coords: hrCoords,
-                cond: cTex.global, negCond: zeros5, concatCond: shapeSlat, proj: cTex.proj,
-                steps: steps, guidanceStrength: 1.0, guidanceRescale: 0.0, guidanceInterval: (0.6, 0.9), rescaleT: 3.0)
+            let texSlat: MLXArray
+            if !tier.isCascade && res512Texture == .stockTex512 {
+                // res512 hybrid: stock tex-512 flow, stock conditioning (all DINOv3 512 tokens of every view)
+                let (sc, sn) = encodeImages(views.map(\.normalized512))
+                texSlat = FlowEulerSampler.sampleSLat(
+                    model: try flow(.tex512), noiseFeats: texNoise, coords: hrCoords,
+                    cond: sc, negCond: sn, concatCond: shapeSlat,
+                    steps: steps, guidanceStrength: 1.0, guidanceRescale: 0.0, guidanceInterval: (0.6, 0.9), rescaleT: 3.0)
+            } else {
+                let cTex = cond.condition(views, stage: .tex1024, coords: hrCoords, grid: grid)
+                capture?("tex1024.cond", ["global": cTex.global, "proj": cTex.proj])
+                texSlat = FlowEulerSampler.sampleSLat(
+                    model: try pixal3dFlow(.tex1024(multiView: mv)), noiseFeats: texNoise, coords: hrCoords,
+                    cond: cTex.global, negCond: zeros5, concatCond: shapeSlat, proj: cTex.proj,
+                    steps: steps, guidanceStrength: 1.0, guidanceRescale: 0.0, guidanceInterval: (0.6, 0.9), rescaleT: 3.0)
+            }
             MLX.eval(texSlat)
             metrics.texSlatS = -t.timeIntervalSinceNow
             capture?("tex1024", ["samples": texSlat, "coords": hrCoords])

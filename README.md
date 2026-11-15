@@ -440,7 +440,7 @@ thread order, and float addition is not associative:
 They now sum on the CPU in face order. Before this change the final face count drifted by up to
 0.07 % between identical runs.
 
-**Unit normals.** Every `NORMAL` is unit length, so the GLBs pass the Khronos glTF validator with
+**Unit normals (v0.17.0).** Every `NORMAL` is unit length, so the GLBs pass the Khronos glTF validator with
 no errors. The mesh reaching the unwrap carries a few zero-thickness fins: two coincident
 triangles with opposite winding. xatlas gives each fin a 3-vertex chart of its own, where the two
 face normals sum to (0,0,0) or to rounding noise. Up to v0.16.0 the bake wrote those vertices as
@@ -469,7 +469,7 @@ lane's charge follows it. Measured peak phys for the dress with `pbrMaps` on:
 On the cascade lanes the HR stage stays the peak. res1536 with a 4096 atlas peaked at 65.23 GB,
 the same as with 1024, so their charges don't move.
 
-## Normal and AO maps
+## Normal and AO maps (v0.17.0)
 
 Two opt-in outputs on the GLB, off by default. A request without them gives the same bytes as
 before they existed (checked against v0.13.0 and v0.16.0, below). Both packages take them (the
